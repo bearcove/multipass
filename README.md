@@ -78,4 +78,5 @@ server-side forwarding — is being built. See `docs/ARCHITECTURE.md`.
 
 ## License
 
-TBD (bearcove).
+Dual-licensed under either of [MIT](LICENSE-MIT) or
+[Apache 2.0](LICENSE-APACHE), at your option.
