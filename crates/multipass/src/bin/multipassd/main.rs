@@ -54,7 +54,7 @@ use multipass::{PathKind, Transport};
 use multipass_proto::{Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_SERVER};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Snapshot of path liveness + RTT, published by the pump for the IPC server.
 /// Kept off the transport so IPC never contends with the pump's `&mut self`.
@@ -363,8 +363,7 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Prove the authenticated QUIC/server/TUN return path before installing routes.
 async fn run_canary_pump(transport: &mut Transport, shared: &Shared, seq: &mut u64) -> bool {
-    let identifier = (*seq >> 16) as u16;
-    let echo_sequence = *seq as u16;
+    let (identifier, echo_sequence) = canary_identity(*seq);
     let packet = Bytes::copy_from_slice(&build_canary_request(identifier, echo_sequence));
     *seq += 1;
     if !transport.send_data(*seq, packet.clone()) {
@@ -383,13 +382,22 @@ async fn run_canary_pump(transport: &mut Transport, shared: &Shared, seq: &mut u
             shared
                 .rx_bytes
                 .fetch_add(data.packet.len() as u64, Ordering::Relaxed);
-            if is_canary_reply(&data.packet, identifier, echo_sequence) {
-                return true;
+            match validate_canary_reply(&data.packet, identifier, echo_sequence) {
+                Ok(()) => return true,
+                Err(CanaryReject::Header) => {
+                    debug!(len = data.packet.len(), "non-canary packet during canary")
+                }
+                Err(reason) => {
+                    warn!(?reason, len = data.packet.len(), "canary reply rejected")
+                }
             }
         }
     })
     .await
     .unwrap_or(false)
+}
+fn canary_identity(seq: u64) -> (u16, u16) {
+    (0x4d50, seq as u16)
 }
 
 fn build_canary_request(identifier: u16, sequence: u16) -> [u8; 28] {
@@ -411,19 +419,52 @@ fn build_canary_request(identifier: u16, sequence: u16) -> [u8; 28] {
     packet
 }
 
-fn is_canary_reply(packet: &[u8], identifier: u16, sequence: u16) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanaryReject {
+    Header,
+    Protocol,
+    Source,
+    Destination,
+    IcmpTypeCode,
+    Identifier,
+    Sequence,
+    IpChecksum,
+    IcmpChecksum,
+}
+
+fn validate_canary_reply(
+    packet: &[u8],
+    identifier: u16,
+    sequence: u16,
+) -> Result<(), CanaryReject> {
     if packet.len() != 28 || packet[0] >> 4 != 4 || packet[0] & 0x0f != 5 {
-        return false;
+        return Err(CanaryReject::Header);
     }
-    packet[9] == 1
-        && packet[12..16] == TUNNEL_SERVER.octets()
-        && packet[16..20] == TUNNEL_CLIENT.octets()
-        && packet[20] == 0
-        && packet[21] == 0
-        && packet[24..26] == identifier.to_be_bytes()
-        && packet[26..28] == sequence.to_be_bytes()
-        && internet_checksum(&packet[..20]) == 0
-        && internet_checksum(&packet[20..]) == 0
+    if packet[9] != 1 {
+        return Err(CanaryReject::Protocol);
+    }
+    if packet[12..16] != TUNNEL_SERVER.octets() {
+        return Err(CanaryReject::Source);
+    }
+    if packet[16..20] != TUNNEL_CLIENT.octets() {
+        return Err(CanaryReject::Destination);
+    }
+    if packet[20] != 0 || packet[21] != 0 {
+        return Err(CanaryReject::IcmpTypeCode);
+    }
+    if packet[24..26] != identifier.to_be_bytes() {
+        return Err(CanaryReject::Identifier);
+    }
+    if packet[26..28] != sequence.to_be_bytes() {
+        return Err(CanaryReject::Sequence);
+    }
+    if internet_checksum(&packet[..20]) != 0 {
+        return Err(CanaryReject::IpChecksum);
+    }
+    if internet_checksum(&packet[20..]) != 0 {
+        return Err(CanaryReject::IcmpChecksum);
+    }
+    Ok(())
 }
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
@@ -584,7 +625,6 @@ fn spawn_utun_reader(utun: Arc<AsyncFd<utun::Utun>>, tx_q: mpsc::Sender<Bytes>) 
     });
 }
 
-
 /// Extract the IPv4 address from an `IpAddr` (we only tunnel IPv4).
 fn source_ipv4(ip: &IpAddr) -> Option<Ipv4Addr> {
     match ip {
@@ -595,7 +635,10 @@ fn source_ipv4(ip: &IpAddr) -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_canary_request, internet_checksum, is_canary_reply};
+    use super::{
+        CanaryReject, build_canary_request, canary_identity, internet_checksum,
+        validate_canary_reply,
+    };
 
     #[test]
     fn raw_canary_request_is_valid_ipv4_icmp() {
@@ -606,6 +649,16 @@ mod tests {
         assert_eq!(&packet[12..16], &[10, 10, 99, 2]);
         assert_eq!(&packet[16..20], &[10, 10, 99, 1]);
         assert_eq!(packet[20], 8);
+    }
+
+    #[test]
+    fn first_process_canary_uses_nonzero_identifier() {
+        let (identifier, sequence) = canary_identity(0);
+        assert_eq!(identifier, 0x4d50);
+        assert_eq!(sequence, 0);
+
+        let request = build_canary_request(identifier, sequence);
+        assert_ne!(&request[22..24], &[0, 0]);
     }
 
     #[test]
@@ -621,8 +674,11 @@ mod tests {
         let ip_checksum = internet_checksum(&reply[..20]);
         reply[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
 
-        assert!(is_canary_reply(&reply, 0x1234, 7));
-        reply[27] ^= 1;
-        assert!(!is_canary_reply(&reply, 0x1234, 7));
+        assert_eq!(validate_canary_reply(&reply, 0x1234, 7), Ok(()));
+        reply[22] ^= 1;
+        assert_eq!(
+            validate_canary_reply(&reply, 0x1234, 7),
+            Err(CanaryReject::IcmpChecksum)
+        );
     }
 }
