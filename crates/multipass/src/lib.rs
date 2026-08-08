@@ -646,6 +646,12 @@ impl Transport {
     pub fn is_ready(&self, kind: PathKind) -> bool {
         self.path(kind).ready.load(Ordering::Relaxed)
     }
+
+    /// Number of packets currently retained in the aggregation send window
+    /// (unacknowledged). Exposed for tests and status.
+    pub fn send_window_len(&self) -> usize {
+        self.send_window.lock().unwrap().len()
+    }
     /// Raw noq connection for a path (e.g. to await `closed()` or inspect).
     pub fn connection(&self, kind: PathKind) -> Connection {
         self.path(kind).conn.lock().unwrap().clone()
