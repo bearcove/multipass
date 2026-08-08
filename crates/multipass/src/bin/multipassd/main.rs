@@ -170,8 +170,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    // Transport lifecycle: connect, handshake, pump; re-dial on any end.
+    // Transport lifecycle, GATED on `enabled` (the app's Connect toggle).
+    //
+    // The daemon boots IDLE: it opens the utun + IPC socket and then waits.
+    // Only when the menubar app sends `connect` (setting `enabled = true`) do
+    // we dial, handshake, install routes, and pump. `disconnect` clears
+    // `enabled`, which tears the transport down and restores routing. This is
+    // the state machine that lets the app actually control the tunnel — and
+    // keeps the IPC socket responsive the whole time (it runs on its own task).
     loop {
+        // Wait until enabled.
+        if !shared.enabled.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
         let mut transport = match Transport::connect(opts.server, opts.wired, opts.wifi).await {
             Ok(t) => t,
             Err(e) => {
@@ -192,7 +205,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &shared.wired_iface,
                     &shared.wifi_iface,
                 );
-                shared.enabled.store(true, Ordering::Relaxed);
             }
             Err(e) => {
                 error!(%e, "handshake failed; re-dialing");
@@ -203,12 +215,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match pump(utun.clone(), &mut transport, shared.clone()).await {
             PumpEnd::Reconnect => {
                 info!("transport ended; re-dialing");
-                shared.enabled.store(false, Ordering::Relaxed);
             }
             PumpEnd::Fatal(e) => {
                 error!(%e, "pump fatal");
                 return Err(e);
             }
+        }
+
+        // Pump ended (transport dropped or user disconnected). If the user
+        // disconnected, restore routing; either way we loop back and re-check
+        // `enabled` before re-dialing.
+        if !shared.enabled.load(Ordering::Relaxed) {
+            info!("disconnect requested; restoring routes");
+            routes::teardown(
+                &shared.utun_name,
+                opts.server.ip(),
+                &shared.wired_iface,
+                &shared.wifi_iface,
+            );
         }
     }
 }
@@ -305,6 +329,11 @@ async fn pump(
                 }
             }
             _ = tick.tick() => {
+                // A disconnect clears `enabled`; exit the pump so the control
+                // loop can tear down routes and go idle.
+                if !shared.enabled.load(Ordering::Relaxed) {
+                    return PumpEnd::Reconnect;
+                }
                 publish_status(transport, &shared);
                 reconnect_dead(transport, &shared, &mut backoff).await;
             }

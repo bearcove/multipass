@@ -46,6 +46,15 @@ pub async fn serve(path: &str, shared: Arc<Shared>) -> io::Result<()> {
         let _ = std::fs::remove_file(path);
     }
     let listener = UnixListener::bind(path)?;
+    // The daemon runs as root but the menubar app runs as the logged-in user
+    // (amos/staff). A root-owned 0755 socket is not connectable by the app
+    // (EACCES), which surfaces as a permanent "daemon unavailable". Open it up:
+    // this socket only exposes status + connect/disconnect, and only on the
+    // local machine.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+    }
     tracing::info!(%path, "ipc socket listening");
     loop {
         let (stream, _peer) = listener.accept().await?;
@@ -83,24 +92,16 @@ async fn handle_conn(stream: tokio::net::UnixStream, shared: Arc<Shared>) -> io:
 fn handle_request(line: &str, shared: &Arc<Shared>) -> String {
     match extract_json_string(line, "cmd").as_deref() {
         Some("status") => status_json(shared),
+        // connect/disconnect only flip `enabled`. The daemon's control loop
+        // owns dialing, the handshake, and route setup/teardown — doing them
+        // here (in the IPC handler) would race the loop and double-install
+        // routes. The status reply reflects `enabled` on the next poll.
         Some("connect") => {
             shared.enabled.store(true, Ordering::Relaxed);
-            crate::routes::setup(
-                &shared.utun_name,
-                shared.server.ip(),
-                &shared.wired_iface,
-                &shared.wifi_iface,
-            );
             "{\"type\":\"ok\"}".to_string()
         }
         Some("disconnect") => {
             shared.enabled.store(false, Ordering::Relaxed);
-            crate::routes::teardown(
-                &shared.utun_name,
-                shared.server.ip(),
-                &shared.wired_iface,
-                &shared.wifi_iface,
-            );
             "{\"type\":\"ok\"}".to_string()
         }
         _ => "{\"type\":\"error\",\"message\":\"unknown command\"}".to_string(),
