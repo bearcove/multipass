@@ -34,6 +34,8 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime
 use tokio::sync::mpsc;
 
 mod send_window;
+mod scheduler;
+pub use scheduler::Scheduler;
 pub use send_window::SendWindow;
 
 /// Re-export the wire format so callers don't need a second `use` path.
