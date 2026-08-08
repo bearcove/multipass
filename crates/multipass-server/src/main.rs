@@ -483,6 +483,9 @@ mod tests {
     use noq::Endpoint;
 
     use super::{Frame, Session, server_config};
+    use multipass_proto::{
+        TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX, encode,
+    };
 
     #[tokio::test]
     async fn new_client_epoch_evicts_old_connections_and_rejects_rollback() {
@@ -603,5 +606,32 @@ mod tests {
             state.send_window.ack(1, &[(3, 3)])
         };
         assert_eq!(gaps, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn server_assigns_both_families() {
+        // The Assign the server sends on Hello must carry both an IPv4 and an
+        // IPv6 tunnel address, and the shared MTU 1280.
+        let assign = Frame::Assign {
+            ipv4: Some((TUNNEL_CLIENT, TUNNEL_PREFIX)),
+            ipv6: Some((TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX)),
+            mtu: TUNNEL_MTU,
+            dns: vec![],
+        };
+        let encoded = encode(&assign);
+        let decoded = multipass_proto::decode(&encoded).unwrap();
+        match decoded {
+            Frame::Assign {
+                ipv4,
+                ipv6,
+                mtu,
+                ..
+            } => {
+                assert_eq!(ipv4, Some((TUNNEL_CLIENT, TUNNEL_PREFIX)));
+                assert_eq!(ipv6, Some((TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX)));
+                assert_eq!(mtu, 1280);
+            }
+            _ => panic!("expected Assign"),
+        }
     }
 }
