@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use multipass::{PathKind, Transport};
-use multipass_proto::{Frame, TUNNEL_MTU};
+use multipass_proto::{Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_SERVER};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -231,9 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     continue;
                 }
 
-                let canary_ok =
-                    run_canary_pump(utun.clone(), &mut transport, &mut rx_q, &shared, &mut seq)
-                        .await;
+                let canary_ok = run_canary_pump(&mut transport, &shared, &mut seq).await;
                 if !canary_ok {
                     error!("dataplane canary failed; disabling tunnel");
                     shared.enabled.store(false, Ordering::Relaxed);
@@ -363,39 +361,83 @@ const RECONNECT_TICK: Duration = Duration::from_millis(500);
 /// Minimum spacing between re-dial attempts for an already-failed path.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 
-/// Run a scoped dataplane canary before installing full-tunnel routes.
-async fn run_canary_pump(
-    utun: Arc<AsyncFd<utun::Utun>>,
-    transport: &mut Transport,
-    rx_q: &mut mpsc::Receiver<Bytes>,
-    shared: &Shared,
-    seq: &mut u64,
-) -> bool {
-    let utun_name = utun.get_ref().name();
-    let ping = tokio::task::spawn_blocking(move || run_canary(&utun_name));
-    tokio::pin!(ping);
-    let mut wbuf = vec![0u8; TUNNEL_MTU as usize + 4];
+/// Prove the authenticated QUIC/server/TUN return path before installing routes.
+async fn run_canary_pump(transport: &mut Transport, shared: &Shared, seq: &mut u64) -> bool {
+    let identifier = (*seq >> 16) as u16;
+    let echo_sequence = *seq as u16;
+    let packet = Bytes::copy_from_slice(&build_canary_request(identifier, echo_sequence));
+    *seq += 1;
+    if !transport.send_data(*seq, packet.clone()) {
+        return false;
+    }
+    shared
+        .tx_bytes
+        .fetch_add(packet.len() as u64, Ordering::Relaxed);
 
-    loop {
-        tokio::select! {
-            result = &mut ping => return result.unwrap_or(false),
-            Some(pkt) = rx_q.recv() => {
-                *seq += 1;
-                if transport.send_data(*seq, pkt.clone()) {
-                    shared.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-                }
-            }
-            d = transport.recv_data() => {
-                let Some(d) = d else { return false };
-                update_active(shared, d.path);
-                shared.rx_bytes.fetch_add(d.packet.len() as u64, Ordering::Relaxed);
-                if let Err(e) = utun.get_ref().write_packet(&mut wbuf, &d.packet) {
-                    warn!(%e, "utun write error during dataplane canary");
-                    return false;
-                }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let Some(data) = transport.recv_data().await else {
+                return false;
+            };
+            update_active(shared, data.path);
+            shared
+                .rx_bytes
+                .fetch_add(data.packet.len() as u64, Ordering::Relaxed);
+            if is_canary_reply(&data.packet, identifier, echo_sequence) {
+                return true;
             }
         }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn build_canary_request(identifier: u16, sequence: u16) -> [u8; 28] {
+    let mut packet = [0u8; 28];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+    packet[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 1;
+    packet[12..16].copy_from_slice(&TUNNEL_CLIENT.octets());
+    packet[16..20].copy_from_slice(&TUNNEL_SERVER.octets());
+    packet[20] = 8;
+    packet[24..26].copy_from_slice(&identifier.to_be_bytes());
+    packet[26..28].copy_from_slice(&sequence.to_be_bytes());
+    let icmp_checksum = internet_checksum(&packet[20..]);
+    packet[22..24].copy_from_slice(&icmp_checksum.to_be_bytes());
+    let ip_checksum = internet_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+    packet
+}
+
+fn is_canary_reply(packet: &[u8], identifier: u16, sequence: u16) -> bool {
+    if packet.len() != 28 || packet[0] >> 4 != 4 || packet[0] & 0x0f != 5 {
+        return false;
     }
+    packet[9] == 1
+        && packet[12..16] == TUNNEL_SERVER.octets()
+        && packet[16..20] == TUNNEL_CLIENT.octets()
+        && packet[20] == 0
+        && packet[21] == 0
+        && packet[24..26] == identifier.to_be_bytes()
+        && packet[26..28] == sequence.to_be_bytes()
+        && internet_checksum(&packet[..20]) == 0
+        && internet_checksum(&packet[20..]) == 0
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in bytes.chunks(2) {
+        let word = if chunk.len() == 2 {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from(chunk[0]) << 8
+        };
+        sum += u32::from(word);
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// Pump packets while re-authenticating any re-dialed path before scheduling.
@@ -542,27 +584,6 @@ fn spawn_utun_reader(utun: Arc<AsyncFd<utun::Utun>>, tx_q: mpsc::Sender<Bytes>) 
     });
 }
 
-fn run_canary(utun: &str) -> bool {
-    run_canary_with(utun, |prog, args| {
-        std::process::Command::new(prog).args(args).status()
-    })
-}
-
-fn run_canary_with<F>(utun: &str, mut run_command: F) -> bool
-where
-    F: FnMut(&str, &[&str]) -> io::Result<std::process::ExitStatus>,
-{
-    match run_command(
-        "/sbin/ping",
-        &["-n", "-c", "1", "-W", "1000", "-b", utun, "10.10.99.1"],
-    ) {
-        Ok(status) => status.success(),
-        Err(e) => {
-            warn!(%e, "dataplane canary command failed");
-            false
-        }
-    }
-}
 
 /// Extract the IPv4 address from an `IpAddr` (we only tunnel IPv4).
 fn source_ipv4(ip: &IpAddr) -> Option<Ipv4Addr> {
@@ -574,25 +595,34 @@ fn source_ipv4(ip: &IpAddr) -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::ExitStatus;
-
-    use super::run_canary_with;
+    use super::{build_canary_request, internet_checksum, is_canary_reply};
 
     #[test]
-    fn canary_binds_one_ping_to_tunnel_peer() {
-        let mut program = String::new();
-        let mut arguments = Vec::new();
-        let ok = run_canary_with("utun16", |prog, args| {
-            program = prog.to_string();
-            arguments = args.iter().map(|arg| arg.to_string()).collect();
-            Ok(ExitStatus::default())
-        });
+    fn raw_canary_request_is_valid_ipv4_icmp() {
+        let packet = build_canary_request(0x1234, 7);
+        assert_eq!(packet.len(), 28);
+        assert_eq!(internet_checksum(&packet[..20]), 0);
+        assert_eq!(internet_checksum(&packet[20..]), 0);
+        assert_eq!(&packet[12..16], &[10, 10, 99, 2]);
+        assert_eq!(&packet[16..20], &[10, 10, 99, 1]);
+        assert_eq!(packet[20], 8);
+    }
 
-        assert!(ok);
-        assert_eq!(program, "/sbin/ping");
-        assert_eq!(
-            arguments,
-            ["-n", "-c", "1", "-W", "1000", "-b", "utun16", "10.10.99.1"]
-        );
+    #[test]
+    fn raw_canary_reply_requires_matching_valid_echo() {
+        let mut reply = build_canary_request(0x1234, 7).to_vec();
+        reply[12..16].copy_from_slice(&[10, 10, 99, 1]);
+        reply[16..20].copy_from_slice(&[10, 10, 99, 2]);
+        reply[20] = 0;
+        reply[22..24].fill(0);
+        let icmp_checksum = internet_checksum(&reply[20..]);
+        reply[22..24].copy_from_slice(&icmp_checksum.to_be_bytes());
+        reply[10..12].fill(0);
+        let ip_checksum = internet_checksum(&reply[..20]);
+        reply[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+        assert!(is_canary_reply(&reply, 0x1234, 7));
+        reply[27] ^= 1;
+        assert!(!is_canary_reply(&reply, 0x1234, 7));
     }
 }
