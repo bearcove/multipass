@@ -1,6 +1,0 @@
-Target dependency graph (3 targets)
-Target 'AllExcludingTests' in project 'Aggregate'
-➜ Explicit dependency on target 'Multipass-product' in project 'Multipass'
-➜ Explicit dependency on target 'Multipass' in project 'Multipass'
-Target 'Multipass' in project 'Multipass' (no dependencies)
-Target 'Multipass-product' in project 'Multipass' (no dependencies)

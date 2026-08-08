@@ -58,8 +58,8 @@ pub async fn serve(path: &str, shared: Arc<Shared>) -> io::Result<()> {
 }
 
 async fn handle_conn(stream: tokio::net::UnixStream, shared: Arc<Shared>) -> io::Result<()> {
-    let mut reader = BufReader::new(stream);
-    let (w, _) = reader.split();
+    let (r, w) = stream.into_split();
+    let mut reader = BufReader::new(r);
     let mut writer = w;
     loop {
         let mut line = String::new();

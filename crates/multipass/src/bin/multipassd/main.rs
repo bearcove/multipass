@@ -42,7 +42,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use multipass_proto::{Frame, TUNNEL_CLIENT, TUNNEL_MTU};
+use multipass_proto::{Frame, TUNNEL_MTU};
 use tokio::io::unix::AsyncFd;
 use tracing::{error, info, warn};
 
@@ -103,7 +103,7 @@ fn parse_args() -> Result<Opts, String> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
     tracing_subscriber::fmt()
         .with_env_filter(

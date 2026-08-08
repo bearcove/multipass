@@ -38,10 +38,15 @@ extension DaemonError: LocalizedError {
 /// retried once on a stale connection. Send/receive are bounded by a 2s
 /// timeout so a wedged daemon can never block the cooperative pool for long.
 actor DaemonClient {
-    static let socketPath = "/var/run/multipassd.sock"
+    static let defaultSocketPath = "/var/run/multipassd.sock"
     private static let ioTimeout: TimeInterval = 2
 
+    private let path: String
     private var fd: Int32 = -1
+
+    init(path: String = DaemonClient.defaultSocketPath) {
+        self.path = path
+    }
     /// Partial bytes carried between reads; replies are newline-delimited and
     /// small, but `recv` makes no message-boundary guarantees.
     private var pending = Data()
@@ -120,7 +125,6 @@ actor DaemonClient {
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
-        let path = Self.socketPath
         let pathLength = path.utf8CString.count
         guard pathLength <= MemoryLayout.size(ofValue: address.sun_path) else {
             Darwin.close(socket)

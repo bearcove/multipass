@@ -1,4 +1,0 @@
-module Multipass {
-header "Multipass-Swift.h"
-export *
-}

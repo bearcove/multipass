@@ -70,7 +70,7 @@ impl Utun {
         }
 
         // 3. Connect with sc_unit = 0 (auto-assign).
-        let mut addr = sockaddr_ctl {
+        let addr = sockaddr_ctl {
             sc_len: std::mem::size_of::<sockaddr_ctl>() as c_uchar,
             sc_family: AF_SYSTEM as c_uchar,
             ss_sysaddr: AF_SYS_CONTROL as u16,
@@ -105,11 +105,6 @@ impl Utun {
         let unit = unsafe { got.assume_init() }.sc_unit;
 
         Ok(Utun { fd, unit })
-    }
-
-    /// The assigned `utunN` unit number.
-    pub fn unit(&self) -> u32 {
-        self.unit
     }
 
     /// The interface name, e.g. `"utun3"`.

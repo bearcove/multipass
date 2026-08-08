@@ -34,6 +34,9 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 /// ALPN for the multipass tunnel connection.
+// Part of the transport boundary surface (TransportLib exposes it); the client
+// daemon doesn't set it directly — noq derives it from the client config.
+#[allow(dead_code)]
 pub const ALPN: &[u8] = multipass_proto::ALPN;
 /// TLS server name passed to noq's connect.
 pub const SERVER_NAME: &str = "multipass";
@@ -144,7 +147,7 @@ impl Transport {
 
         let wired = Arc::new(Path {
             kind: PathKind::Wired,
-            conn: Mutex::new(dial(server, wired_ip, "wired")?),
+            conn: Mutex::new(dial(server, wired_ip, "wired").await?),
             status: Mutex::new(PathStatus {
                 alive: true,
                 last_recv: None,
@@ -154,7 +157,7 @@ impl Transport {
         });
         let wifi = Arc::new(Path {
             kind: PathKind::Wifi,
-            conn: Mutex::new(dial(server, wifi_ip, "wifi")?),
+            conn: Mutex::new(dial(server, wifi_ip, "wifi").await?),
             status: Mutex::new(PathStatus {
                 alive: true,
                 last_recv: None,
@@ -189,8 +192,8 @@ impl Transport {
     pub fn send_frame(&self, frame: &Frame) {
         let data = multipass_proto::encode(frame);
         for path in [&self.wired, &self.wifi] {
-            let sent = path.conn.lock().send_datagram(data.clone());
-            let mut st = path.status.lock();
+            let sent = path.conn.lock().unwrap().send_datagram(data.clone());
+            let mut st = path.status.lock().unwrap();
             match sent {
                 Ok(()) => {
                     st.alive = true;
@@ -236,10 +239,10 @@ impl Transport {
             PathKind::Wired => &self.wired,
             PathKind::Wifi => &self.wifi,
         };
-        let new_conn = dial(server, src_ip, kind.label())?;
-        *path.conn.lock() = new_conn.clone();
+        let new_conn = dial(server, src_ip, kind.label()).await?;
+        *path.conn.lock().unwrap() = new_conn.clone();
         {
-            let mut st = path.status.lock();
+            let mut st = path.status.lock().unwrap();
             st.alive = false;
             st.last_recv = None;
         }
@@ -256,8 +259,8 @@ impl Transport {
     /// Live status snapshot for both paths.
     pub fn status(&self) -> TransportStatus {
         TransportStatus {
-            wired: *self.wired.status.lock(),
-            wifi: *self.wifi.status.lock(),
+            wired: *self.wired.status.lock().unwrap(),
+            wifi: *self.wifi.status.lock().unwrap(),
         }
     }
 
@@ -267,20 +270,22 @@ impl Transport {
             PathKind::Wired => &self.wired,
             PathKind::Wifi => &self.wifi,
         };
-        conn.conn.lock().rtt(noq_proto::PathId::ZERO)
+        conn.conn.lock().unwrap().rtt(noq_proto::PathId::ZERO)
     }
 
-    /// The current connection for a path (owned clone).
+    /// The current connection for a path (owned clone). Boundary surface; the
+/// daemon currently reconnects via `reconnect_path`, so this is unused here.
+#[allow(dead_code)]
     pub fn connection(&self, kind: PathKind) -> Connection {
         match kind {
-            PathKind::Wired => self.wired.conn.lock().clone(),
-            PathKind::Wifi => self.wifi.conn.lock().clone(),
+            PathKind::Wired => self.wired.conn.lock().unwrap().clone(),
+            PathKind::Wifi => self.wifi.conn.lock().unwrap().clone(),
         }
     }
 }
 
 /// Open one connection on an endpoint bound to `src_ip`, labelled for logs.
-pub fn dial(
+pub async fn dial(
     server: SocketAddr,
     src_ip: IpAddr,
     label: &str,
@@ -308,7 +313,9 @@ pub fn transport_config() -> Arc<TransportConfig> {
     Arc::new(tc)
 }
 
-/// Server config (self-signed, skip-verify peer) — exposed for symmetry/tests.
+/// Server config (self-signed, skip-verify peer) — exposed for symmetry/tests;
+/// the client daemon doesn't use it (TransportLib shares the same surface).
+#[allow(dead_code)]
 pub fn server_config() -> ServerConfig {
     let cert = rcgen::generate_simple_self_signed(vec!["multipass".into()]).unwrap();
     let der = CertificateDer::from(cert.cert);
@@ -379,12 +386,12 @@ fn spawn_reader(
 ) {
     tokio::spawn(async move {
         let kind = path.kind;
-        let conn = path.conn.lock().clone();
+        let conn = path.conn.lock().unwrap().clone();
         loop {
             match conn.read_datagram().await {
                 Ok(buf) => {
                     {
-                        let mut st = path.status.lock();
+                        let mut st = path.status.lock().unwrap();
                         st.received = st.received.saturating_add(buf.len() as u64);
                         st.last_recv = Some(Instant::now());
                         st.alive = true;
@@ -397,7 +404,7 @@ fn spawn_reader(
                                 ));
                             }
                             Frame::Data { seq, packet } => {
-                                if dedup.lock().insert(seq) {
+                                if dedup.lock().unwrap().insert(seq) {
                                     let _ = data_tx.try_send(Data {
                                         seq,
                                         packet,
