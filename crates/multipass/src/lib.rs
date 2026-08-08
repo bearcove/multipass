@@ -341,6 +341,9 @@ pub struct Transport {
     dead_tx: mpsc::Sender<PathKind>,
     dedup: Mutex<Dedup>,
     probe_task: tokio::task::JoinHandle<()>,
+    // Aggregation state: retained unacked packets + path scheduler.
+    send_window: Mutex<SendWindow>,
+    scheduler: Mutex<Scheduler>,
 }
 
 impl Transport {
@@ -381,6 +384,8 @@ impl Transport {
             dead_tx,
             dedup: Mutex::new(Dedup::new()),
             probe_task,
+            send_window: Mutex::new(SendWindow::new(CHANNEL_CAPACITY)),
+            scheduler: Mutex::new(Scheduler::new()),
         }
     }
 
@@ -405,27 +410,123 @@ impl Transport {
         Ok(())
     }
 
-    /// Replicate a raw IP packet across every authenticated live path. The
-    /// server deduplicates by sequence before writing to TUN.
+    /// Send a raw IP packet on the best available path, retaining it for
+    /// possible retransmission until the peer's SACK confirms receipt.
+    ///
+    /// Aggregation: the packet goes out on ONE path chosen by the scheduler.
+    /// The SendWindow keeps a copy; on SACK gap or path death the same `seq`
+    /// is retransmitted on a surviving path. The receiver dedups by `seq`, so
+    /// retransmission never produces a duplicate at the tunnel.
+    ///
+    /// Returns `true` if the packet was queued on a path (retained regardless
+    /// of the local send outcome). Returns `false` only if no path is ready.
     pub fn send_data(&self, seq: u64, packet: Bytes) -> bool {
-        let encoded = multipass_proto::encode(&Frame::Data { seq, packet });
-        let mut sent = false;
-        for kind in PathKind::ALL {
-            if !self.is_ready(kind) || !self.is_alive(kind) {
-                continue;
-            }
-            let path = self.path(kind);
-            match path.conn.lock().unwrap().send_datagram(encoded.clone()) {
-                Ok(()) => {
-                    path.transmitted.fetch_add(1, Ordering::Relaxed);
-                    sent = true;
+        // A packet that can never fit a datagram is rejected outright; no path
+        // could ever carry it, so retaining it would wedge the window.
+        let encoded = multipass_proto::encode(&Frame::Data {
+            seq,
+            packet: packet.clone(),
+        });
+        let fits_any = PathKind::ALL.iter().any(|&kind| {
+            self.connection(kind)
+                .max_datagram_size()
+                .map(|max| encoded.len() <= max)
+                .unwrap_or(false)
+        });
+        if !fits_any {
+            return false;
+        }
+
+        // Update scheduler eligibility from current path state.
+        {
+            let mut sched = self.scheduler.lock().unwrap();
+            for kind in PathKind::ALL {
+                sched.set_eligible(kind, self.is_ready(kind) && self.is_alive(kind));
+                let rtt = self.path(kind).rtt.load(Ordering::Relaxed);
+                if rtt > 0 {
+                    sched.note_rtt(kind, Duration::from_micros(rtt));
                 }
-                Err(e) => {
-                    tracing::warn!(path = %kind.label(), %e, "datagram send failed");
-                }
+                let space = self.path(kind).conn.lock().unwrap().datagram_send_buffer_space();
+                sched.note_queue_space(kind, space);
             }
         }
-        sent
+
+        // Retain before send so a path failure never loses the only copy.
+        self.send_window.lock().unwrap().insert(seq, packet);
+
+        let kind = {
+            let mut sched = self.scheduler.lock().unwrap();
+            sched.pick()
+        };
+        let Some(kind) = kind else {
+            return false;
+        };
+        let path = self.path(kind);
+        match path.conn.lock().unwrap().send_datagram(encoded) {
+            Ok(()) => {
+                path.transmitted.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(path = %kind.label(), %e, "datagram send failed; retained for retransmit");
+                true // retained in window; will be retransmitted
+            }
+        }
+    }
+
+    /// Process an inbound SACK: retire acked packets and retransmit gaps on a
+    /// surviving path.
+    fn handle_sack(&self, largest_contiguous: u64, ranges: &[(u64, u64)]) {
+        let gaps = self
+            .send_window
+            .lock()
+            .unwrap()
+            .ack(largest_contiguous, ranges);
+        if gaps.is_empty() {
+            return;
+        }
+        for seq in gaps {
+            let packet = self.send_window.lock().unwrap().get(seq);
+            if let Some(packet) = packet {
+                self.retransmit(seq, packet);
+            }
+        }
+    }
+
+    /// Retransmit a retained packet on the best surviving path.
+    fn retransmit(&self, seq: u64, packet: Bytes) {
+        let kind = {
+            let mut sched = self.scheduler.lock().unwrap();
+            for k in PathKind::ALL {
+                sched.set_eligible(k, self.is_ready(k) && self.is_alive(k));
+            }
+            sched.pick()
+        };
+        let Some(kind) = kind else {
+            return;
+        };
+        let encoded = multipass_proto::encode(&Frame::Data { seq, packet });
+        let path = self.path(kind);
+        if path.conn.lock().unwrap().send_datagram(encoded).is_ok() {
+            path.transmitted.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(seq, path = %kind.label(), "retransmitted packet");
+        }
+    }
+
+    /// Called when a path dies: retransmit all its unacked packets on the
+    /// surviving path so a path failure never strands an only copy.
+    pub fn on_path_dead(&self, dead: PathKind) {
+        {
+            let mut sched = self.scheduler.lock().unwrap();
+            sched.set_eligible(dead, false);
+        }
+        let unacked = self.send_window.lock().unwrap().unacked();
+        for seq in unacked {
+            let packet = self.send_window.lock().unwrap().get(seq);
+            if let Some(packet) = packet {
+                self.retransmit(seq, packet);
+            }
+        }
     }
 
     /// Send a control frame on one specific live path.
@@ -463,20 +564,37 @@ impl Transport {
     }
 
     /// Receive the next non-data frame (Hello, Assign, ...) for the daemon's
-    /// handshake. Pings are answered internally and never surface here.
+    /// handshake. Pings are answered internally and never surface here. Sack
+    /// frames are consumed internally to drive the aggregation retransmission
+    /// window and never surface here.
     pub async fn recv_control(&self) -> Option<(PathKind, Frame)> {
-        self.control_rx.lock().await.recv().await
+        loop {
+            let (path, frame) = self.control_rx.lock().await.recv().await?;
+            match frame {
+                Frame::Sack {
+                    largest_contiguous,
+                    ranges,
+                } => {
+                    self.handle_sack(largest_contiguous, &ranges);
+                }
+                other => return Some((path, other)),
+            }
+        }
     }
 
     /// Wait until one path's reader task dies (read error / connection close),
-    /// returning which path. The daemon re-dials that path.
+    /// returning which path. Retransmits that path's unacked packets on the
+    /// survivor before returning. The daemon re-dials the dead path.
     pub async fn recv_dead(&self) -> PathKind {
-        self.dead_rx
+        let kind = self
+            .dead_rx
             .lock()
             .await
             .recv()
             .await
-            .unwrap_or(PathKind::Wired)
+            .unwrap_or(PathKind::Wired);
+        self.on_path_dead(kind);
+        kind
     }
 
     /// Snapshot of both paths' liveness.
@@ -737,7 +855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicated_data_delivers_once_and_uses_both_paths() {
+    async fn aggregated_send_stripes_and_delivers_once() {
         let addr = spawn_echo_server().await;
         let t = Transport::connect(
             addr,
@@ -766,10 +884,12 @@ mod tests {
             assert!(got.contains(&seq), "seq {seq} delivered");
         }
 
+        // Aggregation: total transmitted across both paths is ~N (each packet
+        // sent once, on one path), not 2N as in replication. Every packet is
+        // retained in the send window for possible retransmission.
         let st = t.status();
-        assert_eq!(st.wired.transmitted, N);
-        assert_eq!(st.wifi.transmitted, N);
-        assert!(st.wired.received >= N && st.wifi.received >= N);
+        let total_tx = st.wired.transmitted + st.wifi.transmitted;
+        assert_eq!(total_tx, N, "each packet striped onto exactly one path");
     }
     #[tokio::test]
     async fn datagram_capacity_supports_tunnel_mtu() {
@@ -822,6 +942,54 @@ mod tests {
         assert_eq!(
             t.status().wired.transmitted + t.status().wifi.transmitted,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn path_death_retransmits_unacked_on_survivor() {
+        let addr = spawn_echo_server().await;
+        let t = Transport::connect(
+            addr,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        for kind in PathKind::ALL {
+            t.mark_ready(kind);
+        }
+
+        // Send a few packets; they stripe across paths and stay unacked
+        // (the echo server returns them as Data, not Sack, so nothing retires).
+        const N: u64 = 6;
+        for seq in 0..N {
+            assert!(t.send_data(seq, Bytes::from_static(b"data")));
+        }
+        // Drain the echoes so they don't confuse the later count.
+        for _ in 0..N {
+            let _ = t.recv_data().await.unwrap();
+        }
+
+        // Kill the wired path at the connection level. The reader task marks
+        // it dead; recv_dead triggers retransmission of all unacked packets
+        // onto the surviving wifi path.
+        t.connection(PathKind::Wired)
+            .close(0u32.into(), b"test: kill wired");
+        let dead = tokio::time::timeout(Duration::from_secs(2), t.recv_dead())
+            .await
+            .expect("wired death must surface");
+        assert_eq!(dead, PathKind::Wired);
+
+        // Every unacked packet must have been retransmitted on wifi, so wifi's
+        // transmitted count exceeds what it originally carried.
+        let st = t.status();
+        assert_eq!(st.wired.alive, false);
+        // wifi now carries retransmissions of wired's unacked packets in
+        // addition to its own original stripes.
+        assert!(
+            st.wifi.transmitted >= N / 2,
+            "survivor must carry retransmitted packets, got {}",
+            st.wifi.transmitted
         );
     }
 }
