@@ -25,7 +25,9 @@
 //! `rtt_ms` is the active path's smoothed RTT. `tx`/`rx` are cumulative
 //! tunnel bytes up/down. JSON is hand-rolled (no serde in this codebase).
 
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -39,31 +41,60 @@ use crate::Shared;
 /// Socket path. The app bundles this; default is the well-known path.
 pub const DEFAULT_SOCKET: &str = "/var/run/multipassd.sock";
 
-/// Bind and serve. `shared` is the live daemon state (transport + counters).
-pub async fn serve(path: &str, shared: Arc<Shared>) -> io::Result<()> {
-    // Remove a stale socket from a previous run before binding.
+pub struct IpcServer {
+    listener: UnixListener,
+    _socket_lock: File,
+}
+
+/// Claim the singleton lock and bind IPC before creating dataplane resources.
+pub fn bind(path: &str) -> io::Result<IpcServer> {
+    let socket_lock = acquire_socket_lock(path)?;
     if std::path::Path::new(path).exists() {
-        let _ = std::fs::remove_file(path);
+        std::fs::remove_file(path)?;
     }
     let listener = UnixListener::bind(path)?;
-    // The daemon runs as root but the menubar app runs as the logged-in user
-    // (amos/staff). A root-owned 0755 socket is not connectable by the app
-    // (EACCES), which surfaces as a permanent "daemon unavailable". Open it up:
-    // this socket only exposes status + connect/disconnect, and only on the
-    // local machine.
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
     }
     tracing::info!(%path, "ipc socket listening");
+    Ok(IpcServer {
+        listener,
+        _socket_lock: socket_lock,
+    })
+}
+
+/// Serve an already-bound listener. An accept failure is fatal to the daemon.
+pub async fn serve(server: IpcServer, shared: Arc<Shared>) -> io::Result<()> {
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, _peer) = server.listener.accept().await?;
         let shared = shared.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_conn(stream, shared).await {
                 tracing::debug!(%e, "ipc connection ended");
             }
         });
+    }
+}
+
+fn acquire_socket_lock(path: &str) -> io::Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(format!("{path}.lock"))?;
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(lock);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "another multipassd owns the IPC socket",
+        ))
+    } else {
+        Err(error)
     }
 }
 
@@ -153,9 +184,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
-    fn shared() -> Arc<Shared> {
+    fn shared_with_tx(tx: u64) -> Arc<Shared> {
         Arc::new(Shared {
-            tx_bytes: AtomicU64::new(100),
+            tx_bytes: AtomicU64::new(tx),
             rx_bytes: AtomicU64::new(200),
             enabled: AtomicBool::new(true),
             active: AtomicBool::new(true),
@@ -173,6 +204,10 @@ mod tests {
             wifi_iface: "en0".into(),
             utun_name: "utun3".into(),
         })
+    }
+
+    fn shared() -> Arc<Shared> {
+        shared_with_tx(100)
     }
 
     /// The status line must match the menubar app's schema exactly:
@@ -216,5 +251,51 @@ mod tests {
             handle_request("{\"cmd\":\"bogus\"}", &sh),
             "{\"type\":\"error\",\"message\":\"unknown command\"}"
         );
+    }
+
+    #[tokio::test]
+    async fn second_server_cannot_replace_live_socket() {
+        let base = std::env::temp_dir().join(format!(
+            "multipassd-ipc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = base.to_str().unwrap().to_owned();
+        let first_path = path.clone();
+        let first_server = bind(&first_path).unwrap();
+        let first = tokio::spawn(async move { serve(first_server, shared_with_tx(100)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while tokio::net::UnixStream::connect(&path).await.is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first IPC server must become reachable");
+
+        let second_path = path.clone();
+        let error = match bind(&second_path) {
+            Ok(_) => panic!("second IPC bind unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+
+        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        stream.write_all(b"{\"cmd\":\"status\"}\n").await.unwrap();
+        let mut response = String::new();
+        BufReader::new(stream)
+            .read_line(&mut response)
+            .await
+            .unwrap();
+        assert!(
+            response.contains("\"tx\":100"),
+            "socket was stolen: {response}"
+        );
+
+        first.abort();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.lock"));
     }
 }

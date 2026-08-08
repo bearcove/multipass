@@ -53,7 +53,7 @@ use bytes::Bytes;
 use multipass::{PathKind, Transport};
 use multipass_proto::{Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_SERVER};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 /// Snapshot of path liveness + RTT, published by the pump for the IPC server.
@@ -149,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let opts = parse_args()?;
+    let ipc_server = ipc::bind(&opts.socket)?;
     info!(server = %opts.server, wired = %opts.wired, wifi = %opts.wifi, "multipassd starting");
 
     // Resolve physical interface names from the source IPs (for route pinning).
@@ -175,126 +176,143 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx_q, mut rx_q) = mpsc::channel::<Bytes>(256);
     spawn_utun_reader(utun.clone(), tx_q);
     let mut seq = 0u64;
-    let client_nonce = new_client_nonce();
 
     let shared = Shared::new(&opts, wired_iface, wifi_iface, utun_name);
-
-    // IPC server (menubar app) runs for the daemon's whole life.
     let ipc_shared = shared.clone();
-    let ipc_socket = opts.socket.clone();
-    tokio::spawn(async move {
-        if let Err(e) = ipc::serve(&ipc_socket, ipc_shared).await {
-            error!(%e, "ipc server failed");
-        }
+
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let ipc_task = tokio::spawn(async move {
+        let result = ipc::serve(ipc_server, ipc_shared).await;
+        let _ = shutdown_tx.send(true);
+        result
     });
-
-    // Transport lifecycle, GATED on `enabled` (the app's Connect toggle).
-    //
-    // The daemon boots IDLE: it opens the utun + IPC socket and then waits.
-    // Only when the menubar app sends `connect` (setting `enabled = true`) do
-    // we dial, handshake, install routes, and pump. `disconnect` clears
-    // `enabled`, which tears the transport down and restores routing. This is
-    // the state machine that lets the app actually control the tunnel — and
-    // keeps the IPC socket responsive the whole time (it runs on its own task).
-    loop {
-        // Wait until enabled.
-        if !shared.enabled.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        }
-
-        let mut transport = match Transport::connect(opts.server, opts.wired, opts.wifi).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(%e, "transport connect failed; retrying");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+    let transport_lifecycle = async {
+        loop {
+            // Wait until enabled, but make IPC failure terminate the daemon.
+            if !shared.enabled.load(Ordering::Relaxed) {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
                 continue;
             }
-        };
-        if !shared.enabled.load(Ordering::Relaxed) {
-            continue;
-        }
 
-        match handshake(&mut transport, client_nonce).await {
-            Ok((addr, prefix, mtu)) => {
-                if !shared.enabled.load(Ordering::Relaxed) {
+            let client_nonce = new_client_nonce();
+            let mut transport = match Transport::connect(opts.server, opts.wired, opts.wifi).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(%e, "transport connect failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                info!(%addr, prefix, mtu, "assigned; configuring tunnel");
-                let utun_name = shared.utun_name.clone();
-                if !routes::configure(&utun_name, addr, prefix, mtu) {
-                    error!("tunnel interface configuration failed; disabling tunnel");
-                    shared.enabled.store(false, Ordering::Relaxed);
-                    continue;
-                }
-                if !shared.enabled.load(Ordering::Relaxed) {
-                    continue;
-                }
+            };
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            if !shared.enabled.load(Ordering::Relaxed) {
+                continue;
+            }
 
-                let canary_ok = run_canary_pump(&mut transport, &shared, &mut seq).await;
-                if !canary_ok {
-                    error!("dataplane canary failed; disabling tunnel");
-                    shared.enabled.store(false, Ordering::Relaxed);
-                    continue;
-                }
-                if !shared.enabled.load(Ordering::Relaxed) {
-                    continue;
-                }
-                if !routes::setup(
-                    &utun_name,
-                    opts.server.ip(),
-                    &shared.wired_iface,
-                    &shared.wifi_iface,
-                ) {
-                    error!("route activation failed; rolled back; disabling tunnel");
-                    shared.enabled.store(false, Ordering::Relaxed);
-                    continue;
-                }
-                if !shared.enabled.load(Ordering::Relaxed) {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            match handshake(&mut transport, client_nonce).await {
+                Ok((addr, prefix, mtu)) => {
+                    if !shared.enabled.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    info!(%addr, prefix, mtu, "assigned; configuring tunnel");
+                    let utun_name = shared.utun_name.clone();
+                    if !routes::configure(&utun_name, addr, prefix, mtu) {
+                        error!("tunnel interface configuration failed; disabling tunnel");
+                        shared.enabled.store(false, Ordering::Relaxed);
+                        continue;
+                    }
+                    if !shared.enabled.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    let canary_ok = run_canary_pump(&mut transport, &shared, &mut seq).await;
+                    if !canary_ok {
+                        error!("dataplane canary failed; disabling tunnel");
+                        shared.enabled.store(false, Ordering::Relaxed);
+                        continue;
+                    }
+                    if !shared.enabled.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if !routes::setup(
+                        &utun_name,
+                        opts.server.ip(),
+                        &shared.wired_iface,
+                        &shared.wifi_iface,
+                    ) {
+                        error!("route activation failed; rolled back; disabling tunnel");
+                        shared.enabled.store(false, Ordering::Relaxed);
+                        continue;
+                    }
+                    if !shared.enabled.load(Ordering::Relaxed) {
+                        routes::teardown(
+                            &shared.utun_name,
+                            opts.server.ip(),
+                            &shared.wired_iface,
+                            &shared.wifi_iface,
+                        );
+                        continue;
+                    }
+                    shared.active.store(true, Ordering::Relaxed);
+                    let pump_end = pump(
+                        utun.clone(),
+                        &mut transport,
+                        shared.clone(),
+                        &mut rx_q,
+                        &mut seq,
+                        client_nonce,
+                        &mut shutdown_rx,
+                    )
+                    .await;
+
+                    shared.active.store(false, Ordering::Relaxed);
+                    info!("transport inactive; restoring routes");
                     routes::teardown(
                         &shared.utun_name,
                         opts.server.ip(),
                         &shared.wired_iface,
                         &shared.wifi_iface,
                     );
-                    continue;
-                }
-                shared.active.store(true, Ordering::Relaxed);
-                match pump(
-                    utun.clone(),
-                    &mut transport,
-                    shared.clone(),
-                    &mut rx_q,
-                    &mut seq,
-                    client_nonce,
-                )
-                .await
-                {
-                    PumpEnd::Reconnect => info!("transport ended; re-dialing"),
-                    PumpEnd::Fatal(e) => {
-                        error!(%e, "pump fatal");
-                        return Err(e);
+                    match pump_end {
+                        PumpEnd::Reconnect => info!("transport ended; re-dialing"),
+                        PumpEnd::Shutdown => break,
+                        PumpEnd::Fatal(e) => {
+                            error!(%e, "pump fatal");
+                            return Err(e);
+                        }
                     }
                 }
+                Err(e) => {
+                    error!(%e, "handshake failed; re-dialing");
+                    continue;
+                }
             }
-            Err(e) => {
-                error!(%e, "handshake failed; re-dialing");
-                continue;
+
+            if *shutdown_rx.borrow() {
+                break;
             }
         }
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    };
 
-        // Any pump end deactivates routing immediately, including transport
-        // loss while user intent remains enabled. A later re-dial must complete
-        // a fresh handshake and route transaction before becoming active again.
-        shared.active.store(false, Ordering::Relaxed);
-        info!("transport inactive; restoring routes");
-        routes::teardown(
-            &shared.utun_name,
-            opts.server.ip(),
-            &shared.wired_iface,
-            &shared.wifi_iface,
-        );
+    let lifecycle_result = transport_lifecycle.await;
+    if *shutdown_rx.borrow() {
+        ipc_task.await??;
+    } else {
+        ipc_task.abort();
     }
+    lifecycle_result
 }
 
 async fn handshake(
@@ -347,6 +365,8 @@ enum PumpEnd {
     /// Transport fully closed (both paths) — re-dial.
     Reconnect,
     /// Fatal daemon error.
+    /// IPC ownership or listener failed; tear down routes and exit.
+    Shutdown,
     Fatal(Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -489,6 +509,7 @@ async fn pump(
     rx_q: &mut mpsc::Receiver<Bytes>,
     seq: &mut u64,
     client_nonce: u64,
+    shutdown_rx: &mut watch::Receiver<bool>,
 ) -> PumpEnd {
     let mut wbuf = vec![0u8; TUNNEL_MTU as usize + 4];
     let mut backoff = [Instant::now(); 2];
@@ -497,6 +518,11 @@ async fn pump(
 
     loop {
         tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return PumpEnd::Shutdown;
+                }
+            }
             Some(pkt) = rx_q.recv() => {
                 if shared.enabled.load(Ordering::Relaxed) {
                     *seq += 1;

@@ -344,6 +344,7 @@ pub struct Transport {
     control_tx: mpsc::Sender<(PathKind, Frame)>,
     dead_tx: mpsc::Sender<PathKind>,
     dedup: Mutex<Dedup>,
+    probe_task: tokio::task::JoinHandle<()>,
 }
 
 impl Transport {
@@ -375,7 +376,7 @@ impl Transport {
         for p in [&wired, &wifi] {
             spawn_reader(p, &data_tx, &control_tx, &dead_tx, &scheduler);
         }
-        spawn_probe(&wired, &wifi, &scheduler);
+        let probe_task = spawn_probe(&wired, &wifi, &scheduler);
 
         Self {
             wired,
@@ -388,6 +389,7 @@ impl Transport {
             control_tx,
             dead_tx,
             dedup: Mutex::new(Dedup::new()),
+            probe_task,
         }
     }
 
@@ -420,10 +422,27 @@ impl Transport {
         Ok(())
     }
 
-    /// Send a raw IP packet as a data frame on the scheduler-chosen path.
-    /// Returns true only when noq accepts the datagram for transmission.
+    /// Replicate a raw IP packet across every authenticated live path. The
+    /// server deduplicates by sequence before writing to TUN.
     pub fn send_data(&self, seq: u64, packet: Bytes) -> bool {
-        self.send_frame(&Frame::Data { seq, packet })
+        let encoded = multipass_proto::encode(&Frame::Data { seq, packet });
+        let mut sent = false;
+        for kind in PathKind::ALL {
+            if !self.is_ready(kind) || !self.is_alive(kind) {
+                continue;
+            }
+            let path = self.path(kind);
+            match path.conn.lock().unwrap().send_datagram(encoded.clone()) {
+                Ok(()) => {
+                    path.transmitted.fetch_add(1, Ordering::Relaxed);
+                    sent = true;
+                }
+                Err(e) => {
+                    tracing::warn!(path = %kind.label(), %e, "datagram send failed");
+                }
+            }
+        }
+        sent
     }
 
     /// Send a control frame on one specific live path.
@@ -444,37 +463,6 @@ impl Transport {
             }
             Err(e) => {
                 tracing::warn!(path = %kind.label(), %e, "datagram send failed");
-                false
-            }
-        }
-    }
-
-    /// Send a frame on the scheduler-chosen path. Used for data and control
-    /// (Hello, Ping, ...). If the chosen path just died, re-homes to the
-    /// survivor; returns false if nothing is alive or noq rejects the datagram.
-    pub fn send_frame(&self, frame: &Frame) -> bool {
-        let d = multipass_proto::encode(frame);
-        let kind = self.scheduler.lock().unwrap().pick();
-        let p = if self.is_alive(kind) {
-            self.path(kind)
-        } else {
-            let other = if kind == PathKind::Wired {
-                PathKind::Wifi
-            } else {
-                PathKind::Wired
-            };
-            if !self.is_alive(other) {
-                return false;
-            }
-            self.path(other)
-        };
-        match p.conn.lock().unwrap().send_datagram(d) {
-            Ok(()) => {
-                p.transmitted.fetch_add(1, Ordering::Relaxed);
-                true
-            }
-            Err(e) => {
-                tracing::warn!(path = %p.kind.label(), %e, "datagram send failed");
                 false
             }
         }
@@ -551,6 +539,17 @@ impl Transport {
         match kind {
             PathKind::Wired => &self.wired,
             PathKind::Wifi => &self.wifi,
+        }
+    }
+}
+impl Drop for Transport {
+    fn drop(&mut self) {
+        self.probe_task.abort();
+        for path in [&self.wired, &self.wifi] {
+            path.conn
+                .lock()
+                .unwrap()
+                .close(0u32.into(), b"transport dropped");
         }
     }
 }
@@ -651,7 +650,11 @@ fn spawn_reader(
 /// Spawn a periodic probe task: re-evaluate the scheduler's stall state and, on
 /// each live path, send a Ping probe and arm the RTT measurement. The matching
 /// Pong (handled by the reader) yields the RTT that feeds the scheduler.
-fn spawn_probe(wired: &Arc<Path>, wifi: &Arc<Path>, scheduler: &Arc<Mutex<Scheduler>>) {
+fn spawn_probe(
+    wired: &Arc<Path>,
+    wifi: &Arc<Path>,
+    scheduler: &Arc<Mutex<Scheduler>>,
+) -> tokio::task::JoinHandle<()> {
     let paths = [Arc::clone(wired), Arc::clone(wifi)];
     let scheduler = Arc::clone(scheduler);
     tokio::spawn(async move {
@@ -678,7 +681,7 @@ fn spawn_probe(wired: &Arc<Path>, wifi: &Arc<Path>, scheduler: &Arc<Mutex<Schedu
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -719,11 +722,47 @@ mod tests {
         });
         addr
     }
+    async fn spawn_close_observing_server() -> (SocketAddr, mpsc::Receiver<()>) {
+        let server = Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let (closed_tx, closed_rx) = mpsc::channel(2);
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let closed_tx = closed_tx.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    let _ = conn.closed().await;
+                    let _ = closed_tx.send(()).await;
+                });
+            }
+        });
+        (addr, closed_rx)
+    }
 
     #[tokio::test]
-    async fn aggregate_scheduler_delivers_all_and_spreads() {
+    async fn dropping_transport_closes_both_connections() {
+        let (addr, mut closed_rx) = spawn_close_observing_server().await;
+        let transport = Transport::connect(
+            addr,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        drop(transport);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            closed_rx.recv().await.unwrap();
+            closed_rx.recv().await.unwrap();
+        })
+        .await
+        .expect("both paths must close when their transport is dropped");
+    }
+
+    #[tokio::test]
+    async fn replicated_data_delivers_once_and_uses_both_paths() {
         let addr = spawn_echo_server().await;
-        // Both paths bound to loopback (distinct ephemeral source ports).
         let t = Transport::connect(
             addr,
             "127.0.0.1".parse().unwrap(),
@@ -737,31 +776,24 @@ mod tests {
 
         const N: u64 = 20;
         for seq in 0..N {
-            t.send_data(seq, Bytes::from_static(b"hello"));
+            assert!(t.send_data(seq, Bytes::from_static(b"hello")));
         }
 
-        // Every seq is delivered exactly once (the scheduler routes each packet
-        // to one path; the echo reflects it back on that path). Delivery order
-        // is not guaranteed across the two paths' differing RTTs — check the set.
         let mut got = std::collections::HashSet::new();
         for _ in 0..N {
             let d = t.recv_data().await.unwrap();
             assert_eq!(d.packet, Bytes::from_static(b"hello"));
             got.insert(d.seq);
         }
-        assert_eq!(got.len(), N as usize, "each seq delivered exactly once");
+        assert_eq!(got.len(), N as usize, "dedup delivers each seq once");
         for seq in 0..N {
             assert!(got.contains(&seq), "seq {seq} delivered");
         }
 
-        // Both paths alive, and the aggregate scheduler spread load across both
-        // (equal weights -> both transmit and receive).
         let st = t.status();
-        assert!(st.wired.alive, "wired path should be alive");
-        assert!(st.wifi.alive, "wifi path should be alive");
-        assert!(st.wired.transmitted > 0, "scheduler must use wired");
-        assert!(st.wifi.transmitted > 0, "scheduler must use wifi");
-        assert!(st.wired.received > 0 && st.wifi.received > 0);
+        assert_eq!(st.wired.transmitted, N);
+        assert_eq!(st.wifi.transmitted, N);
+        assert!(st.wired.received >= N && st.wifi.received >= N);
     }
     #[tokio::test]
     async fn tunnel_mtu_packet_fits_quic_datagram() {

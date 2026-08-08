@@ -26,11 +26,9 @@ pub struct SchedulerConfig {
     pub min_weight: u32,
     /// Ceiling for the fastest path.
     pub max_weight: u32,
-    /// No datagram received in this long -> the path is treated as stalled and
-    /// its weight drops to [`Self::stall_weight`].
+    /// No datagram received in this long -> exclude the path from production
+    /// scheduling until receive traffic proves it healthy again.
     pub stall_after: Duration,
-    /// Weight applied while a path is stalled.
-    pub stall_weight: u32,
     /// Deficit-WRR credit granted per service round per unit of weight.
     pub quantum: u32,
 }
@@ -41,8 +39,7 @@ impl Default for SchedulerConfig {
             base_weight: 100,
             min_weight: 10,
             max_weight: 1000,
-            stall_after: Duration::from_secs(1),
-            stall_weight: 5,
+            stall_after: Duration::from_millis(500),
             quantum: 1,
         }
     }
@@ -99,27 +96,25 @@ impl Scheduler {
         }
     }
 
-    /// The path to send the next packet on.
-    pub fn pick(&mut self) -> PathKind {
+    /// The path to send the next production packet on, or `None` when every
+    /// path is dead or receive-stalled.
+    pub fn pick(&mut self) -> Option<PathKind> {
         loop {
             let mut best = None;
             let mut best_credit = i64::MIN;
             for i in PathKind::ALL {
                 if self.health[idx(i)].weight == 0 {
-                    continue; // dead / not eligible
+                    continue;
                 }
                 if self.credits[idx(i)] > best_credit {
                     best = Some(i);
                     best_credit = self.credits[idx(i)];
                 }
             }
-            let Some(i) = best else {
-                // No eligible path; caller skips (nothing alive).
-                return PathKind::Wired;
-            };
+            let i = best?;
             if best_credit >= 0 {
                 self.credits[idx(i)] -= 1;
-                return i;
+                return Some(i);
             }
             self.service();
         }
@@ -202,7 +197,7 @@ impl Scheduler {
             let w = if !h.alive {
                 0
             } else if Self::stalled(&self.cfg, &h, now) {
-                self.cfg.stall_weight
+                0
             } else {
                 match (h.rtt, ref_rtt) {
                     (Some(r), Some(refr)) => {
@@ -241,8 +236,9 @@ mod tests {
         let (mut a, mut b) = (0u32, 0u32);
         for _ in 0..n {
             match s.pick() {
-                PathKind::Wired => a += 1,
-                PathKind::Wifi => b += 1,
+                Some(PathKind::Wired) => a += 1,
+                Some(PathKind::Wifi) => b += 1,
+                None => {}
             }
         }
         (a, b)
@@ -284,18 +280,44 @@ mod tests {
     }
 
     #[test]
-    fn stalled_path_sheds_weight() {
+    fn stalled_path_carries_no_production_traffic() {
         let cfg = SchedulerConfig {
             stall_after: Duration::from_millis(1),
-            stall_weight: 5,
             ..Default::default()
         };
         let mut s = Scheduler::new(cfg);
-        s.note_recv(PathKind::Wired); // then let it go stale
+        s.note_recv(PathKind::Wired);
         std::thread::sleep(Duration::from_millis(5));
-        s.tick(); // re-evaluate stall from the clock
+        s.tick();
+
         let health = s.health();
-        assert_eq!(health[idx(PathKind::Wired)].weight, cfg.stall_weight);
+        assert_eq!(health[idx(PathKind::Wired)].weight, 0);
         assert_eq!(health[idx(PathKind::Wifi)].weight, cfg.base_weight);
+        let (wired, wifi) = both_have_traffic(&mut s, 100);
+        assert_eq!(wired, 0);
+        assert_eq!(wifi, 100);
+    }
+
+    #[test]
+    fn all_stalled_paths_have_no_production_fallback() {
+        let cfg = SchedulerConfig {
+            stall_after: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let mut s = Scheduler::new(cfg);
+        s.note_recv(PathKind::Wired);
+        s.note_recv(PathKind::Wifi);
+        std::thread::sleep(Duration::from_millis(5));
+        s.tick();
+
+        assert_eq!(s.pick(), None);
+    }
+
+    #[test]
+    fn default_stall_bound_tracks_two_probe_intervals() {
+        assert_eq!(
+            SchedulerConfig::default().stall_after,
+            Duration::from_millis(500)
+        );
     }
 }
