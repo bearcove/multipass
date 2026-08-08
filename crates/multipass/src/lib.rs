@@ -33,6 +33,9 @@ use noq_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use tokio::sync::mpsc;
 
+mod send_window;
+pub use send_window::SendWindow;
+
 /// Re-export the wire format so callers don't need a second `use` path.
 pub use multipass_proto;
 
