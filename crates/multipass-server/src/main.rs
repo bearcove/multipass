@@ -208,6 +208,18 @@ impl Session {
         state.scoreboard.generate_sack()
     }
 
+    /// Whether any connection is authenticated for the current epoch. Used to
+    /// gate TUN reads and SACK broadcasts so the server doesn't buffer or
+    /// broadcast into a session with no live client.
+    async fn has_live_conns(&self) -> bool {
+        let state = self.state.lock().await;
+        let epoch = state.epoch;
+        state
+            .conns
+            .iter()
+            .any(|c| c.epoch == epoch && c.conn.is_some())
+    }
+
     /// Handle an inbound SACK from the client: retire acked server→client
     /// packets and retransmit gaps on a surviving connection.
     async fn handle_sack(&self, largest_contiguous: u64, ranges: &[(u64, u64)]) {
@@ -466,7 +478,9 @@ async fn run(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + 
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            sack_session.broadcast_sack().await;
+            if sack_session.has_live_conns().await {
+                sack_session.broadcast_sack().await;
+            }
         }
     });
 
@@ -494,6 +508,11 @@ async fn run(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + 
             // A packet read from the TUN: aggregate onto the best live connection.
             maybe = from_tun_rx.recv() => {
                 let Some(packet) = maybe else { break }; // TUN reader died
+                // Drop packets when no client session is live rather than
+                // filling the retention window with undeliverable data.
+                if !session.has_live_conns().await {
+                    continue;
+                }
                 let seq = session.next_seq();
                 let sent = session.send_data(seq, packet).await;
                 if !sent {
