@@ -33,10 +33,9 @@ use noq_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use tokio::sync::mpsc;
 
-mod send_window;
 mod scheduler;
+pub use multipass_proto::SendWindow;
 pub use scheduler::Scheduler;
-pub use send_window::SendWindow;
 
 /// Re-export the wire format so callers don't need a second `use` path.
 pub use multipass_proto;
@@ -340,6 +339,8 @@ pub struct Transport {
     control_tx: mpsc::Sender<(PathKind, Frame)>,
     dead_tx: mpsc::Sender<PathKind>,
     dedup: Mutex<Dedup>,
+    /// Receive scoreboard for server→client packets; generates SACKs.
+    recv_scoreboard: Mutex<multipass_proto::SackScoreboard>,
     probe_task: tokio::task::JoinHandle<()>,
     // Aggregation state: retained unacked packets + path scheduler.
     send_window: Mutex<SendWindow>,
@@ -383,6 +384,7 @@ impl Transport {
             control_tx,
             dead_tx,
             dedup: Mutex::new(Dedup::new()),
+            recv_scoreboard: Mutex::new(multipass_proto::SackScoreboard::new()),
             probe_task,
             send_window: Mutex::new(SendWindow::new(CHANNEL_CAPACITY)),
             scheduler: Mutex::new(Scheduler::new()),
@@ -557,9 +559,29 @@ impl Transport {
     pub async fn recv_data(&self) -> Option<Data> {
         loop {
             let d = self.data_rx.lock().await.recv().await?;
+            self.recv_scoreboard.lock().unwrap().insert(d.seq);
             if self.dedup.lock().unwrap().insert(d.seq) {
                 return Some(d);
             }
+        }
+    }
+
+    /// Broadcast a SACK describing server→client receive state on every ready
+    /// path. Called periodically by the daemon so the server can retire and
+    /// retransmit its retention window.
+    pub fn broadcast_sack(&self) {
+        let sack = self.recv_scoreboard.lock().unwrap().generate_sack();
+        let encoded = multipass_proto::encode(&sack);
+        for kind in PathKind::ALL {
+            if !self.is_alive(kind) {
+                continue;
+            }
+            let _ = self
+                .path(kind)
+                .conn
+                .lock()
+                .unwrap()
+                .send_datagram(encoded.clone());
         }
     }
 

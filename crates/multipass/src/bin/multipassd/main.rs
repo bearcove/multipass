@@ -520,6 +520,11 @@ async fn pump(
     let mut backoff = [Instant::now(); 2];
     let mut tick = tokio::time::interval(RECONNECT_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // SACKs must flow back to the server fast enough that its retention window
+    // can retransmit gaps within a few RTTs. 10ms is well under the path RTT
+    // timescale for gap detection without flooding the control channel.
+    let mut sack_tick = tokio::time::interval(Duration::from_millis(10));
+    sack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -527,6 +532,9 @@ async fn pump(
                 if changed.is_err() || *shutdown_rx.borrow() {
                     return PumpEnd::Shutdown;
                 }
+            }
+            _ = sack_tick.tick() => {
+                transport.broadcast_sack();
             }
             Some(pkt) = rx_q.recv() => {
                 if shared.enabled.load(Ordering::Relaxed) {

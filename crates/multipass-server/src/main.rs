@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use multipass_proto::{
-    Dedup, Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX,
-    encode,
+    Dedup, Frame, SackScoreboard, SendWindow, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX,
+    TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX, encode,
 };
 use noq::{Connection, Endpoint, ServerConfig, TransportConfig};
 use noq_proto::crypto::rustls::QuicServerConfig;
@@ -75,6 +75,10 @@ struct SessionState {
     epoch: Option<u64>,
     retired_epochs: HashSet<u64>,
     dedup: Dedup,
+    /// Receive scoreboard for client→server packets; generates SACKs.
+    scoreboard: SackScoreboard,
+    /// Retention window for server→client packets (aggregation retransmit).
+    send_window: SendWindow,
 }
 
 /// A single logical client session. Connection authentication, epoch changes,
@@ -93,6 +97,8 @@ impl Session {
                 epoch: None,
                 retired_epochs: HashSet::new(),
                 dedup: Dedup::new(),
+                scoreboard: SackScoreboard::new(),
+                send_window: SendWindow::new(4096),
             }),
             next_conn_id: AtomicU64::new(0),
             seq: AtomicU64::new(0),
@@ -146,6 +152,8 @@ impl Session {
                 });
             }
             state.dedup = Dedup::new();
+            state.scoreboard = SackScoreboard::new();
+            state.send_window = SendWindow::new(4096);
         }
 
         let Some(conn) = state.conns.iter_mut().find(|conn| conn.id == id) else {
@@ -163,36 +171,92 @@ impl Session {
         if conn.epoch != state.epoch || conn.epoch.is_none() {
             return false;
         }
+        state.scoreboard.insert(seq);
         state.dedup.insert(seq)
     }
 
-    async fn send_all(&self, data: Bytes) -> usize {
+    /// Generate a SACK describing client→server receive state.
+    async fn generate_sack(&self) -> Frame {
+        let state = self.state.lock().await;
+        state.scoreboard.generate_sack()
+    }
+
+    /// Handle an inbound SACK from the client: retire acked server→client
+    /// packets and retransmit gaps on a surviving connection.
+    async fn handle_sack(&self, largest_contiguous: u64, ranges: &[(u64, u64)]) {
+        let gaps = {
+            let mut state = self.state.lock().await;
+            state.send_window.ack(largest_contiguous, ranges)
+        };
+        for seq in gaps {
+            let packet = {
+                let state = self.state.lock().await;
+                state.send_window.get(seq)
+            };
+            if let Some(packet) = packet {
+                let data = encode(&Frame::Data { seq, packet });
+                self.send_one(data).await;
+            }
+        }
+    }
+
+    /// Aggregate a server→client packet onto the best live connection,
+    /// retaining it in the send window until the client's SACK confirms it.
+    async fn send_data(&self, seq: u64, packet: Bytes) -> bool {
+        {
+            let mut state = self.state.lock().await;
+            state.send_window.insert(seq, packet.clone());
+        }
+        let data = encode(&Frame::Data { seq, packet });
+        self.send_one(data).await
+    }
+
+    /// Send an encoded frame on the single best live connection (aggregation).
+    /// Falls back to any live connection. Returns true if queued on one.
+    async fn send_one(&self, data: Bytes) -> bool {
         let mut state = self.state.lock().await;
         let epoch = state.epoch;
-        let mut sent = 0usize;
-        state.conns.retain_mut(|live| {
+        // Pick the first live connection in the current epoch. The scheduler
+        // refinement (RTT/queue-aware choice) lives client-side; the server has
+        // symmetric per-connection data but a simple lowest-id live pick keeps
+        // this change scoped to reliability, not yet full server scheduling.
+        for live in state.conns.iter_mut() {
             if live.epoch != epoch {
-                return true;
+                continue;
             }
             let Some(conn) = live.conn.as_ref() else {
-                return true;
+                continue;
             };
             match conn.send_datagram(data.clone()) {
-                Ok(()) => {
-                    sent += 1;
-                    true
-                }
+                Ok(()) => return true,
                 Err(noq::SendDatagramError::ConnectionLost(e)) => {
-                    warn!(id = live.id, %e, "connection lost while sending; dropped");
-                    false
+                    warn!(id = live.id, %e, "connection lost while sending");
+                    continue;
                 }
                 Err(e) => {
-                    warn!(id = live.id, %e, "datagram send failed; keeping connection");
-                    true
+                    warn!(id = live.id, %e, "datagram send failed");
+                    continue;
                 }
             }
-        });
-        sent
+        }
+        false
+    }
+
+    /// Broadcast a SACK frame on every live connection (redundant, low cost).
+    async fn broadcast_sack(&self) {
+        let sack = self.generate_sack().await;
+        let data = encode(&sack);
+        let mut state = self.state.lock().await;
+        let epoch = state.epoch;
+        for live in state.conns.iter_mut() {
+            if live.epoch != epoch {
+                continue;
+            }
+            let Some(conn) = live.conn.as_ref() else {
+                continue;
+            };
+            let _ = conn.send_datagram(data.clone());
+        }
     }
 
     #[cfg(test)]
@@ -250,7 +314,12 @@ async fn conn_handler(
                     }
                     Frame::Pong { .. } => {}
                     Frame::Assign { .. } => {} // server never expects an assignment
-                    Frame::Sack { .. } => {}   // SACK handling added in Task 6
+                    Frame::Sack {
+                        largest_contiguous,
+                        ranges,
+                    } => {
+                        session.handle_sack(largest_contiguous, &ranges).await;
+                    }
                 }
             }
             Err(e) => {
@@ -337,6 +406,17 @@ async fn run(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + 
 
     let session = Arc::new(Session::new());
 
+    // Periodic SACK broadcast so the client can retire/retransmit its window.
+    let sack_session = session.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(10));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            sack_session.broadcast_sack().await;
+        }
+    });
+
     loop {
         tokio::select! {
             // A new client connection (wired or wifi). Accept it into the session.
@@ -358,14 +438,13 @@ async fn run(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + 
                     info!(id, remote = ?remote, "client connection closed");
                 });
             }
-            // A packet read from the TUN: send it on every live connection.
+            // A packet read from the TUN: aggregate onto the best live connection.
             maybe = from_tun_rx.recv() => {
                 let Some(packet) = maybe else { break }; // TUN reader died
                 let seq = session.next_seq();
-                let data = encode(&Frame::Data { seq, packet });
-                let sent = session.send_all(data).await;
-                if sent == 0 {
-                    warn!(seq, "tunnel packet dropped: no live client connections");
+                let sent = session.send_data(seq, packet).await;
+                if !sent {
+                    warn!(seq, "tunnel packet retained; no live client connections");
                 }
             }
             else => break,
@@ -403,7 +482,7 @@ mod tests {
 
     use noq::Endpoint;
 
-    use super::{Session, server_config};
+    use super::{Frame, Session, server_config};
 
     #[tokio::test]
     async fn new_client_epoch_evicts_old_connections_and_rejects_rollback() {
@@ -481,5 +560,48 @@ mod tests {
             tokio::join!(async { server.accept().await.unwrap().await }, connecting,);
         accepted.unwrap();
         connected.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_generates_sack_with_gap() {
+        let session = Session::new();
+        let conn = session.add_test_conn().await;
+        assert!(session.authenticate(conn, 10).await);
+
+        // Receive 1, 2, 4 — gap at 3.
+        assert!(session.accept_data(conn, 1).await);
+        assert!(session.accept_data(conn, 2).await);
+        assert!(session.accept_data(conn, 4).await);
+
+        let sack = session.generate_sack().await;
+        match sack {
+            Frame::Sack {
+                largest_contiguous,
+                ranges,
+            } => {
+                assert_eq!(largest_contiguous, 2);
+                assert!(ranges.contains(&(4, 4)), "gap range present: {ranges:?}");
+            }
+            _ => panic!("expected Sack frame"),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_sack_retires_send_window() {
+        let session = Session::new();
+        let conn = session.add_test_conn().await;
+        assert!(session.authenticate(conn, 10).await);
+
+        // Retain three server→client packets.
+        session.send_data(1, bytes::Bytes::from_static(b"a")).await;
+        session.send_data(2, bytes::Bytes::from_static(b"b")).await;
+        session.send_data(3, bytes::Bytes::from_static(b"c")).await;
+
+        // Client SACKs 1 and 3, gap at 2 → seq 2 must be a retransmit candidate.
+        let gaps = {
+            let mut state = session.state.lock().await;
+            state.send_window.ack(1, &[(3, 3)])
+        };
+        assert_eq!(gaps, vec![2]);
     }
 }

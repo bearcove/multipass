@@ -9,7 +9,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 mod sack;
+mod send_window;
 pub use sack::SackScoreboard;
+pub use send_window::SendWindow;
 
 /// ALPN for the multipass tunnel connection.
 pub const ALPN: &[u8] = b"multipass/1";
