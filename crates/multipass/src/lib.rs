@@ -8,21 +8,17 @@
 //! connections, one per interface (wired / wifi), each on its own Endpoint
 //! bound to that interface's source IP.
 //!
-//! # Send policy: aggregate, weighted by live health
+//! # Send policy: active-active replication
 //!
-//! Each payload datagram is sent on ONE connection, chosen by the
-//! [`Scheduler`] (deficit-WRR weighted by live RTT and receive liveness), not
-//! duplicated on both. When a path's RTT spikes or its acks stall, its weight
-//! shifts onto the survivor so failover stays seamless. The receiver still
-//! dedups by sequence number ([`multipass_proto::Dedup`]) — that absorbs the
-//! reorder and the brief duplicates that occur while weights re-home.
+//! Every payload datagram is sent on every authenticated live connection with
+//! the same sequence number. The receiver accepts the first copy and dedups
+//! later copies via [`multipass_proto::Dedup`]. This spends extra bandwidth to
+//! preserve TCP and UDP sessions across link changes without a detection gap.
 //!
 //! This crate is purely I/O: no TUN, no routing, no platform-specific code. It
 //! is macOS + Linux agnostic. The client daemon owns the tunnel device and the
-//! Hello/Assign handshake; it drives them through [`Transport::send_frame`] and
-//! [`Transport::recv_control`].
-
-mod scheduler;
+//! Hello/Assign handshake; it drives them through [`Transport::send_frame_on`]
+//! and [`Transport::recv_control`].
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -37,8 +33,6 @@ use noq_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use tokio::sync::mpsc;
 
-pub use scheduler::{PathHealth, Scheduler, SchedulerConfig};
-
 /// Re-export the wire format so callers don't need a second `use` path.
 pub use multipass_proto;
 
@@ -48,8 +42,7 @@ pub const ALPN: &[u8] = multipass_proto::ALPN;
 /// for this name; the client verifier skips validation anyway.
 pub const SERVER_NAME: &str = "multipass";
 
-/// How often the transport sends a Ping probe on each live path to measure RTT
-/// and re-evaluate scheduler stall detection.
+/// How often the transport sends a Ping probe on each live path to measure RTT.
 pub const RTT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// A probe with no Pong reply after this long is considered lost.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -326,16 +319,14 @@ pub struct Data {
 ///
 /// Holds two [`Connection`]s (wired + wifi), each with a reader task that
 /// decodes inbound datagrams, auto-answers Pings, and feeds the daemon-facing
-/// channels, plus a probe loop that measures RTT into the [`Scheduler`].
-/// Outbound frames are routed through the scheduler onto ONE path (aggregate,
-/// weighted by live health). Sequence dedup is owned here via
+/// channels. A probe loop measures per-path RTT for status. Outbound data is
+/// replicated across every authenticated live path; inbound data is deduped by
 /// [`multipass_proto::Dedup`].
 pub struct Transport {
     wired: Arc<Path>,
     wifi: Arc<Path>,
-    scheduler: Arc<Mutex<Scheduler>>,
     // Receivers are mutex-guarded so `recv_*` can take `&self` and be selected
-    // over alongside `send_data`/`send_frame` in one tokio::select!.
+    // over alongside `send_data` in one tokio::select!.
     data_rx: tokio::sync::Mutex<mpsc::Receiver<Data>>,
     control_rx: tokio::sync::Mutex<mpsc::Receiver<(PathKind, Frame)>>,
     dead_rx: tokio::sync::Mutex<mpsc::Receiver<PathKind>>,
@@ -364,24 +355,19 @@ impl Transport {
     pub fn from_connections(wired: Connection, wifi: Connection) -> Self {
         let wired = Arc::new(Path::new(PathKind::Wired, wired));
         let wifi = Arc::new(Path::new(PathKind::Wifi, wifi));
-        let scheduler = Arc::new(Mutex::new(Scheduler::new(SchedulerConfig::default())));
-        for kind in PathKind::ALL {
-            scheduler.lock().unwrap().set_alive(kind, false);
-        }
 
         let (data_tx, data_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (dead_tx, dead_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
         for p in [&wired, &wifi] {
-            spawn_reader(p, &data_tx, &control_tx, &dead_tx, &scheduler);
+            spawn_reader(p, &data_tx, &control_tx, &dead_tx);
         }
-        let probe_task = spawn_probe(&wired, &wifi, &scheduler);
+        let probe_task = spawn_probe(&wired, &wifi);
 
         Self {
             wired,
             wifi,
-            scheduler,
             data_rx: tokio::sync::Mutex::new(data_rx),
             control_rx: tokio::sync::Mutex::new(control_rx),
             dead_rx: tokio::sync::Mutex::new(dead_rx),
@@ -393,10 +379,9 @@ impl Transport {
         }
     }
 
-    /// Re-dial one dead path and swap it in, respawning its reader task and
-    /// restoring it in the scheduler. The daemon calls this on
-    /// [`Transport::recv_dead`]. Returns the dial error if the interface is
-    /// still down; callers retry with backoff.
+    /// Re-dial one dead path and swap it in, respawning its reader task. The
+    /// daemon calls this on [`Transport::recv_dead`]. Returns the dial error if
+    /// the interface is still down; callers retry with backoff.
     pub async fn reconnect_path(
         &self,
         kind: PathKind,
@@ -410,14 +395,7 @@ impl Transport {
         p.ready.store(false, Ordering::Relaxed);
         p.rtt.store(0, Ordering::Relaxed);
         *p.probe.lock().unwrap() = None;
-        self.scheduler.lock().unwrap().set_alive(kind, false);
-        spawn_reader(
-            p,
-            &self.data_tx,
-            &self.control_tx,
-            &self.dead_tx,
-            &self.scheduler,
-        );
+        spawn_reader(p, &self.data_tx, &self.control_tx, &self.dead_tx);
         tracing::info!(path = %kind.label(), "path reconnected");
         Ok(())
     }
@@ -514,11 +492,9 @@ impl Transport {
         self.path(kind).alive.load(Ordering::Relaxed)
     }
 
-    /// Mark a path eligible for data after its Hello was acknowledged.
+    /// Mark a path eligible for replicated data after its Hello was acknowledged.
     pub fn mark_ready(&self, kind: PathKind) {
-        let p = self.path(kind);
-        p.ready.store(true, Ordering::Relaxed);
-        self.scheduler.lock().unwrap().set_alive(kind, true);
+        self.path(kind).ready.store(true, Ordering::Relaxed);
     }
 
     /// Whether the path acknowledged the current client epoch.
@@ -528,11 +504,6 @@ impl Transport {
     /// Raw noq connection for a path (e.g. to await `closed()` or inspect).
     pub fn connection(&self, kind: PathKind) -> Connection {
         self.path(kind).conn.lock().unwrap().clone()
-    }
-
-    /// Handle to the scheduler, for status/tuning (e.g. `set_weight`).
-    pub fn scheduler(&self) -> Arc<Mutex<Scheduler>> {
-        Arc::clone(&self.scheduler)
     }
 
     fn path(&self, kind: PathKind) -> &Arc<Path> {
@@ -555,9 +526,9 @@ impl Drop for Transport {
 }
 
 /// Spawn a reader task for `path`: decode inbound datagrams, auto-answer
-/// Pings, measure RTT from probe Pongs, feed the scheduler, and distribute
-/// Data / control frames to the shared channels. On a read error or connection
-/// close it marks the path dead and notifies.
+/// Pings, measure RTT from probe Pongs, and distribute Data / control frames to
+/// the shared channels. On a read error or connection close it marks the path
+/// dead and notifies.
 ///
 /// `#[allow(clippy::collapsible_match)]`: clippy suggests collapsing the
 /// `if …send().await.is_err() { break }` blocks into async match guards, but
@@ -568,7 +539,6 @@ fn spawn_reader(
     data_tx: &mpsc::Sender<Data>,
     control_tx: &mpsc::Sender<(PathKind, Frame)>,
     dead_tx: &mpsc::Sender<PathKind>,
-    scheduler: &Arc<Mutex<Scheduler>>,
 ) {
     let path = Arc::clone(path);
     let kind = path.kind;
@@ -583,7 +553,6 @@ fn spawn_reader(
         move |rtt| p.set_rtt(rtt)
     };
     let probe = Arc::clone(&path.probe);
-    let scheduler = Arc::clone(scheduler);
     let data_tx = data_tx.clone();
     let control_tx = control_tx.clone();
     let dead_tx = dead_tx.clone();
@@ -594,7 +563,6 @@ fn spawn_reader(
             match conn.read_datagram().await {
                 Ok(d) => {
                     mark_recv();
-                    scheduler.lock().unwrap().note_recv(kind);
                     match multipass_proto::decode(&d) {
                         Some(Frame::Data { seq, packet }) => {
                             if data_tx
@@ -622,7 +590,6 @@ fn spawn_reader(
                                 let rtt = sent.elapsed();
                                 *inflight = None;
                                 set_rtt(rtt);
-                                scheduler.lock().unwrap().note_rtt(kind, rtt);
                             }
                         }
                         Some(other) => {
@@ -638,7 +605,6 @@ fn spawn_reader(
                 Err(e) => {
                     tracing::warn!(path = %kind.label(), %e, "path read ended");
                     alive.store(false, Ordering::Relaxed);
-                    scheduler.lock().unwrap().set_alive(kind, false);
                     let _ = dead_tx.send(kind).await;
                     break;
                 }
@@ -647,22 +613,15 @@ fn spawn_reader(
     });
 }
 
-/// Spawn a periodic probe task: re-evaluate the scheduler's stall state and, on
-/// each live path, send a Ping probe and arm the RTT measurement. The matching
-/// Pong (handled by the reader) yields the RTT that feeds the scheduler.
-fn spawn_probe(
-    wired: &Arc<Path>,
-    wifi: &Arc<Path>,
-    scheduler: &Arc<Mutex<Scheduler>>,
-) -> tokio::task::JoinHandle<()> {
+/// Spawn a periodic probe task on each live path. Matching Pongs update the
+/// per-path RTT exposed through status.
+fn spawn_probe(wired: &Arc<Path>, wifi: &Arc<Path>) -> tokio::task::JoinHandle<()> {
     let paths = [Arc::clone(wired), Arc::clone(wifi)];
-    let scheduler = Arc::clone(scheduler);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(RTT_PROBE_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            scheduler.lock().unwrap().tick();
             for p in &paths {
                 if !p.alive.load(Ordering::Relaxed) {
                     continue;
@@ -688,9 +647,8 @@ fn spawn_probe(
 mod tests {
     use super::*;
 
-    /// Echo server: decodes inbound data frames and re-sends them (same seq)
-    /// on the connection they arrived on, so the client sees the aggregate
-    /// scheduler's choice reflected back on the same path.
+    /// Echo server: decodes replicated inbound data frames and re-sends each
+    /// copy on the connection it arrived on; client dedup exposes one result.
     async fn spawn_echo_server() -> SocketAddr {
         let server = Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = server.local_addr().unwrap();

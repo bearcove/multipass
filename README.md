@@ -39,23 +39,21 @@ One trick, and it's the entire thing:
 
 - The client opens **two independent QUIC connections** to the router — one
   pinned to the wired interface, one to Wi-Fi.
-- Outgoing packets are **striped across both** connections, weighted by each
-  path's measured RTT/cwnd — so you get both links' bandwidth, not just
-  failover.
-- Every packet carries a **sequence number**; the receiver dedups and reorders
-  by it, so striping's out-of-order arrival is absorbed transparently.
-- When a path's RTT balloons or its packets stop being acked, it's re-homed
-  onto the survivor **fast** — unplug a cable and the other connection is
-  already carrying traffic. No reconnect, no re-handshake, gap ≈ zero.
+- Outgoing packets are **replicated across both** authenticated live
+  connections. This uses both links for redundancy, not bandwidth aggregation.
+- Every packet carries a **sequence number**; the receiver accepts the first
+  arrival and deduplicates later copies transparently.
+- Unplugging either link leaves the other connection already carrying every
+  packet. No reconnect or re-handshake is needed for traffic continuity.
 
 ```
    your apps (ssh, browser, git — anything)
         │  plain IP, unchanged
         ▼
    ┌─────────────┐      ┌── conn A (en17, wired) ──┐
-   │  utun dev   │─────►│   striped by RTT/cwnd    │──► router ──► internet
+   │  utun dev   │─────►│  replicated on both paths │──► router ──► internet
    │ (tun IP)    │      └── conn B (en0,  wifi)  ──┘
-   └─────────────┘   seq-tagged, dedup+reorder on receipt
+   └─────────────┘     seq-tagged, deduped on receipt
      stable tunnel IP — apps never see the path change
 ```
 

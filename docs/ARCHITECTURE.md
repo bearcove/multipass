@@ -11,18 +11,17 @@ measured baseline (step 0) sent every packet on BOTH connections (active-active
 redundancy) and survived unplug/replug with 0.1% loss, 184ms worst gap. That
 proves the failover property.
 
-## Send policy: AGGREGATE (decided, supersedes plain active-active)
+## Send policy: active-active replication
 
-Rather than duplicate everything (2x bandwidth, shared-bottleneck self-loss),
-the send path **stripes** packets across both connections, weighted by each
-path's live RTT/cwnd (a deficit-WRR scheduler, like mqvpn's `wlb`). The seq
-number + receiver dedup absorb the resulting out-of-order arrival. On
-suspected path trouble (RTT spike, ack stall), the scheduler re-homes traffic
-onto the survivor fast — so it stays seamless, not just fast. Dedup remains
-mandatory: duplicates still occur during failover and re-home.
+The send path transmits every raw IP packet on every authenticated live path
+with the same sequence number. The receiver accepts the first arrival and
+deduplicates later copies. This costs roughly 2x uplink bandwidth while both
+paths are healthy, but removes the detection window that made scheduler-based
+striping lose packets during a physical link transition.
 
-This is a Transport-layer policy only; the proto/wire format (seq + Dedup)
-already supports it unchanged.
+True bandwidth aggregation is not implemented. If added later, it needs an
+explicit transition policy that preserves the already-proven zero-session-loss
+contract rather than silently replacing replication.
 
 ## Why datagrams, not streams (decided)
 
