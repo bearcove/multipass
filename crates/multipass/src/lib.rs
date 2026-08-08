@@ -506,6 +506,19 @@ impl Transport {
         self.path(kind).conn.lock().unwrap().clone()
     }
 
+    /// Verify that a path can carry datagrams of at least `required` bytes.
+    ///
+    /// The tunnel requires 1289 bytes (MTU 1280 + 9 bytes framing). A path
+    /// that cannot carry this is not dual-stack ready and must not be used
+    /// for IPv6 traffic.
+    pub fn verify_datagram_capacity(&self, kind: PathKind, required: usize) -> bool {
+        let conn = self.connection(kind);
+        match conn.max_datagram_size() {
+            Some(max) => max >= required,
+            None => false,
+        }
+    }
+
     fn path(&self, kind: PathKind) -> &Arc<Path> {
         match kind {
             PathKind::Wired => &self.wired,
@@ -776,6 +789,41 @@ mod tests {
                 frame.len(),
                 kind.label(),
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn datagram_capacity_supports_tunnel_mtu() {
+        let addr = spawn_echo_server().await;
+        let t = Transport::connect(
+            addr,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Required: MTU 1280 + 9 bytes framing = 1289 bytes
+        // PMTUD starts at 1200 and climbs; poll until convergence or timeout
+        const REQUIRED: usize = 1289;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for kind in PathKind::ALL {
+            loop {
+                let conn = t.connection(kind);
+                let max = conn.max_datagram_size().unwrap_or(0);
+                if max >= REQUIRED {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!(
+                        "path {} did not reach {REQUIRED}-byte capacity (final: {max})",
+                        kind.label(),
+                    );
+                }
+                // Trigger PMTUD by sending traffic
+                let _ = t.send_data(1, Bytes::from(vec![0u8; 100]));
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
     }
 
