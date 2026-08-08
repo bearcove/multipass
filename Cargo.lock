@@ -628,6 +628,33 @@ name = "multipass"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "libc",
+ "multipass-proto",
+ "n0-error",
+ "noq",
+ "noq-proto",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "multipass-proto"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
+name = "multipass-server"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "libc",
+ "multipass-proto",
  "n0-error",
  "noq",
  "noq-proto",

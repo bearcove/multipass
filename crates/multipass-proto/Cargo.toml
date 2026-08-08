@@ -1,0 +1,8 @@
+[package]
+name = "multipass-proto"
+version = "0.1.0"
+edition = "2024"
+description = "multipass wire format: framing, dedup, control messages (no I/O)"
+
+[dependencies]
+bytes.workspace = true

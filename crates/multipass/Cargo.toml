@@ -1,0 +1,20 @@
+[package]
+name = "multipass"
+version = "0.1.0"
+edition = "2024"
+description = "multipass client daemon (multipassd): utun + dual-connection seamless failover transport"
+default-run = "multipass"
+
+[dependencies]
+multipass-proto = { path = "../multipass-proto" }
+bytes.workspace = true
+noq.workspace = true
+noq-proto.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+n0-error.workspace = true
