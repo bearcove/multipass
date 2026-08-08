@@ -8,6 +8,9 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::Ipv4Addr;
 
+mod sack;
+pub use sack::SackScoreboard;
+
 /// ALPN for the multipass tunnel connection.
 pub const ALPN: &[u8] = b"multipass/0";
 
@@ -34,6 +37,8 @@ pub enum Tag {
     Ping = 3,
     /// Liveness reply. Payload: [nonce u64] (echoed).
     Pong = 4,
+    /// Selective acknowledgment. Payload: [largest_contiguous u64][range_count u8][ranges...].
+    Sack = 5,
 }
 
 impl Tag {
@@ -44,6 +49,7 @@ impl Tag {
             2 => Tag::Assign,
             3 => Tag::Ping,
             4 => Tag::Pong,
+            5 => Tag::Sack,
             _ => return None,
         })
     }
@@ -69,6 +75,10 @@ pub enum Frame {
     },
     Pong {
         nonce: u64,
+    },
+    Sack {
+        largest_contiguous: u64,
+        ranges: Vec<(u64, u64)>,
     },
 }
 
@@ -99,6 +109,18 @@ pub fn encode(frame: &Frame) -> Bytes {
         Frame::Pong { nonce } => {
             out.put_u8(Tag::Pong as u8);
             out.put_u64(*nonce);
+        }
+        Frame::Sack {
+            largest_contiguous,
+            ranges,
+        } => {
+            out.put_u8(Tag::Sack as u8);
+            out.put_u64(*largest_contiguous);
+            out.put_u8(ranges.len() as u8);
+            for &(start, end) in ranges {
+                out.put_u64(start);
+                out.put_u64(end);
+            }
         }
     }
     out.freeze()
@@ -150,6 +172,26 @@ pub fn decode(mut buf: &[u8]) -> Option<Frame> {
             }
             Some(Frame::Pong {
                 nonce: buf.get_u64(),
+            })
+        }
+        Tag::Sack => {
+            if buf.remaining() < 9 {
+                return None;
+            }
+            let largest_contiguous = buf.get_u64();
+            let range_count = buf.get_u8() as usize;
+            if buf.remaining() < range_count * 16 {
+                return None;
+            }
+            let mut ranges = Vec::with_capacity(range_count);
+            for _ in 0..range_count {
+                let start = buf.get_u64();
+                let end = buf.get_u64();
+                ranges.push((start, end));
+            }
+            Some(Frame::Sack {
+                largest_contiguous,
+                ranges,
             })
         }
     }
@@ -274,6 +316,26 @@ mod tests {
             let enc = encode(&f);
             let dec = decode(&enc).unwrap();
             assert_eq!(format!("{dec:?}"), format!("{f:?}"));
+        }
+    }
+
+    #[test]
+    fn sack_frame_roundtrip() {
+        let sack = Frame::Sack {
+            largest_contiguous: 100,
+            ranges: vec![(95, 98), (85, 90)],
+        };
+        let encoded = encode(&sack);
+        let decoded = decode(&encoded).unwrap();
+        match decoded {
+            Frame::Sack {
+                largest_contiguous,
+                ranges,
+            } => {
+                assert_eq!(largest_contiguous, 100);
+                assert_eq!(ranges, vec![(95, 98), (85, 90)]);
+            }
+            _ => panic!("wrong frame"),
         }
     }
 
