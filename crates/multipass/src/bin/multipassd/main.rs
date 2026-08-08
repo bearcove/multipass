@@ -660,6 +660,28 @@ mod tests {
         let request = build_canary_request(identifier, sequence);
         assert_ne!(&request[22..24], &[0, 0]);
     }
+    #[test]
+    fn canary_identity_accepts_valid_zero_reply_checksum_at_b2af() {
+        let (identifier, sequence) = canary_identity(0xb2af);
+        let reply = build_canary_reply(identifier, sequence);
+
+        assert_eq!(&reply[22..24], &[0, 0]);
+        assert_eq!(validate_canary_reply(&reply, identifier, sequence), Ok(()));
+    }
+
+    fn build_canary_reply(identifier: u16, sequence: u16) -> Vec<u8> {
+        let mut reply = build_canary_request(identifier, sequence).to_vec();
+        reply[12..16].copy_from_slice(&[10, 10, 99, 1]);
+        reply[16..20].copy_from_slice(&[10, 10, 99, 2]);
+        reply[20] = 0;
+        reply[22..24].fill(0);
+        let icmp_checksum = internet_checksum(&reply[20..]);
+        reply[22..24].copy_from_slice(&icmp_checksum.to_be_bytes());
+        reply[10..12].fill(0);
+        let ip_checksum = internet_checksum(&reply[..20]);
+        reply[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+        reply
+    }
 
     #[test]
     fn raw_canary_reply_requires_matching_valid_echo() {
