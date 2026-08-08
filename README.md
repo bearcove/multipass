@@ -35,31 +35,37 @@ transport layer — which is the whole trick.
 
 ## How it works
 
-One trick, and it's the entire thing:
+Two ideas: aggregation for throughput, and a reliability layer for seamlessness.
 
 - The client opens **two independent QUIC connections** to the router — one
   pinned to the wired interface, one to Wi-Fi.
-- Outgoing packets are **replicated across both** authenticated live
-  connections. This uses both links for redundancy, not bandwidth aggregation.
-- Every packet carries a **sequence number**; the receiver accepts the first
-  arrival and deduplicates later copies transparently.
-- Unplugging either link leaves the other connection already carrying every
-  packet. No reconnect or re-handshake is needed for traffic continuity.
+- Outgoing packets are **striped across both** connections by a
+  congestion-aware scheduler (lowest RTT + queue cost). A single flow can use
+  both links at once — ~2.4 Gbps wired + ~0.9 Gbps Wi-Fi ≈ 3.3 Gbps.
+- Every packet carries a **sequence number** and is retained in a send window
+  until the peer's **selective ACK** confirms it. On a gap or path failure the
+  same sequence is retransmitted on the surviving path; the receiver dedups by
+  sequence, so nothing is lost or duplicated.
+- Unplugging either link retransmits that path's in-flight packets onto the
+  survivor. No reconnect or re-handshake — sessions stay up.
 
 ```
    your apps (ssh, browser, git — anything)
         │  plain IP, unchanged
         ▼
    ┌─────────────┐      ┌── conn A (en17, wired) ──┐
-   │  utun dev   │─────►│  replicated on both paths │──► router ──► internet
+   │  utun dev   │─────►│  striped by RTT/queue     │──► router ──► internet
    │ (tun IP)    │      └── conn B (en0,  wifi)  ──┘
-   └─────────────┘     seq-tagged, deduped on receipt
+   └─────────────┘   seq-tagged, SACK-acked, deduped
      stable tunnel IP — apps never see the path change
 ```
 
 Measured on the real desk (unplug eth, replug, unplug wifi, replug): **0.1%
 packet loss, worst gap 184 ms**, and that spike is the interface coming *back*,
 not the failure. The failure direction is effectively zero-gap.
+
+Dual-stack: the tunnel carries IPv4 and IPv6 (MTU 1280). IPv6 uses NAT66 at the
+router until the ISP prefix delegation arrives, then switches to native routed.
 
 ## Status
 
