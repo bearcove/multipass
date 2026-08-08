@@ -402,20 +402,27 @@ impl Transport {
         p.rtt.store(0, Ordering::Relaxed);
         *p.probe.lock().unwrap() = None;
         self.scheduler.lock().unwrap().set_alive(kind, true);
-        spawn_reader(p, &self.data_tx, &self.control_tx, &self.dead_tx, &self.scheduler);
+        spawn_reader(
+            p,
+            &self.data_tx,
+            &self.control_tx,
+            &self.dead_tx,
+            &self.scheduler,
+        );
         tracing::info!(path = %kind.label(), "path reconnected");
         Ok(())
     }
 
     /// Send a raw IP packet as a data frame on the scheduler-chosen path.
-    pub fn send_data(&self, seq: u64, packet: Bytes) {
-        self.send_frame(&Frame::Data { seq, packet });
+    /// Returns true only when noq accepts the datagram for transmission.
+    pub fn send_data(&self, seq: u64, packet: Bytes) -> bool {
+        self.send_frame(&Frame::Data { seq, packet })
     }
 
     /// Send a frame on the scheduler-chosen path. Used for data and control
     /// (Hello, Ping, ...). If the chosen path just died, re-homes to the
-    /// survivor; drops the frame if nothing is alive.
-    pub fn send_frame(&self, frame: &Frame) {
+    /// survivor; returns false if nothing is alive or noq rejects the datagram.
+    pub fn send_frame(&self, frame: &Frame) -> bool {
         let d = multipass_proto::encode(frame);
         let kind = self.scheduler.lock().unwrap().pick();
         let p = if self.is_alive(kind) {
@@ -427,12 +434,19 @@ impl Transport {
                 PathKind::Wired
             };
             if !self.is_alive(other) {
-                return;
+                return false;
             }
             self.path(other)
         };
-        if p.conn.lock().unwrap().send_datagram(d).is_ok() {
-            p.transmitted.fetch_add(1, Ordering::Relaxed);
+        match p.conn.lock().unwrap().send_datagram(d) {
+            Ok(()) => {
+                p.transmitted.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(path = %p.kind.label(), %e, "datagram send failed");
+                false
+            }
         }
     }
 
@@ -456,7 +470,12 @@ impl Transport {
     /// Wait until one path's reader task dies (read error / connection close),
     /// returning which path. The daemon re-dials that path.
     pub async fn recv_dead(&self) -> PathKind {
-        self.dead_rx.lock().await.recv().await.unwrap_or(PathKind::Wired)
+        self.dead_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .unwrap_or(PathKind::Wired)
     }
 
     /// Snapshot of both paths' liveness.
@@ -539,7 +558,11 @@ fn spawn_reader(
                     match multipass_proto::decode(&d) {
                         Some(Frame::Data { seq, packet }) => {
                             if data_tx
-                                .send(Data { seq, packet, path: kind })
+                                .send(Data {
+                                    seq,
+                                    packet,
+                                    path: kind,
+                                })
                                 .await
                                 .is_err()
                             {
@@ -547,9 +570,8 @@ fn spawn_reader(
                             }
                         }
                         Some(Frame::Ping { nonce }) => {
-                            let _ = conn.send_datagram(multipass_proto::encode(&Frame::Pong {
-                                nonce,
-                            }));
+                            let _ =
+                                conn.send_datagram(multipass_proto::encode(&Frame::Pong { nonce }));
                         }
                         Some(Frame::Pong { nonce }) => {
                             // RTT from the matching in-flight probe, if any.
@@ -641,9 +663,11 @@ mod tests {
                                 if let Some(Frame::Data { seq, packet }) =
                                     multipass_proto::decode(&d)
                                 {
-                                    let _ = conn.send_datagram(multipass_proto::encode(
-                                        &Frame::Data { seq, packet },
-                                    ));
+                                    let _ =
+                                        conn.send_datagram(multipass_proto::encode(&Frame::Data {
+                                            seq,
+                                            packet,
+                                        }));
                                 }
                             }
                             Err(_) => break,
@@ -694,5 +718,48 @@ mod tests {
         assert!(st.wired.transmitted > 0, "scheduler must use wired");
         assert!(st.wifi.transmitted > 0, "scheduler must use wifi");
         assert!(st.wired.received > 0 && st.wifi.received > 0);
+    }
+    #[tokio::test]
+    async fn tunnel_mtu_packet_fits_quic_datagram() {
+        let addr = spawn_echo_server().await;
+        let t = Transport::connect(
+            addr,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let frame = multipass_proto::encode(&Frame::Data {
+            seq: 1,
+            packet: Bytes::from(vec![0; multipass_proto::TUNNEL_MTU as usize]),
+        });
+        for kind in PathKind::ALL {
+            let maximum = t.connection(kind).max_datagram_size().unwrap();
+            assert!(
+                frame.len() <= maximum,
+                "{}-byte tunnel frame exceeds {} path's {maximum}-byte QUIC datagram limit",
+                frame.len(),
+                kind.label(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_data_reports_send_failure() {
+        let addr = spawn_echo_server().await;
+        let t = Transport::connect(
+            addr,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!t.send_data(1, Bytes::from(vec![0; 64 * 1024])));
+        assert_eq!(
+            t.status().wired.transmitted + t.status().wifi.transmitted,
+            0
+        );
     }
 }

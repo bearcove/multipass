@@ -82,8 +82,18 @@ impl Scheduler {
         Self {
             cfg,
             health: [
-                PathHealth { weight: w, rtt: None, last_recv: None, alive: true },
-                PathHealth { weight: w, rtt: None, last_recv: None, alive: true },
+                PathHealth {
+                    weight: w,
+                    rtt: None,
+                    last_recv: None,
+                    alive: true,
+                },
+                PathHealth {
+                    weight: w,
+                    rtt: None,
+                    last_recv: None,
+                    alive: true,
+                },
             ],
             credits: [0, 0],
         }
@@ -177,7 +187,10 @@ impl Scheduler {
         // Reference RTT = the minimum among alive, non-stalled, measured paths.
         let mut ref_rtt: Option<Duration> = None;
         for h in &self.health {
-            if h.alive && !Self::stalled(&self.cfg, h, now) && let Some(r) = h.rtt {
+            if h.alive
+                && !Self::stalled(&self.cfg, h, now)
+                && let Some(r) = h.rtt
+            {
                 ref_rtt = Some(match ref_rtt {
                     Some(cur) if cur <= r => cur,
                     _ => r,
@@ -240,7 +253,10 @@ mod tests {
         let mut s = Scheduler::new(SchedulerConfig::default());
         let (wired, wifi) = both_have_traffic(&mut s, 100);
         assert!(wired > 0 && wifi > 0, "equal weights must spread load");
-        assert!((wired as i64 - wifi as i64).abs() <= 1, "alternating evenly");
+        assert!(
+            (wired as i64 - wifi as i64).abs() <= 1,
+            "alternating evenly"
+        );
     }
 
     #[test]
@@ -261,7 +277,10 @@ mod tests {
         s.note_rtt(PathKind::Wifi, Duration::from_millis(10));
         let (wired, wifi) = both_have_traffic(&mut s, 1000);
         assert!(wired > wifi, "faster path should carry more");
-        assert!(wifi > 0, "slower path still carries a little (warm standby)");
+        assert!(
+            wifi > 0,
+            "slower path still carries a little (warm standby)"
+        );
     }
 
     #[test]

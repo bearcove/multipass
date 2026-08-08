@@ -15,9 +15,9 @@ pub const ALPN: &[u8] = b"multipass/0";
 pub const TUNNEL_SERVER: Ipv4Addr = Ipv4Addr::new(10, 10, 99, 1);
 pub const TUNNEL_CLIENT: Ipv4Addr = Ipv4Addr::new(10, 10, 99, 2);
 pub const TUNNEL_PREFIX: u8 = 24;
-/// Default TUN MTU. QUIC datagrams over 1500-MTU Ethernet/WiFi; leave headroom
-/// for QUIC+UDP+IP overhead so inner packets never need fragmentation.
-pub const TUNNEL_MTU: u16 = 1382;
+/// Conservative inner MTU for QUIC DATAGRAM. noq initially permits 1162-byte
+/// application datagrams; the Data frame adds a one-byte tag and u64 sequence.
+pub const TUNNEL_MTU: u16 = 1153;
 
 /// Frame type tag (first byte of every datagram).
 #[repr(u8)]
@@ -52,11 +52,24 @@ impl Tag {
 /// A decoded frame. `Data`'s packet is owned Bytes.
 #[derive(Debug, Clone)]
 pub enum Frame {
-    Data { seq: u64, packet: Bytes },
-    Hello { client_nonce: u64 },
-    Assign { addr: Ipv4Addr, prefix: u8, mtu: u16 },
-    Ping { nonce: u64 },
-    Pong { nonce: u64 },
+    Data {
+        seq: u64,
+        packet: Bytes,
+    },
+    Hello {
+        client_nonce: u64,
+    },
+    Assign {
+        addr: Ipv4Addr,
+        prefix: u8,
+        mtu: u16,
+    },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
 }
 
 /// Encode a frame into a fresh buffer ready to send as one datagram.
@@ -110,7 +123,9 @@ pub fn decode(mut buf: &[u8]) -> Option<Frame> {
             if buf.remaining() < 8 {
                 return None;
             }
-            Some(Frame::Hello { client_nonce: buf.get_u64() })
+            Some(Frame::Hello {
+                client_nonce: buf.get_u64(),
+            })
         }
         Tag::Assign => {
             if buf.remaining() < 7 {
@@ -125,13 +140,17 @@ pub fn decode(mut buf: &[u8]) -> Option<Frame> {
             if buf.remaining() < 8 {
                 return None;
             }
-            Some(Frame::Ping { nonce: buf.get_u64() })
+            Some(Frame::Ping {
+                nonce: buf.get_u64(),
+            })
         }
         Tag::Pong => {
             if buf.remaining() < 8 {
                 return None;
             }
-            Some(Frame::Pong { nonce: buf.get_u64() })
+            Some(Frame::Pong {
+                nonce: buf.get_u64(),
+            })
         }
     }
 }
@@ -153,7 +172,11 @@ impl Dedup {
     const WORDS: usize = (Self::WINDOW / 64) as usize;
 
     pub fn new() -> Self {
-        Self { max_seq: 0, started: false, bits: [0; Self::WORDS] }
+        Self {
+            max_seq: 0,
+            started: false,
+            bits: [0; Self::WORDS],
+        }
     }
 
     /// Returns true if this seq is new (first time seen), false if duplicate
@@ -220,7 +243,10 @@ mod tests {
     #[test]
     fn data_roundtrip() {
         let pkt = Bytes::from_static(&[0x45, 0x00, 0x00, 0x3c, 1, 2, 3]);
-        let f = Frame::Data { seq: 42, packet: pkt.clone() };
+        let f = Frame::Data {
+            seq: 42,
+            packet: pkt.clone(),
+        };
         let enc = encode(&f);
         match decode(&enc).unwrap() {
             Frame::Data { seq, packet } => {
@@ -234,8 +260,14 @@ mod tests {
     #[test]
     fn control_roundtrip() {
         for f in [
-            Frame::Hello { client_nonce: 0xdeadbeef },
-            Frame::Assign { addr: TUNNEL_CLIENT, prefix: TUNNEL_PREFIX, mtu: TUNNEL_MTU },
+            Frame::Hello {
+                client_nonce: 0xdeadbeef,
+            },
+            Frame::Assign {
+                addr: TUNNEL_CLIENT,
+                prefix: TUNNEL_PREFIX,
+                mtu: TUNNEL_MTU,
+            },
             Frame::Ping { nonce: 7 },
             Frame::Pong { nonce: 7 },
         ] {

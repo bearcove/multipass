@@ -26,8 +26,8 @@
 //! tunnel bytes up/down. JSON is hand-rolled (no serde in this codebase).
 
 use std::io;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -131,8 +131,7 @@ fn status_json(shared: &Shared) -> String {
     let rx = shared.rx_bytes.load(Ordering::Relaxed);
     format!(
         "{{\"type\":\"status\",\"connected\":{connected},\"wired\":{},\"wifi\":{},\"active_path\":{active},\"rtt_ms\":{rtt},\"tx\":{tx},\"rx\":{rx}}}",
-        paths.wired_alive,
-        paths.wifi_alive,
+        paths.wired_alive, paths.wifi_alive,
     )
 }
 

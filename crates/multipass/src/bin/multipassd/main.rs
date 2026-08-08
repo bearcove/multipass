@@ -119,16 +119,28 @@ fn parse_args() -> Result<Opts, String> {
     if args.len() < 4 {
         return Err("usage: multipassd <server:port> <wired-ip> <wifi-ip> [socket-path]".into());
     }
-    let server = args[1].parse().map_err(|e| format!("bad server addr: {e}"))?;
+    let server = args[1]
+        .parse()
+        .map_err(|e| format!("bad server addr: {e}"))?;
     let wired = args[2].parse().map_err(|e| format!("bad wired ip: {e}"))?;
     let wifi = args[3].parse().map_err(|e| format!("bad wifi ip: {e}"))?;
-    let socket = args.get(4).cloned().unwrap_or_else(|| ipc::DEFAULT_SOCKET.to_string());
-    Ok(Opts { server, wired, wifi, socket })
+    let socket = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(|| ipc::DEFAULT_SOCKET.to_string());
+    Ok(Opts {
+        server,
+        wired,
+        wifi,
+        socket,
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -160,6 +172,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let utun = Arc::new(AsyncFd::new(utun_raw)?);
     let utun_name = utun.get_ref().name();
     info!(iface = %utun_name, "utun open");
+    let (tx_q, mut rx_q) = mpsc::channel::<Bytes>(256);
+    spawn_utun_reader(utun.clone(), tx_q);
+    let mut seq = 0u64;
 
     let shared = Shared::new(&opts, wired_iface, wifi_iface, utun_name);
 
@@ -214,6 +229,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if !shared.enabled.load(Ordering::Relaxed) {
                     continue;
                 }
+
+                let canary_ok =
+                    run_canary_pump(utun.clone(), &mut transport, &mut rx_q, &shared, &mut seq)
+                        .await;
+                if !canary_ok {
+                    error!("dataplane canary failed; disabling tunnel");
+                    shared.enabled.store(false, Ordering::Relaxed);
+                    continue;
+                }
+                if !shared.enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
                 if !routes::setup(
                     &utun_name,
                     opts.server.ip(),
@@ -234,20 +261,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     continue;
                 }
                 shared.active.store(true, Ordering::Relaxed);
+                match pump(
+                    utun.clone(),
+                    &mut transport,
+                    shared.clone(),
+                    &mut rx_q,
+                    &mut seq,
+                )
+                .await
+                {
+                    PumpEnd::Reconnect => info!("transport ended; re-dialing"),
+                    PumpEnd::Fatal(e) => {
+                        error!(%e, "pump fatal");
+                        return Err(e);
+                    }
+                }
             }
             Err(e) => {
                 error!(%e, "handshake failed; re-dialing");
                 continue;
-            }
-        }
-
-        match pump(utun.clone(), &mut transport, shared.clone()).await {
-            PumpEnd::Reconnect => {
-                info!("transport ended; re-dialing");
-            }
-            PumpEnd::Fatal(e) => {
-                error!(%e, "pump fatal");
-                return Err(e);
             }
         }
 
@@ -274,7 +306,9 @@ async fn handshake(
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
         ^ (std::process::id() as u64);
-    transport.send_frame(&Frame::Hello { client_nonce: nonce });
+    transport.send_frame(&Frame::Hello {
+        client_nonce: nonce,
+    });
     loop {
         match transport.recv_control().await {
             Some((_, Frame::Assign { addr, prefix, mtu })) => {
@@ -313,6 +347,44 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 ///     picks the live path)
 ///   * `recv_data` (deduped) -> write packet to utun (when enabled)
 ///   * every 500ms: republish the path snapshot and re-dial dead paths
+async fn run_canary_pump(
+    utun: Arc<AsyncFd<utun::Utun>>,
+    transport: &mut Transport,
+    rx_q: &mut mpsc::Receiver<Bytes>,
+    shared: &Shared,
+    seq: &mut u64,
+) -> bool {
+    let ping = tokio::task::spawn_blocking(run_canary);
+    tokio::pin!(ping);
+
+    let mut wbuf = vec![0u8; TUNNEL_MTU as usize + 4];
+
+    loop {
+        tokio::select! {
+            result = &mut ping => {
+                return result.unwrap_or(false);
+            }
+            Some(pkt) = rx_q.recv() => {
+                *seq += 1;
+                if transport.send_data(*seq, pkt.clone()) {
+                    shared.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                }
+            }
+            d = transport.recv_data() => {
+                let Some(d) = d else {
+                    return false;
+                };
+                update_active(shared, d.path);
+                shared.rx_bytes.fetch_add(d.packet.len() as u64, Ordering::Relaxed);
+                if let Err(e) = utun.get_ref().write_packet(&mut wbuf, &d.packet) {
+                    warn!(%e, "utun write error during dataplane canary");
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 ///
 /// Reconnect is driven by `is_alive()` polling (the transport's reader marks a
 /// path dead when it errors) rather than `recv_dead`, because the receive
@@ -321,15 +393,11 @@ async fn pump(
     utun: Arc<AsyncFd<utun::Utun>>,
     transport: &mut Transport,
     shared: Arc<Shared>,
+    rx_q: &mut mpsc::Receiver<Bytes>,
+    seq: &mut u64,
 ) -> PumpEnd {
-    // The utun reader needs its own seq counter per outbound packet; the pump
-    // owns it here alongside the transport.
-    let mut seq = 0u64;
     let mut wbuf = vec![0u8; TUNNEL_MTU as usize + 4];
     let mut backoff = [Instant::now(); 2];
-
-    let (tx_q, mut rx_q) = mpsc::channel::<Bytes>(256);
-    spawn_utun_reader(utun.clone(), tx_q);
 
     let mut tick = tokio::time::interval(RECONNECT_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -338,9 +406,10 @@ async fn pump(
         tokio::select! {
             Some(pkt) = rx_q.recv() => {
                 if shared.enabled.load(Ordering::Relaxed) {
-                    seq += 1;
-                    transport.send_data(seq, pkt.clone());
-                    shared.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                    *seq += 1;
+                    if transport.send_data(*seq, pkt.clone()) {
+                        shared.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                    }
                 }
             }
             d = transport.recv_data() => {
@@ -387,11 +456,7 @@ fn update_active(shared: &Shared, kind: PathKind) {
 }
 
 /// Re-dial any path the transport reports dead, rate-limited per path.
-async fn reconnect_dead(
-    transport: &Transport,
-    shared: &Shared,
-    backoff: &mut [Instant; 2],
-) {
+async fn reconnect_dead(transport: &Transport, shared: &Shared, backoff: &mut [Instant; 2]) {
     for kind in PathKind::ALL {
         if transport.is_alive(kind) {
             continue;
@@ -448,10 +513,49 @@ fn spawn_utun_reader(utun: Arc<AsyncFd<utun::Utun>>, tx_q: mpsc::Sender<Bytes>) 
     });
 }
 
+fn run_canary() -> bool {
+    run_canary_with(|prog, args| std::process::Command::new(prog).args(args).status())
+}
+
+fn run_canary_with<F>(mut run_command: F) -> bool
+where
+    F: FnMut(&str, &[&str]) -> io::Result<std::process::ExitStatus>,
+{
+    match run_command("/sbin/ping", &["-n", "-c", "1", "-W", "1000", "10.10.99.1"]) {
+        Ok(status) => status.success(),
+        Err(e) => {
+            warn!(%e, "dataplane canary command failed");
+            false
+        }
+    }
+}
+
 /// Extract the IPv4 address from an `IpAddr` (we only tunnel IPv4).
 fn source_ipv4(ip: &IpAddr) -> Option<Ipv4Addr> {
     match ip {
         IpAddr::V4(v4) => Some(*v4),
         IpAddr::V6(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::ExitStatus;
+
+    use super::run_canary_with;
+
+    #[test]
+    fn canary_binds_one_ping_to_tunnel_peer() {
+        let mut program = String::new();
+        let mut arguments = Vec::new();
+        let ok = run_canary_with(|prog, args| {
+            program = prog.to_string();
+            arguments = args.iter().map(|arg| arg.to_string()).collect();
+            Ok(ExitStatus::default())
+        });
+
+        assert!(ok);
+        assert_eq!(program, "/sbin/ping");
+        assert_eq!(arguments, ["-n", "-c", "1", "-W", "1000", "10.10.99.1"]);
     }
 }

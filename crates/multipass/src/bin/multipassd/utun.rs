@@ -28,8 +28,8 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{
-    c_char, c_uchar, sockaddr, sockaddr_ctl, AF_INET, AF_SYSTEM, AF_SYS_CONTROL,
-    CTLIOCGINFO, SOCK_DGRAM, SYSPROTO_CONTROL, ctl_info,
+    AF_INET, AF_SYS_CONTROL, AF_SYSTEM, CTLIOCGINFO, SOCK_DGRAM, SYSPROTO_CONTROL, c_char, c_uchar,
+    ctl_info, sockaddr, sockaddr_ctl,
 };
 
 /// Kernel control name for the utun subsystem.
@@ -126,7 +126,6 @@ impl AsRawFd for Utun {
 }
 
 impl Utun {
-
     /// Read one packet into `buf` (which must hold at least 4 bytes for the
     /// AF header). Strips the 4-byte AF header and validates it is `AF_INET`.
     /// Returns `Ok(Some(len))` with `buf[..len]` = the raw IPv4 packet, or
@@ -216,8 +215,7 @@ pub fn iface_for_ip(ip: std::net::Ipv4Addr) -> Option<String> {
                 let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
                 let addr = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
                 if addr == ip {
-                    let name =
-                        unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy();
+                    let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy();
                     out = Some(name.into_owned());
                     break;
                 }

@@ -19,9 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use multipass_proto::{
-    Dedup, Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, encode,
-};
+use multipass_proto::{Dedup, Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, encode};
 use noq::{Connection, Endpoint, ServerConfig, TransportConfig};
 use noq_proto::crypto::rustls::QuicServerConfig;
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -131,7 +129,12 @@ impl Session {
 }
 
 /// Drive one client connection: read datagrams, decode, dispatch.
-async fn conn_handler(conn: Connection, id: u64, session: Arc<Session>, to_tun: mpsc::Sender<Bytes>) {
+async fn conn_handler(
+    conn: Connection,
+    id: u64,
+    session: Arc<Session>,
+    to_tun: mpsc::Sender<Bytes>,
+) {
     loop {
         match conn.read_datagram().await {
             Ok(d) => {
@@ -192,7 +195,11 @@ async fn run(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + 
             let mut buf = vec![0u8; TUNNEL_MTU as usize + 64];
             loop {
                 let n = unsafe {
-                    libc::read(rfd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                    libc::read(
+                        rfd.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
                 };
                 if n < 0 {
                     let e = std::io::Error::last_os_error();
@@ -205,7 +212,10 @@ async fn run(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + 
                 if n == 0 {
                     break; // EOF
                 }
-                if tx.blocking_send(Bytes::copy_from_slice(&buf[..n as usize])).is_err() {
+                if tx
+                    .blocking_send(Bytes::copy_from_slice(&buf[..n as usize]))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -282,7 +292,9 @@ async fn run(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + 
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -318,17 +330,12 @@ mod tests {
         .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-            .unwrap();
+        let client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
         client.set_default_client_config(multipass::client_config());
-        let connecting = client
-            .connect(server_addr, multipass::SERVER_NAME)
-            .unwrap();
+        let connecting = client.connect(server_addr, multipass::SERVER_NAME).unwrap();
 
-        let (accepted, connected) = tokio::join!(
-            async { server.accept().await.unwrap().await },
-            connecting,
-        );
+        let (accepted, connected) =
+            tokio::join!(async { server.accept().await.unwrap().await }, connecting,);
         accepted.unwrap();
         connected.unwrap();
     }
