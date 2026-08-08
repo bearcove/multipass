@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use multipass_proto::{
-    Dedup, Frame, SackScoreboard, SendWindow, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX,
-    TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX, encode,
+    Dedup, Frame, PathKind, SackScoreboard, Scheduler, SendWindow, TUNNEL_CLIENT, TUNNEL_MTU,
+    TUNNEL_PREFIX, TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX, encode,
 };
 use noq::{Connection, Endpoint, ServerConfig, TransportConfig};
 use noq_proto::crypto::rustls::QuicServerConfig;
@@ -68,6 +68,10 @@ struct LiveConn {
     id: u64,
     conn: Option<Connection>,
     epoch: Option<u64>,
+    /// Scheduling slot for this path within the epoch (Wired/Wifi label; the
+    /// physical mapping is irrelevant — what matters is the scheduler can
+    /// distinguish the two paths by measured RTT/queue).
+    path: Option<PathKind>,
 }
 
 struct SessionState {
@@ -79,6 +83,8 @@ struct SessionState {
     scoreboard: SackScoreboard,
     /// Retention window for server→client packets (aggregation retransmit).
     send_window: SendWindow,
+    /// Path scheduler for server→client aggregation (the download direction).
+    scheduler: Scheduler,
 }
 
 /// A single logical client session. Connection authentication, epoch changes,
@@ -99,6 +105,7 @@ impl Session {
                 dedup: Dedup::new(),
                 scoreboard: SackScoreboard::new(),
                 send_window: SendWindow::new(4096),
+                scheduler: Scheduler::new(),
             }),
             next_conn_id: AtomicU64::new(0),
             seq: AtomicU64::new(0),
@@ -115,13 +122,20 @@ impl Session {
             id,
             conn: Some(conn),
             epoch: None,
+            path: None,
         });
         debug!(id, "connection added to session");
         id
     }
 
     async fn remove_conn(&self, id: u64) {
-        self.state.lock().await.conns.retain(|conn| conn.id != id);
+        let mut state = self.state.lock().await;
+        if let Some(conn) = state.conns.iter().find(|c| c.id == id)
+            && let Some(path) = conn.path
+        {
+            state.scheduler.set_eligible(path, false);
+        }
+        state.conns.retain(|conn| conn.id != id);
         debug!(id, "connection removed from session");
     }
 
@@ -154,12 +168,25 @@ impl Session {
             state.dedup = Dedup::new();
             state.scoreboard = SackScoreboard::new();
             state.send_window = SendWindow::new(4096);
+            state.scheduler = Scheduler::new();
         }
+
+        // Assign this connection the next free scheduling slot in the epoch.
+        let used: HashSet<PathKind> = state
+            .conns
+            .iter()
+            .filter_map(|c| (c.epoch == Some(epoch)).then_some(c.path).flatten())
+            .collect();
+        let slot = PathKind::ALL.into_iter().find(|k| !used.contains(k));
 
         let Some(conn) = state.conns.iter_mut().find(|conn| conn.id == id) else {
             return false;
         };
         conn.epoch = Some(epoch);
+        conn.path = slot;
+        if let Some(slot) = slot {
+            state.scheduler.set_eligible(slot, true);
+        }
         true
     }
 
@@ -211,17 +238,41 @@ impl Session {
         self.send_one(data).await
     }
 
-    /// Send an encoded frame on the single best live connection (aggregation).
-    /// Falls back to any live connection. Returns true if queued on one.
+    /// Send an encoded frame on the scheduler-chosen live connection. This is
+    /// the download aggregation path: the scheduler picks the lowest-cost
+    /// (RTT + queue) ready connection per packet, striping across both to
+    /// combine their bandwidth.
     async fn send_one(&self, data: Bytes) -> bool {
         let mut state = self.state.lock().await;
         let epoch = state.epoch;
-        // Pick the first live connection in the current epoch. The scheduler
-        // refinement (RTT/queue-aware choice) lives client-side; the server has
-        // symmetric per-connection data but a simple lowest-id live pick keeps
-        // this change scoped to reliability, not yet full server scheduling.
+
+        // Collect per-connection stats first (immutable borrow), then release.
+        let stats: Vec<(PathKind, Option<Duration>, usize)> = state
+            .conns
+            .iter()
+            .filter(|live| live.epoch == epoch)
+            .filter_map(|live| {
+                let path = live.path?;
+                let conn = live.conn.as_ref()?;
+                Some((
+                    path,
+                    conn.rtt(noq_proto::PathId::ZERO),
+                    conn.datagram_send_buffer_space(),
+                ))
+            })
+            .collect();
+        for (path, rtt, space) in stats {
+            if let Some(rtt) = rtt {
+                state.scheduler.note_rtt(path, rtt);
+            }
+            state.scheduler.note_queue_space(path, space);
+        }
+
+        let Some(chosen) = state.scheduler.pick() else {
+            return false;
+        };
         for live in state.conns.iter_mut() {
-            if live.epoch != epoch {
+            if live.epoch != epoch || live.path != Some(chosen) {
                 continue;
             }
             let Some(conn) = live.conn.as_ref() else {
@@ -231,11 +282,12 @@ impl Session {
                 Ok(()) => return true,
                 Err(noq::SendDatagramError::ConnectionLost(e)) => {
                     warn!(id = live.id, %e, "connection lost while sending");
-                    continue;
+                    state.scheduler.set_eligible(chosen, false);
+                    return false;
                 }
                 Err(e) => {
                     warn!(id = live.id, %e, "datagram send failed");
-                    continue;
+                    return false;
                 }
             }
         }
@@ -266,6 +318,7 @@ impl Session {
             id,
             conn: None,
             epoch: None,
+            path: None,
         });
         id
     }
@@ -632,6 +685,41 @@ mod tests {
                 assert_eq!(mtu, 1280);
             }
             _ => panic!("expected Assign"),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_assigns_distinct_path_slots_and_schedules() {
+        let session = Session::new();
+        let first = session.add_test_conn().await;
+        let second = session.add_test_conn().await;
+        assert!(session.authenticate(first, 10).await);
+        assert!(session.authenticate(second, 10).await);
+
+        // The two connections in one epoch must occupy distinct scheduling
+        // slots (Wired/Wifi labels), which is what lets the scheduler stripe
+        // the download direction across both.
+        let (p1, p2) = {
+            let state = session.state.lock().await;
+            let p1 = state.conns.iter().find(|c| c.id == first).unwrap().path;
+            let p2 = state.conns.iter().find(|c| c.id == second).unwrap().path;
+            (p1, p2)
+        };
+        assert!(p1.is_some() && p2.is_some());
+        assert_ne!(p1, p2, "each connection gets a distinct scheduling slot");
+
+        // With a measured RTT difference, the scheduler must prefer the faster.
+        {
+            let mut state = session.state.lock().await;
+            let slow = p1.unwrap();
+            let fast = p2.unwrap();
+            state
+                .scheduler
+                .note_rtt(slow, std::time::Duration::from_millis(50));
+            state
+                .scheduler
+                .note_rtt(fast, std::time::Duration::from_millis(1));
+            assert_eq!(state.scheduler.pick(), Some(fast));
         }
     }
 }

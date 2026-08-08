@@ -33,12 +33,9 @@ use noq_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use tokio::sync::mpsc;
 
-mod scheduler;
-pub use multipass_proto::SendWindow;
-pub use scheduler::Scheduler;
-
 /// Re-export the wire format so callers don't need a second `use` path.
 pub use multipass_proto;
+pub use multipass_proto::{PathKind, Scheduler, SendWindow};
 
 /// ALPN for the multipass tunnel (from multipass-proto).
 pub const ALPN: &[u8] = multipass_proto::ALPN;
@@ -54,26 +51,6 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Strength of the internal channels carrying inbound frames from the reader
 /// tasks to the daemon's `recv_data` / `recv_control` consumers.
 const CHANNEL_CAPACITY: usize = 4096;
-
-/// Which of the two active-active connections a path is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PathKind {
-    Wired,
-    Wifi,
-}
-
-impl PathKind {
-    /// Both paths, in a stable order.
-    pub const ALL: [PathKind; 2] = [PathKind::Wired, PathKind::Wifi];
-
-    /// Human label for logs / status.
-    pub fn label(self) -> &'static str {
-        match self {
-            PathKind::Wired => "wired",
-            PathKind::Wifi => "wifi",
-        }
-    }
-}
 
 /// Errors that can occur while establishing a path connection.
 #[derive(Debug)]
@@ -1011,7 +988,7 @@ mod tests {
         // Every unacked packet must have been retransmitted on wifi, so wifi's
         // transmitted count exceeds what it originally carried.
         let st = t.status();
-        assert_eq!(st.wired.alive, false);
+        assert!(!st.wired.alive);
         // wifi now carries retransmissions of wired's unacked packets in
         // addition to its own original stripes.
         assert!(

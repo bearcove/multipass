@@ -9,9 +9,31 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 mod sack;
+mod scheduler;
 mod send_window;
 pub use sack::SackScoreboard;
+pub use scheduler::Scheduler;
 pub use send_window::SendWindow;
+
+/// Which of the two active-active connections a path is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PathKind {
+    Wired,
+    Wifi,
+}
+
+impl PathKind {
+    /// Both paths, in a stable order.
+    pub const ALL: [PathKind; 2] = [PathKind::Wired, PathKind::Wifi];
+
+    /// Human label for logs / status.
+    pub fn label(self) -> &'static str {
+        match self {
+            PathKind::Wired => "wired",
+            PathKind::Wifi => "wifi",
+        }
+    }
+}
 
 /// ALPN for the multipass tunnel connection.
 pub const ALPN: &[u8] = b"multipass/1";

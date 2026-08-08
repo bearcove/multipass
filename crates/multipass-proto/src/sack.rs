@@ -92,10 +92,10 @@ impl SackScoreboard {
                 _ => {}
             }
         }
-        if let Some(start) = range_start {
-            if ranges.len() < 8 {
-                ranges.push((start, self.max_seq));
-            }
+        if let Some(start) = range_start
+            && ranges.len() < 8
+        {
+            ranges.push((start, self.max_seq));
         }
 
         crate::Frame::Sack {
