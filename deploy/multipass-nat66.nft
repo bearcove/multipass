@@ -1,0 +1,9 @@
+# NAT66 for the multipass tunnel (ULA fd00:99::/64 -> WAN global).
+# Additive to the existing ruleset; load with `nft -f` after `nft -c` check.
+# Remove this file's table when switching to native-routed IPv6 (Freebox PD).
+table ip6 nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "enp5s0f1np1" ip6 saddr fd00:99::/64 masquerade
+    }
+}
