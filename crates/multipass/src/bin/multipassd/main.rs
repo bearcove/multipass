@@ -153,7 +153,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Open the utun once; it outlives transport reconnects.
-    let utun = Arc::new(AsyncFd::new(utun::Utun::open()?)?);
+    let utun_raw = utun::Utun::open()?;
+    tracing::debug!(iface = %utun_raw.name(), "utun: kernel control socket open");
+    let utun = Arc::new(AsyncFd::new(utun_raw)?);
     let utun_name = utun.get_ref().name();
     info!(iface = %utun_name, "utun open");
 

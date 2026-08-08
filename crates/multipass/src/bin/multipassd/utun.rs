@@ -25,7 +25,6 @@
 //! with no configured v6) are dropped on read.
 
 use std::io;
-use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{
@@ -51,6 +50,7 @@ impl Utun {
     pub fn open() -> io::Result<Utun> {
         // 1. Control socket.
         let raw = unsafe { libc::socket(AF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL) };
+        tracing::debug!(raw, "utun: socket()");
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -68,41 +68,43 @@ impl Utun {
         if unsafe { libc::ioctl(fd.as_raw_fd(), CTLIOCGINFO, &mut info) } < 0 {
             return Err(io::Error::last_os_error());
         }
+        tracing::debug!(ctl_id = info.ctl_id, "utun: CTLIOCGINFO");
 
-        // 3. Connect with sc_unit = 0 (auto-assign).
-        let addr = sockaddr_ctl {
-            sc_len: std::mem::size_of::<sockaddr_ctl>() as c_uchar,
-            sc_family: AF_SYSTEM as c_uchar,
-            ss_sysaddr: AF_SYS_CONTROL as u16,
-            sc_id: info.ctl_id,
-            sc_unit: 0,
-            sc_reserved: [0; 5],
-        };
-        let rc = unsafe {
-            libc::connect(
-                fd.as_raw_fd(),
-                &addr as *const sockaddr_ctl as *const sockaddr,
-                std::mem::size_of::<sockaddr_ctl>() as u32,
-            )
-        };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
+        // 3. Connect, binding a SPECIFIC unit. We don't rely on reading the
+        // assigned unit back (getsockname and the UTUN_IF_NAME ioctl are both
+        // EOPNOTSUPP on macOS 27), so we ask for a known unit: sc_unit = N+1
+        // yields interface `utunN`. Try a small range in case some are taken
+        // by other VPNs / Continuity / etc.
+        const FIRST_UNIT: u32 = 16; // pick high units to dodge system utun0..5
+        const MAX_TRIES: u32 = 16;
+        let mut connected_unit = None;
+        for n in FIRST_UNIT..(FIRST_UNIT + MAX_TRIES) {
+            let addr = sockaddr_ctl {
+                sc_len: std::mem::size_of::<sockaddr_ctl>() as c_uchar,
+                sc_family: AF_SYSTEM as c_uchar,
+                ss_sysaddr: AF_SYS_CONTROL as u16,
+                sc_id: info.ctl_id,
+                sc_unit: n + 1, // unit N+1 => interface utunN
+                sc_reserved: [0; 5],
+            };
+            let rc = unsafe {
+                libc::connect(
+                    fd.as_raw_fd(),
+                    &addr as *const sockaddr_ctl as *const sockaddr,
+                    std::mem::size_of::<sockaddr_ctl>() as u32,
+                )
+            };
+            if rc == 0 {
+                connected_unit = Some(n);
+                tracing::debug!(unit = n, "utun: connect() ok");
+                break;
+            }
+            let e = io::Error::last_os_error();
+            tracing::debug!(unit = n, err = %e, "utun: connect() unit busy, trying next");
         }
-
-        // 4. Read back the assigned unit via getsockname.
-        let mut got = MaybeUninit::<sockaddr_ctl>::uninit();
-        let mut len = std::mem::size_of::<sockaddr_ctl>() as u32;
-        let rc = unsafe {
-            libc::getsockname(
-                fd.as_raw_fd(),
-                got.as_mut_ptr() as *mut sockaddr,
-                &mut len,
-            )
-        };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let unit = unsafe { got.assume_init() }.sc_unit;
+        let unit = connected_unit.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::AddrInUse, "no free utun unit in range")
+        })?;
 
         Ok(Utun { fd, unit })
     }
