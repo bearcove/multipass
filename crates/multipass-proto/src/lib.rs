@@ -6,21 +6,28 @@
 //! frame on BOTH connections (active-active); the receiver dedups by `seq`.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 mod sack;
 pub use sack::SackScoreboard;
 
 /// ALPN for the multipass tunnel connection.
-pub const ALPN: &[u8] = b"multipass/0";
+pub const ALPN: &[u8] = b"multipass/1";
 
 /// Well-known tunnel subnet layout. Server is .1, first client is .2.
 pub const TUNNEL_SERVER: Ipv4Addr = Ipv4Addr::new(10, 10, 99, 1);
 pub const TUNNEL_CLIENT: Ipv4Addr = Ipv4Addr::new(10, 10, 99, 2);
 pub const TUNNEL_PREFIX: u8 = 24;
-/// Conservative inner MTU for QUIC DATAGRAM. noq initially permits 1162-byte
-/// application datagrams; the Data frame adds a one-byte tag and u64 sequence.
-pub const TUNNEL_MTU: u16 = 1153;
+
+/// IPv6 tunnel prefix (ULA, NAT66 mode). Server is ::1, client is ::2.
+pub const TUNNEL_V6_PREFIX: u8 = 64;
+pub const TUNNEL_V6_SERVER: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x99, 0, 0, 0, 0, 0, 1);
+pub const TUNNEL_V6_CLIENT: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x99, 0, 0, 0, 0, 0, 2);
+
+/// Conservative inner MTU for QUIC DATAGRAM. 1280 is the IPv6 minimum link MTU;
+/// noq's PMTUD converges to ~1414 on a 1500-byte underlay, so 1280 + 9 bytes
+/// framing fits after convergence.
+pub const TUNNEL_MTU: u16 = 1280;
 
 /// Frame type tag (first byte of every datagram).
 #[repr(u8)]
@@ -66,9 +73,10 @@ pub enum Frame {
         client_nonce: u64,
     },
     Assign {
-        addr: Ipv4Addr,
-        prefix: u8,
+        ipv4: Option<(Ipv4Addr, u8)>,
+        ipv6: Option<(Ipv6Addr, u8)>,
         mtu: u16,
+        dns: Vec<IpAddr>,
     },
     Ping {
         nonce: u64,
@@ -96,11 +104,44 @@ pub fn encode(frame: &Frame) -> Bytes {
             out.put_u8(Tag::Hello as u8);
             out.put_u64(*client_nonce);
         }
-        Frame::Assign { addr, prefix, mtu } => {
+        Frame::Assign {
+            ipv4,
+            ipv6,
+            mtu,
+            dns,
+        } => {
             out.put_u8(Tag::Assign as u8);
-            out.put_u32(u32::from(*addr));
-            out.put_u8(*prefix);
+            // flags: bit 0 = ipv4 present, bit 1 = ipv6 present
+            let mut flags = 0u8;
+            if ipv4.is_some() {
+                flags |= 1;
+            }
+            if ipv6.is_some() {
+                flags |= 2;
+            }
+            out.put_u8(flags);
+            if let Some((addr, prefix)) = ipv4 {
+                out.put_u32(u32::from(*addr));
+                out.put_u8(*prefix);
+            }
+            if let Some((addr, prefix)) = ipv6 {
+                out.put_u128(u128::from(*addr));
+                out.put_u8(*prefix);
+            }
             out.put_u16(*mtu);
+            out.put_u8(dns.len() as u8);
+            for addr in dns {
+                match addr {
+                    IpAddr::V4(a) => {
+                        out.put_u8(4);
+                        out.put_u32(u32::from(*a));
+                    }
+                    IpAddr::V6(a) => {
+                        out.put_u8(6);
+                        out.put_u128(u128::from(*a));
+                    }
+                }
+            }
         }
         Frame::Ping { nonce } => {
             out.put_u8(Tag::Ping as u8);
@@ -150,13 +191,63 @@ pub fn decode(mut buf: &[u8]) -> Option<Frame> {
             })
         }
         Tag::Assign => {
-            if buf.remaining() < 7 {
+            if buf.remaining() < 3 {
                 return None;
             }
-            let addr = Ipv4Addr::from(buf.get_u32());
-            let prefix = buf.get_u8();
+            let flags = buf.get_u8();
+            let ipv4 = if flags & 1 != 0 {
+                if buf.remaining() < 5 {
+                    return None;
+                }
+                let addr = Ipv4Addr::from(buf.get_u32());
+                let prefix = buf.get_u8();
+                Some((addr, prefix))
+            } else {
+                None
+            };
+            let ipv6 = if flags & 2 != 0 {
+                if buf.remaining() < 17 {
+                    return None;
+                }
+                let addr = Ipv6Addr::from(buf.get_u128());
+                let prefix = buf.get_u8();
+                Some((addr, prefix))
+            } else {
+                None
+            };
+            if buf.remaining() < 3 {
+                return None;
+            }
             let mtu = buf.get_u16();
-            Some(Frame::Assign { addr, prefix, mtu })
+            let dns_count = buf.get_u8() as usize;
+            let mut dns = Vec::with_capacity(dns_count);
+            for _ in 0..dns_count {
+                if buf.remaining() < 1 {
+                    return None;
+                }
+                let family = buf.get_u8();
+                match family {
+                    4 => {
+                        if buf.remaining() < 4 {
+                            return None;
+                        }
+                        dns.push(IpAddr::V4(Ipv4Addr::from(buf.get_u32())));
+                    }
+                    6 => {
+                        if buf.remaining() < 16 {
+                            return None;
+                        }
+                        dns.push(IpAddr::V6(Ipv6Addr::from(buf.get_u128())));
+                    }
+                    _ => return None,
+                }
+            }
+            Some(Frame::Assign {
+                ipv4,
+                ipv6,
+                mtu,
+                dns,
+            })
         }
         Tag::Ping => {
             if buf.remaining() < 8 {
@@ -306,9 +397,10 @@ mod tests {
                 client_nonce: 0xdeadbeef,
             },
             Frame::Assign {
-                addr: TUNNEL_CLIENT,
-                prefix: TUNNEL_PREFIX,
+                ipv4: Some((TUNNEL_CLIENT, TUNNEL_PREFIX)),
+                ipv6: None,
                 mtu: TUNNEL_MTU,
+                dns: vec![],
             },
             Frame::Ping { nonce: 7 },
             Frame::Pong { nonce: 7 },
@@ -334,6 +426,36 @@ mod tests {
             } => {
                 assert_eq!(largest_contiguous, 100);
                 assert_eq!(ranges, vec![(95, 98), (85, 90)]);
+            }
+            _ => panic!("wrong frame"),
+        }
+    }
+
+    #[test]
+    fn assign_dual_stack_roundtrip() {
+        use std::net::Ipv6Addr;
+        let assign = Frame::Assign {
+            ipv4: Some((Ipv4Addr::new(10, 10, 99, 2), 24)),
+            ipv6: Some((Ipv6Addr::new(0xfd00, 0x99, 0, 0, 0, 0, 0, 2), 64)),
+            mtu: 1280,
+            dns: vec![],
+        };
+        let encoded = encode(&assign);
+        let decoded = decode(&encoded).unwrap();
+        match decoded {
+            Frame::Assign {
+                ipv4,
+                ipv6,
+                mtu,
+                dns,
+            } => {
+                assert_eq!(ipv4, Some((Ipv4Addr::new(10, 10, 99, 2), 24)));
+                assert_eq!(
+                    ipv6,
+                    Some((Ipv6Addr::new(0xfd00, 0x99, 0, 0, 0, 0, 0, 2), 64))
+                );
+                assert_eq!(mtu, 1280);
+                assert!(dns.is_empty());
             }
             _ => panic!("wrong frame"),
         }

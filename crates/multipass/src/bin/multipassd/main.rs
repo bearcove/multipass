@@ -221,13 +221,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 break;
             }
             match handshake(&mut transport, client_nonce).await {
-                Ok((addr, prefix, mtu)) => {
+                Ok((ipv4, ipv6, mtu)) => {
                     if !shared.enabled.load(Ordering::Relaxed) {
                         continue;
                     }
-                    info!(%addr, prefix, mtu, "assigned; configuring tunnel");
+                    info!(?ipv4, ?ipv6, mtu, "assigned; configuring tunnel");
                     let utun_name = shared.utun_name.clone();
-                    if !routes::configure(&utun_name, addr, prefix, mtu) {
+                    let Some((v4_addr, v4_prefix)) = ipv4 else {
+                        error!("no IPv4 assignment received; disabling tunnel");
+                        shared.enabled.store(false, Ordering::Relaxed);
+                        continue;
+                    };
+                    if !routes::configure(&utun_name, v4_addr, v4_prefix, mtu) {
                         error!("tunnel interface configuration failed; disabling tunnel");
                         shared.enabled.store(false, Ordering::Relaxed);
                         continue;
@@ -318,7 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn handshake(
     transport: &mut Transport,
     client_nonce: u64,
-) -> Result<(Ipv4Addr, u8, u16), Box<dyn std::error::Error>> {
+) -> Result<(Option<(Ipv4Addr, u8)>, Option<(std::net::Ipv6Addr, u8)>, u16), Box<dyn std::error::Error>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let mut assignment = None;
     while PathKind::ALL.iter().any(|&kind| !transport.is_ready(kind)) {
@@ -338,9 +343,9 @@ async fn handshake(
         )
         .await
         {
-            Ok(Some((path, Frame::Assign { addr, prefix, mtu }))) => {
+            Ok(Some((path, Frame::Assign { ipv4, ipv6, mtu, .. }))) => {
                 transport.mark_ready(path);
-                assignment.get_or_insert((addr, prefix, mtu));
+                assignment.get_or_insert((ipv4, ipv6, mtu));
             }
             Ok(Some((path, frame))) => {
                 info!(path = %path.label(), ?frame, "control frame during handshake");

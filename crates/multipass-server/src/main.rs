@@ -20,7 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use multipass_proto::{Dedup, Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, encode};
+use multipass_proto::{
+    Dedup, Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX,
+    encode,
+};
 use noq::{Connection, Endpoint, ServerConfig, TransportConfig};
 use noq_proto::crypto::rustls::QuicServerConfig;
 use tokio::sync::{Mutex, mpsc};
@@ -224,9 +227,10 @@ async fn conn_handler(
                             break;
                         }
                         let assign = Frame::Assign {
-                            addr: TUNNEL_CLIENT,
-                            prefix: TUNNEL_PREFIX,
+                            ipv4: Some((TUNNEL_CLIENT, TUNNEL_PREFIX)),
+                            ipv6: Some((TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX)),
                             mtu: TUNNEL_MTU,
+                            dns: vec![],
                         };
                         if conn.send_datagram(encode(&assign)).is_err() {
                             break;
@@ -246,6 +250,7 @@ async fn conn_handler(
                     }
                     Frame::Pong { .. } => {}
                     Frame::Assign { .. } => {} // server never expects an assignment
+                    Frame::Sack { .. } => {}   // SACK handling added in Task 6
                 }
             }
             Err(e) => {

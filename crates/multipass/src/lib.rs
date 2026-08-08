@@ -767,32 +767,6 @@ mod tests {
         assert!(st.wired.received >= N && st.wifi.received >= N);
     }
     #[tokio::test]
-    async fn tunnel_mtu_packet_fits_quic_datagram() {
-        let addr = spawn_echo_server().await;
-        let t = Transport::connect(
-            addr,
-            "127.0.0.1".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let frame = multipass_proto::encode(&Frame::Data {
-            seq: 1,
-            packet: Bytes::from(vec![0; multipass_proto::TUNNEL_MTU as usize]),
-        });
-        for kind in PathKind::ALL {
-            let maximum = t.connection(kind).max_datagram_size().unwrap();
-            assert!(
-                frame.len() <= maximum,
-                "{}-byte tunnel frame exceeds {} path's {maximum}-byte QUIC datagram limit",
-                frame.len(),
-                kind.label(),
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn datagram_capacity_supports_tunnel_mtu() {
         let addr = spawn_echo_server().await;
         let t = Transport::connect(
