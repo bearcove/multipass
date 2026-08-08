@@ -1,7 +1,7 @@
 #!/bin/bash
 # multipass — macOS uninstall. Run with:  sudo ./uninstall-mac.sh
 set -euo pipefail
-LABEL="rs.bearcove.multipassd"
+LABEL="eu.bearcove.multipassd"
 PLIST="/Library/LaunchDaemons/$LABEL.plist"
 
 [ "$(id -u)" -ne 0 ] && { echo "run with sudo" >&2; exit 1; }

@@ -22,7 +22,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_BIN="$REPO/target/release/multipassd"
 APP_BIN="$REPO/app/.build/release/Multipass"
-LABEL="rs.bearcove.multipassd"
+LABEL="eu.bearcove.multipassd"
 PLIST="/Library/LaunchDaemons/$LABEL.plist"
 LIBEXEC="/usr/local/libexec"
 
