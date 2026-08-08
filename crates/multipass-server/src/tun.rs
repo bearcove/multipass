@@ -116,7 +116,32 @@ mod imp {
             ifr.ifr_ifru.ifru_flags = flags;
         })?;
 
+        // IPv6 address. ifreq ioctls are IPv4-only; use `ip` for the v6 address.
+        // The link is up and MTU set, so this is a pure address add.
+        configure_v6(name)?;
+
         Ok(())
+    }
+
+    /// Assign the IPv6 tunnel address via `ip -6 addr add`. Returns Ok if the
+    /// address is added (or already present).
+    fn configure_v6(name: &str) -> io::Result<()> {
+        let arg = format!("{}/{}", multipass_proto::TUNNEL_V6_SERVER, multipass_proto::TUNNEL_V6_PREFIX);
+        let out = std::process::Command::new("ip")
+            .args(["-6", "addr", "add", &arg, "dev", name])
+            .output()?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        // "File exists" means the address is already configured; treat as success.
+        if err.contains("File exists") {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("ip -6 addr add {arg} dev {name} failed: {err}"),
+        ))
     }
 
     /// Run `ioctl(sock, req, &ifr)` with `ifr` initialized to `name`, then filled by `f`.
