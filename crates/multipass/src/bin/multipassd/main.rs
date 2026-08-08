@@ -51,7 +51,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use multipass::{PathKind, Transport};
-use multipass_proto::{Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_SERVER};
+use multipass_proto::{
+    Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_SERVER, TUNNEL_V6_CLIENT, TUNNEL_V6_SERVER,
+};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
@@ -237,6 +239,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         shared.enabled.store(false, Ordering::Relaxed);
                         continue;
                     }
+                    // Configure IPv6 if assigned. v6 is optional-but-atomic: if a
+                    // v6 assignment is present, its configuration must succeed or
+                    // the whole activation fails (no partial-tunnel leak).
+                    let v6_active = if let Some((v6_addr, v6_prefix)) = ipv6 {
+                        if !routes::configure_v6(&utun_name, v6_addr, v6_prefix) {
+                            error!("tunnel IPv6 configuration failed; disabling tunnel");
+                            shared.enabled.store(false, Ordering::Relaxed);
+                            continue;
+                        }
+                        true
+                    } else {
+                        false
+                    };
                     if !shared.enabled.load(Ordering::Relaxed) {
                         continue;
                     }
@@ -246,6 +261,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         error!("dataplane canary failed; disabling tunnel");
                         shared.enabled.store(false, Ordering::Relaxed);
                         continue;
+                    }
+                    if v6_active {
+                        let v6_canary_ok =
+                            run_canary_pump_v6(&mut transport, &shared, &mut seq).await;
+                        if !v6_canary_ok {
+                            error!("IPv6 dataplane canary failed; disabling tunnel");
+                            shared.enabled.store(false, Ordering::Relaxed);
+                            continue;
+                        }
                     }
                     if !shared.enabled.load(Ordering::Relaxed) {
                         continue;
@@ -260,7 +284,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         shared.enabled.store(false, Ordering::Relaxed);
                         continue;
                     }
+                    if v6_active && !routes::setup_v6(&utun_name) {
+                        error!("IPv6 route activation failed; rolling back v4; disabling tunnel");
+                        routes::teardown(
+                            &shared.utun_name,
+                            opts.server.ip(),
+                            &shared.wired_iface,
+                            &shared.wifi_iface,
+                        );
+                        shared.enabled.store(false, Ordering::Relaxed);
+                        continue;
+                    }
                     if !shared.enabled.load(Ordering::Relaxed) {
+                        if v6_active {
+                            routes::teardown_v6(&shared.utun_name);
+                        }
                         routes::teardown(
                             &shared.utun_name,
                             opts.server.ip(),
@@ -283,6 +321,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                     shared.active.store(false, Ordering::Relaxed);
                     info!("transport inactive; restoring routes");
+                    if v6_active {
+                        routes::teardown_v6(&shared.utun_name);
+                    }
                     routes::teardown(
                         &shared.utun_name,
                         opts.server.ip(),
@@ -390,6 +431,29 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 async fn run_canary_pump(transport: &mut Transport, shared: &Shared, seq: &mut u64) -> bool {
     let (identifier, echo_sequence) = canary_identity(*seq);
     let packet = Bytes::copy_from_slice(&build_canary_request(identifier, echo_sequence));
+    run_canary_with(transport, shared, seq, packet, move |p| {
+        validate_canary_reply(p, identifier, echo_sequence)
+    })
+    .await
+}
+
+/// Prove the IPv6 return path. Same shape as the v4 canary but ICMPv6.
+async fn run_canary_pump_v6(transport: &mut Transport, shared: &Shared, seq: &mut u64) -> bool {
+    let (identifier, echo_sequence) = canary_identity(*seq);
+    let packet = Bytes::copy_from_slice(&build_canary_request_v6(identifier, echo_sequence));
+    run_canary_with(transport, shared, seq, packet, move |p| {
+        validate_canary_reply_v6(p, identifier, echo_sequence)
+    })
+    .await
+}
+
+async fn run_canary_with(
+    transport: &mut Transport,
+    shared: &Shared,
+    seq: &mut u64,
+    packet: Bytes,
+    validate: impl Fn(&[u8]) -> Result<(), CanaryReject>,
+) -> bool {
     *seq += 1;
     if !transport.send_data(*seq, packet.clone()) {
         return false;
@@ -407,7 +471,7 @@ async fn run_canary_pump(transport: &mut Transport, shared: &Shared, seq: &mut u
             shared
                 .rx_bytes
                 .fetch_add(data.packet.len() as u64, Ordering::Relaxed);
-            match validate_canary_reply(&data.packet, identifier, echo_sequence) {
+            match validate(&data.packet) {
                 Ok(()) => return true,
                 Err(CanaryReject::Header) => {
                     debug!(len = data.packet.len(), "non-canary packet during canary")
@@ -504,6 +568,82 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+/// Build an ICMPv6 Echo Request canary from the tunnel client to the server.
+/// 40-byte IPv6 header + 8-byte ICMPv6 Echo header. The ICMPv6 checksum covers
+/// the IPv6 pseudo-header (src, dst, length, next-header).
+fn build_canary_request_v6(identifier: u16, sequence: u16) -> [u8; 48] {
+    let mut packet = [0u8; 48];
+    // IPv6 header
+    packet[0] = 0x60; // version 6, traffic class 0, flow label 0
+    packet[4..6].copy_from_slice(&8u16.to_be_bytes()); // payload length = 8 (ICMPv6)
+    packet[6] = 58; // next header = ICMPv6
+    packet[7] = 64; // hop limit
+    packet[8..24].copy_from_slice(&TUNNEL_V6_CLIENT.octets());
+    packet[24..40].copy_from_slice(&TUNNEL_V6_SERVER.octets());
+    // ICMPv6 Echo Request
+    packet[40] = 128; // type = Echo Request
+    packet[41] = 0; // code
+    packet[44..46].copy_from_slice(&identifier.to_be_bytes());
+    packet[46..48].copy_from_slice(&sequence.to_be_bytes());
+    let csum = icmpv6_checksum(
+        &TUNNEL_V6_CLIENT.octets(),
+        &TUNNEL_V6_SERVER.octets(),
+        &packet[40..],
+    );
+    packet[42..44].copy_from_slice(&csum.to_be_bytes());
+    packet
+}
+
+/// ICMPv6 checksum: pseudo-header (src + dst + upper-layer length + next
+/// header) plus the ICMPv6 message.
+fn icmpv6_checksum(src: &[u8; 16], dst: &[u8; 16], msg: &[u8]) -> u16 {
+    let mut pseudo = Vec::with_capacity(40 + msg.len());
+    pseudo.extend_from_slice(src);
+    pseudo.extend_from_slice(dst);
+    pseudo.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 58]); // next header = ICMPv6
+    pseudo.extend_from_slice(msg);
+    internet_checksum(&pseudo)
+}
+
+/// Validate an ICMPv6 Echo Reply canary from the server to the client.
+fn validate_canary_reply_v6(
+    packet: &[u8],
+    identifier: u16,
+    sequence: u16,
+) -> Result<(), CanaryReject> {
+    if packet.len() != 48 || packet[0] >> 4 != 6 {
+        return Err(CanaryReject::Header);
+    }
+    if packet[6] != 58 {
+        return Err(CanaryReject::Protocol);
+    }
+    if packet[8..24] != TUNNEL_V6_SERVER.octets() {
+        return Err(CanaryReject::Source);
+    }
+    if packet[24..40] != TUNNEL_V6_CLIENT.octets() {
+        return Err(CanaryReject::Destination);
+    }
+    if packet[40] != 129 || packet[41] != 0 {
+        return Err(CanaryReject::IcmpTypeCode);
+    }
+    if packet[44..46] != identifier.to_be_bytes() {
+        return Err(CanaryReject::Identifier);
+    }
+    if packet[46..48] != sequence.to_be_bytes() {
+        return Err(CanaryReject::Sequence);
+    }
+    let csum = icmpv6_checksum(
+        &TUNNEL_V6_SERVER.octets(),
+        &TUNNEL_V6_CLIENT.octets(),
+        &packet[40..],
+    );
+    if csum != 0 {
+        return Err(CanaryReject::IcmpChecksum);
+    }
+    Ok(())
 }
 
 /// Pump packets while re-authenticating any re-dialed path before scheduling.
@@ -686,9 +826,10 @@ fn source_ipv4(ip: &IpAddr) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CanaryReject, build_canary_request, canary_identity, internet_checksum,
-        validate_canary_reply,
+        CanaryReject, build_canary_request, build_canary_request_v6, canary_identity,
+        icmpv6_checksum, internet_checksum, validate_canary_reply, validate_canary_reply_v6,
     };
+    use multipass_proto::{TUNNEL_V6_CLIENT, TUNNEL_V6_SERVER};
 
     #[test]
     fn raw_canary_request_is_valid_ipv4_icmp() {
@@ -750,6 +891,47 @@ mod tests {
         reply[22] ^= 1;
         assert_eq!(
             validate_canary_reply(&reply, 0x1234, 7),
+            Err(CanaryReject::IcmpChecksum)
+        );
+    }
+
+    #[test]
+    fn v6_canary_request_is_valid_icmpv6() {
+        let packet = build_canary_request_v6(0x1234, 7);
+        assert_eq!(packet.len(), 48);
+        assert_eq!(packet[0] >> 4, 6, "IPv6 version nibble");
+        assert_eq!(packet[6], 58, "next header ICMPv6");
+        assert_eq!(&packet[8..24], &TUNNEL_V6_CLIENT.octets());
+        assert_eq!(&packet[24..40], &TUNNEL_V6_SERVER.octets());
+        assert_eq!(packet[40], 128, "Echo Request");
+        // Request checksum must be valid over pseudo-header + message.
+        let csum = icmpv6_checksum(
+            &TUNNEL_V6_CLIENT.octets(),
+            &TUNNEL_V6_SERVER.octets(),
+            &packet[40..],
+        );
+        assert_eq!(csum, 0, "ICMPv6 checksum valid");
+    }
+
+    #[test]
+    fn v6_canary_reply_validates() {
+        // Build a reply: swap src/dst, set type 129, recompute checksum.
+        let mut reply = build_canary_request_v6(0x1234, 7).to_vec();
+        reply[8..24].copy_from_slice(&TUNNEL_V6_SERVER.octets());
+        reply[24..40].copy_from_slice(&TUNNEL_V6_CLIENT.octets());
+        reply[40] = 129; // Echo Reply
+        reply[42..44].fill(0);
+        let csum = icmpv6_checksum(
+            &TUNNEL_V6_SERVER.octets(),
+            &TUNNEL_V6_CLIENT.octets(),
+            &reply[40..],
+        );
+        reply[42..44].copy_from_slice(&csum.to_be_bytes());
+
+        assert_eq!(validate_canary_reply_v6(&reply, 0x1234, 7), Ok(()));
+        reply[42] ^= 1;
+        assert_eq!(
+            validate_canary_reply_v6(&reply, 0x1234, 7),
             Err(CanaryReject::IcmpChecksum)
         );
     }
