@@ -40,13 +40,20 @@ pub struct Tun {
 pub fn open() -> io::Result<Tun> {
     let fd = open_dev_net_tun()?;
     let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
-    // Empty name => kernel picks a free `tunN` and reports it back.
+    // Empty name => kernel picks a free `tunN` and reports it back into ifr_name.
     ifr.ifr_ifru.ifru_flags = IFF_TUN | IFF_NO_PI;
-    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF, &ifr) };
+    // Pass a mutable pointer: the kernel writes the assigned name in place.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF, &mut ifr as *mut libc::ifreq) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
     let name = ifr_name(&ifr);
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "TUNSETIFF returned an empty interface name",
+        ));
+    }
     configure(&name)?;
     Ok(Tun { fd, name })
 }
