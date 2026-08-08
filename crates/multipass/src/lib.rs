@@ -221,6 +221,8 @@ struct Path {
     conn: Arc<Mutex<Connection>>,
     /// Set false when the reader task hits an error / the conn closes.
     alive: Arc<AtomicBool>,
+    /// True after this connection acknowledges the current client epoch.
+    ready: Arc<AtomicBool>,
     /// Microseconds since `started` of the last datagram received (0 = none).
     last_recv: Arc<AtomicU64>,
     /// Last measured RTT in microseconds (0 = none).
@@ -241,6 +243,7 @@ impl Path {
             kind,
             conn: Arc::new(Mutex::new(conn)),
             alive: Arc::new(AtomicBool::new(true)),
+            ready: Arc::new(AtomicBool::new(false)),
             last_recv: Arc::new(AtomicU64::new(0)),
             rtt: Arc::new(AtomicU64::new(0)),
             probe: Arc::new(Mutex::new(None)),
@@ -361,6 +364,9 @@ impl Transport {
         let wired = Arc::new(Path::new(PathKind::Wired, wired));
         let wifi = Arc::new(Path::new(PathKind::Wifi, wifi));
         let scheduler = Arc::new(Mutex::new(Scheduler::new(SchedulerConfig::default())));
+        for kind in PathKind::ALL {
+            scheduler.lock().unwrap().set_alive(kind, false);
+        }
 
         let (data_tx, data_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -399,9 +405,10 @@ impl Transport {
         let p = self.path(kind);
         *p.conn.lock().unwrap() = new_conn;
         p.alive.store(true, Ordering::Relaxed);
+        p.ready.store(false, Ordering::Relaxed);
         p.rtt.store(0, Ordering::Relaxed);
         *p.probe.lock().unwrap() = None;
-        self.scheduler.lock().unwrap().set_alive(kind, true);
+        self.scheduler.lock().unwrap().set_alive(kind, false);
         spawn_reader(
             p,
             &self.data_tx,
@@ -417,6 +424,29 @@ impl Transport {
     /// Returns true only when noq accepts the datagram for transmission.
     pub fn send_data(&self, seq: u64, packet: Bytes) -> bool {
         self.send_frame(&Frame::Data { seq, packet })
+    }
+
+    /// Send a control frame on one specific live path.
+    pub fn send_frame_on(&self, kind: PathKind, frame: &Frame) -> bool {
+        if !self.is_alive(kind) {
+            return false;
+        }
+        let p = self.path(kind);
+        match p
+            .conn
+            .lock()
+            .unwrap()
+            .send_datagram(multipass_proto::encode(frame))
+        {
+            Ok(()) => {
+                p.transmitted.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(path = %kind.label(), %e, "datagram send failed");
+                false
+            }
+        }
     }
 
     /// Send a frame on the scheduler-chosen path. Used for data and control
@@ -496,6 +526,17 @@ impl Transport {
         self.path(kind).alive.load(Ordering::Relaxed)
     }
 
+    /// Mark a path eligible for data after its Hello was acknowledged.
+    pub fn mark_ready(&self, kind: PathKind) {
+        let p = self.path(kind);
+        p.ready.store(true, Ordering::Relaxed);
+        self.scheduler.lock().unwrap().set_alive(kind, true);
+    }
+
+    /// Whether the path acknowledged the current client epoch.
+    pub fn is_ready(&self, kind: PathKind) -> bool {
+        self.path(kind).ready.load(Ordering::Relaxed)
+    }
     /// Raw noq connection for a path (e.g. to await `closed()` or inspect).
     pub fn connection(&self, kind: PathKind) -> Connection {
         self.path(kind).conn.lock().unwrap().clone()
@@ -690,6 +731,9 @@ mod tests {
         )
         .await
         .unwrap();
+        for kind in PathKind::ALL {
+            t.mark_ready(kind);
+        }
 
         const N: u64 = 20;
         for seq in 0..N {
@@ -755,6 +799,7 @@ mod tests {
         )
         .await
         .unwrap();
+        t.mark_ready(PathKind::Wired);
 
         assert!(!t.send_data(1, Bytes::from(vec![0; 64 * 1024])));
         assert_eq!(

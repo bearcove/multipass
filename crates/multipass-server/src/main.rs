@@ -13,6 +13,7 @@
 
 mod tun;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,7 +23,7 @@ use bytes::Bytes;
 use multipass_proto::{Dedup, Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, encode};
 use noq::{Connection, Endpoint, ServerConfig, TransportConfig};
 use noq_proto::crypto::rustls::QuicServerConfig;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
 /// Server bind.
@@ -59,29 +60,39 @@ fn server_config() -> ServerConfig {
     cfg
 }
 
-/// One live client connection (tagged with a stable id so `send_all` and
-/// `remove_conn` don't need to compare opaque noq handles).
+/// One client connection and the epoch established by its first Hello.
 struct LiveConn {
     id: u64,
-    conn: Connection,
+    conn: Option<Connection>,
+    epoch: Option<u64>,
 }
 
-/// A single logical client session: the set of its live connections plus the
-/// shared per-tunnel state (outbound seq counter, inbound dedup window).
+struct SessionState {
+    conns: Vec<LiveConn>,
+    epoch: Option<u64>,
+    retired_epochs: HashSet<u64>,
+    dedup: Dedup,
+}
+
+/// A single logical client session. Connection authentication, epoch changes,
+/// connection eviction, and inbound dedup are one atomic state transition.
 struct Session {
-    conns: RwLock<Vec<LiveConn>>,
+    state: Mutex<SessionState>,
     next_conn_id: AtomicU64,
     seq: AtomicU64,
-    dedup: Mutex<Dedup>,
 }
 
 impl Session {
     fn new() -> Self {
         Self {
-            conns: RwLock::new(Vec::new()),
+            state: Mutex::new(SessionState {
+                conns: Vec::new(),
+                epoch: None,
+                retired_epochs: HashSet::new(),
+                dedup: Dedup::new(),
+            }),
             next_conn_id: AtomicU64::new(0),
             seq: AtomicU64::new(0),
-            dedup: Mutex::new(Dedup::new()),
         }
     }
 
@@ -91,40 +102,105 @@ impl Session {
 
     async fn add_conn(&self, conn: Connection) -> u64 {
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        self.conns.write().await.push(LiveConn { id, conn });
+        self.state.lock().await.conns.push(LiveConn {
+            id,
+            conn: Some(conn),
+            epoch: None,
+        });
         debug!(id, "connection added to session");
         id
     }
 
     async fn remove_conn(&self, id: u64) {
-        self.conns.write().await.retain(|lc| lc.id != id);
+        self.state.lock().await.conns.retain(|conn| conn.id != id);
         debug!(id, "connection removed from session");
     }
 
-    /// Send `data` on every live connection. Returns how many got it.
-    /// Dead connections (ConnectionLost) are dropped from the session;
-    /// transient errors (e.g. TooLarge) keep the connection.
+    async fn authenticate(&self, id: u64, epoch: u64) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(index) = state.conns.iter().position(|conn| conn.id == id) else {
+            return false;
+        };
+        if let Some(authenticated_epoch) = state.conns[index].epoch {
+            return authenticated_epoch == epoch;
+        }
+        if state.retired_epochs.contains(&epoch) {
+            return false;
+        }
+
+        if state.epoch != Some(epoch) {
+            if let Some(previous) = state.epoch.replace(epoch) {
+                state.retired_epochs.insert(previous);
+                state.conns.retain_mut(|conn| {
+                    if conn.epoch == Some(previous) {
+                        if let Some(handle) = conn.conn.take() {
+                            handle.close(0u32.into(), b"client epoch replaced");
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            state.dedup = Dedup::new();
+        }
+
+        let Some(conn) = state.conns.iter_mut().find(|conn| conn.id == id) else {
+            return false;
+        };
+        conn.epoch = Some(epoch);
+        true
+    }
+
+    async fn accept_data(&self, id: u64, seq: u64) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(conn) = state.conns.iter().find(|conn| conn.id == id) else {
+            return false;
+        };
+        if conn.epoch != state.epoch || conn.epoch.is_none() {
+            return false;
+        }
+        state.dedup.insert(seq)
+    }
+
     async fn send_all(&self, data: Bytes) -> usize {
-        let mut conns = self.conns.write().await;
-        let mut live: Vec<LiveConn> = Vec::with_capacity(conns.len());
+        let mut state = self.state.lock().await;
+        let epoch = state.epoch;
         let mut sent = 0usize;
-        for lc in conns.drain(..) {
-            match lc.conn.send_datagram(data.clone()) {
+        state.conns.retain_mut(|live| {
+            if live.epoch != epoch {
+                return true;
+            }
+            let Some(conn) = live.conn.as_ref() else {
+                return true;
+            };
+            match conn.send_datagram(data.clone()) {
                 Ok(()) => {
-                    live.push(lc);
                     sent += 1;
+                    true
                 }
                 Err(noq::SendDatagramError::ConnectionLost(e)) => {
-                    warn!(id = lc.id, %e, "connection lost while sending; dropped");
+                    warn!(id = live.id, %e, "connection lost while sending; dropped");
+                    false
                 }
                 Err(e) => {
-                    warn!(id = lc.id, %e, "datagram send failed; keeping connection");
-                    live.push(lc);
+                    warn!(id = live.id, %e, "datagram send failed; keeping connection");
+                    true
                 }
             }
-        }
-        *conns = live;
+        });
         sent
+    }
+
+    #[cfg(test)]
+    async fn add_test_conn(&self) -> u64 {
+        let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        self.state.lock().await.conns.push(LiveConn {
+            id,
+            conn: None,
+            epoch: None,
+        });
+        id
     }
 }
 
@@ -143,7 +219,10 @@ async fn conn_handler(
                     continue;
                 };
                 match frame {
-                    Frame::Hello { .. } => {
+                    Frame::Hello { client_nonce } => {
+                        if !session.authenticate(id, client_nonce).await {
+                            break;
+                        }
                         let assign = Frame::Assign {
                             addr: TUNNEL_CLIENT,
                             prefix: TUNNEL_PREFIX,
@@ -152,12 +231,12 @@ async fn conn_handler(
                         if conn.send_datagram(encode(&assign)).is_err() {
                             break;
                         }
-                        info!(id, "answered Hello: assigned",);
+                        info!(id, client_nonce, "answered Hello: assigned");
                     }
                     Frame::Data { seq, packet } => {
-                        let is_new = session.dedup.lock().await.insert(seq);
-                        if is_new && to_tun.send(packet).await.is_err() {
-                            break; // TUN writer gone
+                        if session.accept_data(id, seq).await && to_tun.send(packet).await.is_err()
+                        {
+                            break;
                         }
                     }
                     Frame::Ping { nonce } => {
@@ -319,8 +398,67 @@ mod tests {
 
     use noq::Endpoint;
 
-    use super::server_config;
+    use super::{Session, server_config};
 
+    #[tokio::test]
+    async fn new_client_epoch_evicts_old_connections_and_rejects_rollback() {
+        let session = Session::new();
+        let old_a = session.add_test_conn().await;
+        let old_b = session.add_test_conn().await;
+        assert!(session.authenticate(old_a, 10).await);
+        assert!(session.authenticate(old_b, 10).await);
+        assert!(session.accept_data(old_a, 1).await);
+
+        let new_conn = session.add_test_conn().await;
+        assert!(session.authenticate(new_conn, 20).await);
+        assert!(!session.authenticate(old_a, 10).await);
+        assert!(!session.accept_data(old_b, 2).await);
+        assert!(session.accept_data(new_conn, 1).await);
+    }
+
+    #[tokio::test]
+    async fn second_path_same_epoch_authenticates_without_reset() {
+        let session = Session::new();
+        let first = session.add_test_conn().await;
+        let second = session.add_test_conn().await;
+        assert!(session.authenticate(first, 10).await);
+        assert!(session.accept_data(first, 7).await);
+        assert!(session.authenticate(second, 10).await);
+        assert!(!session.accept_data(second, 7).await);
+        assert!(session.accept_data(second, 8).await);
+    }
+
+    #[tokio::test]
+    async fn epoch_change_preserves_unauthed_second_new_path() {
+        let session = Session::new();
+        let old = session.add_test_conn().await;
+        assert!(session.authenticate(old, 10).await);
+
+        let new_a = session.add_test_conn().await;
+        let new_b = session.add_test_conn().await;
+        assert!(session.authenticate(new_a, 20).await);
+        assert!(session.authenticate(new_b, 20).await);
+        assert!(!session.authenticate(old, 10).await);
+        assert!(session.accept_data(new_a, 1).await);
+        assert!(session.accept_data(new_b, 2).await);
+    }
+
+    #[tokio::test]
+    async fn repeated_same_epoch_hello_is_idempotent() {
+        let session = Session::new();
+        let conn = session.add_test_conn().await;
+        assert!(session.authenticate(conn, 10).await);
+        assert!(session.authenticate(conn, 10).await);
+        assert!(!session.authenticate(conn, 20).await);
+    }
+
+    #[tokio::test]
+    async fn connection_accepts_only_its_first_hello() {
+        let session = Session::new();
+        let conn = session.add_test_conn().await;
+        assert!(session.authenticate(conn, 10).await);
+        assert!(!session.authenticate(conn, 20).await);
+    }
     #[tokio::test]
     async fn production_server_negotiates_wire_protocol_alpn() {
         let server = Endpoint::server(

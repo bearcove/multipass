@@ -175,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx_q, mut rx_q) = mpsc::channel::<Bytes>(256);
     spawn_utun_reader(utun.clone(), tx_q);
     let mut seq = 0u64;
+    let client_nonce = new_client_nonce();
 
     let shared = Shared::new(&opts, wired_iface, wifi_iface, utun_name);
 
@@ -214,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             continue;
         }
 
-        match handshake(&mut transport).await {
+        match handshake(&mut transport, client_nonce).await {
             Ok((addr, prefix, mtu)) => {
                 if !shared.enabled.load(Ordering::Relaxed) {
                     continue;
@@ -267,6 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     shared.clone(),
                     &mut rx_q,
                     &mut seq,
+                    client_nonce,
                 )
                 .await
                 {
@@ -297,29 +299,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 }
 
-/// Client handshake: send `Hello`, wait for the server's `Assign`.
 async fn handshake(
     transport: &mut Transport,
+    client_nonce: u64,
 ) -> Result<(Ipv4Addr, u8, u16), Box<dyn std::error::Error>> {
-    let nonce = std::time::SystemTime::now()
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut assignment = None;
+    while PathKind::ALL.iter().any(|&kind| !transport.is_ready(kind)) {
+        for kind in PathKind::ALL {
+            if !transport.is_ready(kind) {
+                transport.send_frame_on(kind, &Frame::Hello { client_nonce });
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("timed out waiting for both path assignments".into());
+        }
+        match tokio::time::timeout(
+            remaining.min(Duration::from_millis(250)),
+            transport.recv_control(),
+        )
+        .await
+        {
+            Ok(Some((path, Frame::Assign { addr, prefix, mtu }))) => {
+                transport.mark_ready(path);
+                assignment.get_or_insert((addr, prefix, mtu));
+            }
+            Ok(Some((path, frame))) => {
+                info!(path = %path.label(), ?frame, "control frame during handshake");
+            }
+            Ok(None) => return Err("transport closed during handshake".into()),
+            Err(_) => {}
+        }
+    }
+    assignment.ok_or_else(|| "no assignment received".into())
+}
+
+fn new_client_nonce() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
-        ^ (std::process::id() as u64);
-    transport.send_frame(&Frame::Hello {
-        client_nonce: nonce,
-    });
-    loop {
-        match transport.recv_control().await {
-            Some((_, Frame::Assign { addr, prefix, mtu })) => {
-                return Ok((addr, prefix, mtu));
-            }
-            Some((path, frame)) => {
-                info!(path = %path.label(), ?frame, "control frame during handshake");
-            }
-            None => return Err("transport closed during handshake".into()),
-        }
-    }
+        ^ (std::process::id() as u64)
 }
 
 /// How the pump exited.
@@ -341,12 +363,7 @@ const RECONNECT_TICK: Duration = Duration::from_millis(500);
 /// Minimum spacing between re-dial attempts for an already-failed path.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 
-/// The packet pump: utun <-> transport.
-///
-///   * utun-reader task -> mpsc channel -> `send_data(seq, packet)` (scheduler
-///     picks the live path)
-///   * `recv_data` (deduped) -> write packet to utun (when enabled)
-///   * every 500ms: republish the path snapshot and re-dial dead paths
+/// Run a scoped dataplane canary before installing full-tunnel routes.
 async fn run_canary_pump(
     utun: Arc<AsyncFd<utun::Utun>>,
     transport: &mut Transport,
@@ -354,16 +371,14 @@ async fn run_canary_pump(
     shared: &Shared,
     seq: &mut u64,
 ) -> bool {
-    let ping = tokio::task::spawn_blocking(run_canary);
+    let utun_name = utun.get_ref().name();
+    let ping = tokio::task::spawn_blocking(move || run_canary(&utun_name));
     tokio::pin!(ping);
-
     let mut wbuf = vec![0u8; TUNNEL_MTU as usize + 4];
 
     loop {
         tokio::select! {
-            result = &mut ping => {
-                return result.unwrap_or(false);
-            }
+            result = &mut ping => return result.unwrap_or(false),
             Some(pkt) = rx_q.recv() => {
                 *seq += 1;
                 if transport.send_data(*seq, pkt.clone()) {
@@ -371,9 +386,7 @@ async fn run_canary_pump(
                 }
             }
             d = transport.recv_data() => {
-                let Some(d) = d else {
-                    return false;
-                };
+                let Some(d) = d else { return false };
                 update_active(shared, d.path);
                 shared.rx_bytes.fetch_add(d.packet.len() as u64, Ordering::Relaxed);
                 if let Err(e) = utun.get_ref().write_packet(&mut wbuf, &d.packet) {
@@ -385,20 +398,17 @@ async fn run_canary_pump(
     }
 }
 
-///
-/// Reconnect is driven by `is_alive()` polling (the transport's reader marks a
-/// path dead when it errors) rather than `recv_dead`, because the receive
-/// methods take `&mut self` and can't be armed alongside `recv_data`.
+/// Pump packets while re-authenticating any re-dialed path before scheduling.
 async fn pump(
     utun: Arc<AsyncFd<utun::Utun>>,
     transport: &mut Transport,
     shared: Arc<Shared>,
     rx_q: &mut mpsc::Receiver<Bytes>,
     seq: &mut u64,
+    client_nonce: u64,
 ) -> PumpEnd {
     let mut wbuf = vec![0u8; TUNNEL_MTU as usize + 4];
     let mut backoff = [Instant::now(); 2];
-
     let mut tick = tokio::time::interval(RECONNECT_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -412,11 +422,20 @@ async fn pump(
                     }
                 }
             }
-            d = transport.recv_data() => {
-                let d = match d {
-                    Some(d) => d,
+            control = transport.recv_control() => {
+                match control {
+                    Some((path, Frame::Assign { .. })) => {
+                        transport.mark_ready(path);
+                        info!(path = %path.label(), "path epoch acknowledged");
+                    }
+                    Some((path, frame)) => {
+                        info!(path = %path.label(), ?frame, "control frame during pump");
+                    }
                     None => return PumpEnd::Reconnect,
-                };
+                }
+            }
+            d = transport.recv_data() => {
+                let Some(d) = d else { return PumpEnd::Reconnect };
                 update_active(&shared, d.path);
                 shared.rx_bytes.fetch_add(d.packet.len() as u64, Ordering::Relaxed);
                 if shared.enabled.load(Ordering::Relaxed)
@@ -426,19 +445,16 @@ async fn pump(
                 }
             }
             _ = tick.tick() => {
-                // A disconnect clears `enabled`; exit the pump so the control
-                // loop can tear down routes and go idle.
                 if !shared.enabled.load(Ordering::Relaxed) {
                     return PumpEnd::Reconnect;
                 }
                 publish_status(transport, &shared);
-                reconnect_dead(transport, &shared, &mut backoff).await;
+                reconnect_dead(transport, &shared, &mut backoff, client_nonce).await;
             }
         }
     }
 }
 
-/// Republish the path-liveness snapshot for the IPC server.
 fn publish_status(transport: &Transport, shared: &Shared) {
     let st = transport.status();
     let active = shared.paths.read().unwrap().active;
@@ -455,12 +471,13 @@ fn update_active(shared: &Shared, kind: PathKind) {
     shared.paths.write().unwrap().active = Some(kind);
 }
 
-/// Re-dial any path the transport reports dead, rate-limited per path.
-async fn reconnect_dead(transport: &Transport, shared: &Shared, backoff: &mut [Instant; 2]) {
+async fn reconnect_dead(
+    transport: &Transport,
+    shared: &Shared,
+    backoff: &mut [Instant; 2],
+    client_nonce: u64,
+) {
     for kind in PathKind::ALL {
-        if transport.is_alive(kind) {
-            continue;
-        }
         let idx = match kind {
             PathKind::Wired => 0,
             PathKind::Wifi => 1,
@@ -468,13 +485,25 @@ async fn reconnect_dead(transport: &Transport, shared: &Shared, backoff: &mut [I
         if backoff[idx].elapsed() < RECONNECT_BACKOFF {
             continue;
         }
+
+        if transport.is_alive(kind) {
+            if !transport.is_ready(kind) {
+                backoff[idx] = Instant::now();
+                transport.send_frame_on(kind, &Frame::Hello { client_nonce });
+            }
+            continue;
+        }
+
         backoff[idx] = Instant::now();
         let src = match kind {
             PathKind::Wired => shared.wired_src,
             PathKind::Wifi => shared.wifi_src,
         };
         match transport.reconnect_path(kind, shared.server, src).await {
-            Ok(()) => info!(path = %kind.label(), "path re-dialed"),
+            Ok(()) => {
+                transport.send_frame_on(kind, &Frame::Hello { client_nonce });
+                info!(path = %kind.label(), "path re-dialed; awaiting epoch acknowledgement");
+            }
             Err(e) => warn!(path = %kind.label(), %e, "path re-dial failed; will retry"),
         }
     }
@@ -513,15 +542,20 @@ fn spawn_utun_reader(utun: Arc<AsyncFd<utun::Utun>>, tx_q: mpsc::Sender<Bytes>) 
     });
 }
 
-fn run_canary() -> bool {
-    run_canary_with(|prog, args| std::process::Command::new(prog).args(args).status())
+fn run_canary(utun: &str) -> bool {
+    run_canary_with(utun, |prog, args| {
+        std::process::Command::new(prog).args(args).status()
+    })
 }
 
-fn run_canary_with<F>(mut run_command: F) -> bool
+fn run_canary_with<F>(utun: &str, mut run_command: F) -> bool
 where
     F: FnMut(&str, &[&str]) -> io::Result<std::process::ExitStatus>,
 {
-    match run_command("/sbin/ping", &["-n", "-c", "1", "-W", "1000", "10.10.99.1"]) {
+    match run_command(
+        "/sbin/ping",
+        &["-n", "-c", "1", "-W", "1000", "-b", utun, "10.10.99.1"],
+    ) {
         Ok(status) => status.success(),
         Err(e) => {
             warn!(%e, "dataplane canary command failed");
@@ -548,7 +582,7 @@ mod tests {
     fn canary_binds_one_ping_to_tunnel_peer() {
         let mut program = String::new();
         let mut arguments = Vec::new();
-        let ok = run_canary_with(|prog, args| {
+        let ok = run_canary_with("utun16", |prog, args| {
             program = prog.to_string();
             arguments = args.iter().map(|arg| arg.to_string()).collect();
             Ok(ExitStatus::default())
@@ -556,6 +590,9 @@ mod tests {
 
         assert!(ok);
         assert_eq!(program, "/sbin/ping");
-        assert_eq!(arguments, ["-n", "-c", "1", "-W", "1000", "10.10.99.1"]);
+        assert_eq!(
+            arguments,
+            ["-n", "-c", "1", "-W", "1000", "-b", "utun16", "10.10.99.1"]
+        );
     }
 }
