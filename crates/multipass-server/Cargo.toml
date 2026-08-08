@@ -3,7 +3,7 @@ name = "multipass-server"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "multipass server (jax): accept dual connections, decapsulate, forward/NAT"
+description = "multipass server (router): accept dual connections, decapsulate, forward/NAT"
 
 [dependencies]
 multipass-proto = { path = "../multipass-proto" }

@@ -1,5 +1,5 @@
 //! multipass wire format — the contract between client (scooter) and server
-//! (jax). No I/O here; just framing, dedup, and control messages. Both sides
+//! (router). No I/O here; just framing, dedup, and control messages. Both sides
 //! depend on this crate; keep it minimal and allocation-free on the hot path.
 //!
 //! One QUIC datagram carries exactly one `Frame`. The tunnel sends each Data

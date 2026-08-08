@@ -1,0 +1,69 @@
+{
+  "" : {
+    "diagnostics" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/Multipass-primary.dia",
+    "emit-module-dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/Multipass-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/Multipass-primary-emit-module.dia",
+    "pch" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/Multipass-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/Multipass-primary.swiftdeps"
+  },
+  "/Users/amos/bearcove/multipass/app/Sources/Multipass/DaemonClient.swift" : {
+    "const-values" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonClient.swiftconstvalues",
+    "dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonClient.d",
+    "diagnostics" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonClient.dia",
+    "index-unit-output-path" : "/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonClient.o",
+    "llvm-bc" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonClient.bc",
+    "object" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonClient.o",
+    "swift-dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonClient.swiftdeps",
+    "swiftmodule" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonClient~partial.swiftmodule"
+  },
+  "/Users/amos/bearcove/multipass/app/Sources/Multipass/DaemonProtocol.swift" : {
+    "const-values" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonProtocol.swiftconstvalues",
+    "dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonProtocol.d",
+    "diagnostics" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonProtocol.dia",
+    "index-unit-output-path" : "/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonProtocol.o",
+    "llvm-bc" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonProtocol.bc",
+    "object" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonProtocol.o",
+    "swift-dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonProtocol.swiftdeps",
+    "swiftmodule" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/DaemonProtocol~partial.swiftmodule"
+  },
+  "/Users/amos/bearcove/multipass/app/Sources/Multipass/LaunchAtLogin.swift" : {
+    "const-values" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/LaunchAtLogin.swiftconstvalues",
+    "dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/LaunchAtLogin.d",
+    "diagnostics" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/LaunchAtLogin.dia",
+    "index-unit-output-path" : "/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/LaunchAtLogin.o",
+    "llvm-bc" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/LaunchAtLogin.bc",
+    "object" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/LaunchAtLogin.o",
+    "swift-dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/LaunchAtLogin.swiftdeps",
+    "swiftmodule" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/LaunchAtLogin~partial.swiftmodule"
+  },
+  "/Users/amos/bearcove/multipass/app/Sources/Multipass/MenuBarView.swift" : {
+    "const-values" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MenuBarView.swiftconstvalues",
+    "dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MenuBarView.d",
+    "diagnostics" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MenuBarView.dia",
+    "index-unit-output-path" : "/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MenuBarView.o",
+    "llvm-bc" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MenuBarView.bc",
+    "object" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MenuBarView.o",
+    "swift-dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MenuBarView.swiftdeps",
+    "swiftmodule" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MenuBarView~partial.swiftmodule"
+  },
+  "/Users/amos/bearcove/multipass/app/Sources/Multipass/MultipassApp.swift" : {
+    "const-values" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MultipassApp.swiftconstvalues",
+    "dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MultipassApp.d",
+    "diagnostics" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MultipassApp.dia",
+    "index-unit-output-path" : "/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MultipassApp.o",
+    "llvm-bc" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MultipassApp.bc",
+    "object" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MultipassApp.o",
+    "swift-dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MultipassApp.swiftdeps",
+    "swiftmodule" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/MultipassApp~partial.swiftmodule"
+  },
+  "/Users/amos/bearcove/multipass/app/Sources/Multipass/TunnelController.swift" : {
+    "const-values" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/TunnelController.swiftconstvalues",
+    "dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/TunnelController.d",
+    "diagnostics" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/TunnelController.dia",
+    "index-unit-output-path" : "/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/TunnelController.o",
+    "llvm-bc" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/TunnelController.bc",
+    "object" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/TunnelController.o",
+    "swift-dependencies" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/TunnelController.swiftdeps",
+    "swiftmodule" : "/Users/amos/bearcove/multipass/app/.build/out/Intermediates.noindex/Multipass.build/Debug/Multipass-p.build/Objects-normal/arm64/TunnelController~partial.swiftmodule"
+  }
+}

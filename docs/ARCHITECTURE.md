@@ -1,24 +1,36 @@
 # multipass — architecture contract
 
 Seamless eth<->wifi failover VPN for Amos's desk. macOS 27+ client, Linux
-(jax) server. All our own Rust + SwiftUI. Transport already proven.
+(router) server. All our own Rust + SwiftUI. Transport already proven.
 
-## The proven core (do not redesign)
+## The proven core
 
 Two independent noq QUIC connections, one per interface (wired en17 / wifi
-en0). Every payload datagram is sent on BOTH connections; the receiver dedups
-by sequence number. Unplugging one interface blackholes one connection's
-packets; the other keeps delivering with ~0 gap. Measured: 0.1% loss, 184ms
-worst gap across unplug+replug cycles. This is the ONLY reason multipass is
-seamless where WireGuard/MPTCP are not.
+en0). Every packet carries a sequence number; the receiver dedups by it. The
+measured baseline (step 0) sent every packet on BOTH connections (active-active
+redundancy) and survived unplug/replug with 0.1% loss, 184ms worst gap. That
+proves the failover property.
+
+## Send policy: AGGREGATE (decided, supersedes plain active-active)
+
+Rather than duplicate everything (2x bandwidth, shared-bottleneck self-loss),
+the send path **stripes** packets across both connections, weighted by each
+path's live RTT/cwnd (a deficit-WRR scheduler, like mqvpn's `wlb`). The seq
+number + receiver dedup absorb the resulting out-of-order arrival. On
+suspected path trouble (RTT spike, ack stall), the scheduler re-homes traffic
+onto the survivor fast — so it stays seamless, not just fast. Dedup remains
+mandatory: duplicates still occur during failover and re-home.
+
+This is a Transport-layer policy only; the proto/wire format (seq + Dedup)
+already supports it unchanged.
 
 ## Why datagrams, not streams (decided)
 
 noq offers both. Streams (open_bi) are reliable+ordered per stream but would
 require terminating TCP inside the tunnel (a proxy, not a VPN) and break
 UDP/ICMP. We carry RAW IP PACKETS, one per QUIC datagram, on the unreliable
-datagram lane with seq-dedup + active-active redundancy. Inner TCP retransmits
-on its own; inner UDP/ICMP just work. Same model as mqvpn's datagram lane.
+datagram lane with seq-dedup. Inner TCP retransmits on its own; inner UDP/ICMP
+just work. Same model as mqvpn's datagram lane.
 
 ## Components
 
@@ -52,11 +64,11 @@ Owns the tunnel. Privileged.
   for the menubar app to query status and toggle the tunnel. (Unix socket, NOT
   real NSXPC — simpler from Rust; app side uses a tiny POSIX client.)
 
-### multipass-server (Rust bin on jax)
+### multipass-server (Rust bin on router)
 - noq server, accepts the two client connections (same ALPN).
 - Creates a `tun` device (/dev/net/tun), owns subnet 10.10.99.0/24 (server is
   .1). Assigns the client .2 via ControlMsg::Assign.
-- Decapsulate inbound frames -> write raw packet to tun. jax's existing
+- Decapsulate inbound frames -> write raw packet to tun. router's existing
   nftables masquerade (10.10.0.0/16 -> WAN) handles egress; ip_forward=1
   already set. NO new firewall/NAT rules needed for the base case.
 - Outbound: read tun -> wrap -> send on the client's currently-live conn(s).
@@ -71,7 +83,7 @@ Menubar app (LSUIElement), SMAppService launch-at-login like baratheon.
 
 ## Wire/ALPN
 ALPN = "multipass/0". Server port 51823/udp (51822 was mqvpn, now removed).
-Tunnel subnet 10.10.99.0/24 (server .1, client .2). Reuses jax's existing
+Tunnel subnet 10.10.99.0/24 (server .1, client .2). Reuses router's existing
 masquerade; no firewall delta for the base case.
 
 ## Non-goals (v1)

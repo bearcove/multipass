@@ -19,7 +19,7 @@
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -124,8 +124,7 @@ pub fn server_config() -> ServerConfig {
         .unwrap();
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
-    let mut cfg =
-        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()));
+    let mut cfg = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()));
     cfg.transport_config(transport_config());
     cfg
 }
@@ -204,10 +203,11 @@ pub async fn dial(
 }
 
 /// A single live QUIC connection on one interface, with its reader task's
-/// liveness bookkeeping.
+/// liveness bookkeeping. The connection is swappable so a dead path can be
+/// re-dialed in place without tearing down the [`Transport`].
 struct Path {
     kind: PathKind,
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
     /// Set false when the reader task hits an error / the conn closes.
     alive: Arc<AtomicBool>,
     /// Microseconds since `started` of the last datagram received.
@@ -222,7 +222,7 @@ impl Path {
     fn new(kind: PathKind, conn: Connection) -> Self {
         Self {
             kind,
-            conn,
+            conn: Arc::new(Mutex::new(conn)),
             alive: Arc::new(AtomicBool::new(true)),
             last_recv: Arc::new(AtomicU64::new(0)),
             started: Instant::now(),
@@ -296,6 +296,10 @@ pub struct Transport {
     data_rx: mpsc::Receiver<Data>,
     control_rx: mpsc::Receiver<(PathKind, Frame)>,
     dead_rx: mpsc::Receiver<PathKind>,
+    // Sender clones kept so a re-dialed path can respawn its reader task.
+    data_tx: mpsc::Sender<Data>,
+    control_tx: mpsc::Sender<(PathKind, Frame)>,
+    dead_tx: mpsc::Sender<PathKind>,
     dedup: Dedup,
 }
 
@@ -312,7 +316,7 @@ impl Transport {
     }
 
     /// Wrap two already-established connections. Used by the failover test and
-    /// by the daemon when re-dialing a single dead path.
+    /// by the daemon when re-establishing a transport.
     pub fn from_connections(wired: Connection, wifi: Connection) -> Self {
         let wired = Arc::new(Path::new(PathKind::Wired, wired));
         let wifi = Arc::new(Path::new(PathKind::Wifi, wifi));
@@ -321,8 +325,8 @@ impl Transport {
         let (control_tx, control_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (dead_tx, dead_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
-        spawn_reader(&wired, data_tx.clone(), control_tx.clone(), dead_tx.clone());
-        spawn_reader(&wifi, data_tx, control_tx, dead_tx);
+        spawn_reader(&wired, &data_tx, &control_tx, &dead_tx);
+        spawn_reader(&wifi, &data_tx, &control_tx, &dead_tx);
 
         Self {
             wired,
@@ -330,8 +334,29 @@ impl Transport {
             data_rx,
             control_rx,
             dead_rx,
+            data_tx,
+            control_tx,
+            dead_tx,
             dedup: Dedup::new(),
         }
+    }
+
+    /// Re-dial one dead path and swap it in, respawning its reader task.
+    /// The daemon calls this on [`Transport::recv_dead`]. Returns the dial
+    /// error if the interface is still down; callers retry with backoff.
+    pub async fn reconnect_path(
+        &self,
+        kind: PathKind,
+        server: SocketAddr,
+        src_ip: IpAddr,
+    ) -> Result<(), TransportError> {
+        let new_conn = dial(server, src_ip, kind.label()).await?;
+        let p = self.path(kind);
+        *p.conn.lock().unwrap() = new_conn;
+        p.alive.store(true, Ordering::Relaxed);
+        spawn_reader(p, &self.data_tx, &self.control_tx, &self.dead_tx);
+        tracing::info!(path = %kind.label(), "path reconnected");
+        Ok(())
     }
 
     /// Send a raw IP packet as a data frame on BOTH live paths. Best-effort:
@@ -347,7 +372,8 @@ impl Transport {
             if !p.alive.load(Ordering::Relaxed) {
                 continue;
             }
-            if p.conn.send_datagram(d.clone()).is_ok() {
+            let conn = p.conn.lock().unwrap();
+            if conn.send_datagram(d.clone()).is_ok() {
                 p.transmitted.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -395,11 +421,11 @@ impl Transport {
     }
 
     /// Raw noq connection for a path (e.g. to await `closed()` or inspect).
-    pub fn connection(&self, kind: PathKind) -> &Connection {
-        &self.path(kind).conn
+    pub fn connection(&self, kind: PathKind) -> Connection {
+        self.path(kind).conn.lock().unwrap().clone()
     }
 
-    fn path(&self, kind: PathKind) -> &Path {
+    fn path(&self, kind: PathKind) -> &Arc<Path> {
         match kind {
             PathKind::Wired => &self.wired,
             PathKind::Wifi => &self.wifi,
@@ -410,23 +436,32 @@ impl Transport {
 /// Spawn a reader task for `path`: decode inbound datagrams, auto-answer
 /// Pings, and distribute Data / control frames to the shared channels. On a
 /// read error or connection close it marks the path dead and notifies.
+///
+/// `#[allow(clippy::collapsible_match)]`: clippy suggests collapsing the
+/// `if …send().await.is_err() { break }` blocks into async match guards, but
+/// match guards cannot be `async`, so the suggestion doesn't compile.
+#[allow(clippy::collapsible_match)]
 fn spawn_reader(
     path: &Arc<Path>,
-    data_tx: mpsc::Sender<Data>,
-    control_tx: mpsc::Sender<(PathKind, Frame)>,
-    dead_tx: mpsc::Sender<PathKind>,
+    data_tx: &mpsc::Sender<Data>,
+    control_tx: &mpsc::Sender<(PathKind, Frame)>,
+    dead_tx: &mpsc::Sender<PathKind>,
 ) {
     let path = Arc::clone(path);
     let kind = path.kind;
-    let conn = path.conn.clone();
+    let conn = Arc::clone(&path.conn);
     let alive = Arc::clone(&path.alive);
     let mark_recv = {
         let p = Arc::clone(&path);
         move || p.mark_recv()
     };
+    let data_tx = data_tx.clone();
+    let control_tx = control_tx.clone();
+    let dead_tx = dead_tx.clone();
 
     tokio::spawn(async move {
         loop {
+            let conn = conn.lock().unwrap().clone();
             match conn.read_datagram().await {
                 Ok(d) => {
                     mark_recv();
@@ -466,4 +501,82 @@ fn spawn_reader(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Echo server: decodes inbound data frames and re-sends them (same seq),
+    /// so the client sees ONE copy per seq from EACH path — perfect for
+    /// proving the transport's active-active dedup.
+    async fn spawn_echo_server() -> SocketAddr {
+        let server = Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                tokio::spawn(async move {
+                    let conn = match incoming.await {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    loop {
+                        match conn.read_datagram().await {
+                            Ok(d) => {
+                                if let Some(Frame::Data { seq, packet }) =
+                                    multipass_proto::decode(&d)
+                                {
+                                    let _ = conn.send_datagram(multipass_proto::encode(
+                                        &Frame::Data { seq, packet },
+                                    ));
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn active_active_sends_on_both_and_dedups() {
+        let addr = spawn_echo_server().await;
+        // Both paths bound to loopback (distinct ephemeral source ports).
+        let mut t = Transport::connect(
+            addr,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        const N: u64 = 10;
+        for seq in 0..N {
+            t.send_data(seq, Bytes::from_static(b"hello"));
+        }
+
+        // Each seq is delivered on BOTH paths -> 2x copies -> dedup must
+        // collapse to exactly the N unique seqs.
+        let mut got = Vec::new();
+        for _ in 0..N {
+            let d = t.recv_data().await.unwrap();
+            got.push((d.seq, d.packet));
+        }
+        assert_eq!(got.len(), N as usize);
+        for (i, (seq, pkt)) in got.iter().enumerate() {
+            assert_eq!(*seq, i as u64);
+            assert_eq!(pkt, &Bytes::from_static(b"hello"));
+        }
+
+        // Both paths alive and each saw at least one datagram.
+        let st = t.status();
+        assert!(st.wired.alive, "wired path should be alive");
+        assert!(st.wifi.alive, "wifi path should be alive");
+        assert!(
+            st.wired.received + st.wifi.received >= N,
+            "both paths should deliver copies"
+        );
+    }
 }

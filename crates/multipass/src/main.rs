@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use multipass::{dial, server_config};
 use noq::Endpoint;
-use tokio_stream::StreamExt;
 
 const PING_INTERVAL: Duration = Duration::from_millis(50);
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -52,14 +51,9 @@ async fn run_server(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + 
             };
             let remote = conn.path(noq_proto::PathId::ZERO).and_then(|p| p.remote_address().ok());
             println!("[{}] [srv] conn from {:?}", now(), remote);
-            loop {
-                match conn.read_datagram().await {
-                    Ok(d) => {
-                        if conn.send_datagram(d).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(d) = conn.read_datagram().await {
+                if conn.send_datagram(d).is_err() {
+                    break;
                 }
             }
         });

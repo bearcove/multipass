@@ -1,4 +1,4 @@
-//! multipass-server — the jax side of the multipass failover VPN.
+//! multipass-server — the router side of the multipass failover VPN.
 //!
 //! Listens on `0.0.0.0:51823` (noq QUIC, ALPN `multipass/0`). The client
 //! opens TWO independent connections (one per interface: wired + wifi); the
@@ -142,10 +142,8 @@ async fn conn_handler(conn: Connection, id: u64, session: Arc<Session>, to_tun: 
                     }
                     Frame::Data { seq, packet } => {
                         let is_new = session.dedup.lock().await.insert(seq);
-                        if is_new {
-                            if to_tun.send(packet).await.is_err() {
-                                break; // TUN writer gone
-                            }
+                        if is_new && to_tun.send(packet).await.is_err() {
+                            break; // TUN writer gone
                         }
                     }
                     Frame::Ping { nonce } => {

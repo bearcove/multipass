@@ -98,9 +98,9 @@ fn configure(name: &str) -> io::Result<()> {
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        ifr.ifr_ifru.ifru_flags
+        unsafe { ifr.ifr_ifru.ifru_flags }
     };
-    flags |= IFF_UP | IFF_RUNNING | IFF_POINTOPOINT | IFF_NOARP;
+    flags |= (IFF_UP | IFF_RUNNING | IFF_POINTOPOINT | IFF_NOARP) as c_short;
     with_ifr(sock.as_raw_fd(), SIOCSIFFLAGS, name, |ifr| {
         ifr.ifr_ifru.ifru_flags = flags;
     })?;
@@ -128,14 +128,17 @@ fn with_ifr(
 fn set_name(ifr: &mut libc::ifreq, name: &str) {
     let bytes = name.as_bytes();
     let n = bytes.len().min(IFNAMSIZ - 1);
-    ifr.ifr_name[..n].copy_from_slice(&bytes[..n]);
+    for (slot, &b) in ifr.ifr_name[..n].iter_mut().zip(&bytes[..n]) {
+        *slot = b as c_char;
+    }
     ifr.ifr_name[n] = 0;
 }
 
 /// Read the NUL-terminated interface name back out of an ifreq.
 fn ifr_name(ifr: &libc::ifreq) -> String {
     let end = ifr.ifr_name.iter().position(|&c| c == 0).unwrap_or(ifr.ifr_name.len());
-    String::from_utf8_lossy(&ifr.ifr_name[..end]).into_owned()
+    let name: Vec<u8> = ifr.ifr_name[..end].iter().map(|&c| c as u8).collect();
+    String::from_utf8_lossy(&name).into_owned()
 }
 
 fn sockaddr_in_to_sockaddr(sa: sockaddr_in) -> sockaddr {
@@ -147,7 +150,7 @@ fn sockaddr_in_to_sockaddr(sa: sockaddr_in) -> sockaddr {
 #[cfg(target_os = "linux")]
 pub use imp::*;
 
-/// Non-Linux: the TUN device only exists on Linux (jax).
+/// Non-Linux: the TUN device only exists on Linux (router).
 #[cfg(not(target_os = "linux"))]
 pub mod imp {
     use std::io;

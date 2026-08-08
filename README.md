@@ -37,23 +37,25 @@ transport layer — which is the whole trick.
 
 One trick, and it's the entire thing:
 
-- The client opens **two independent QUIC connections** to the server — one
+- The client opens **two independent QUIC connections** to the router — one
   pinned to the wired interface, one to Wi-Fi.
-- Every tunnel packet is sent on **both** connections (active-active).
-- The receiver **dedups by sequence number** and keeps whichever copy arrives
-  first.
-- Unplug a cable → that connection's packets silently stop, the other
-  connection is *already* delivering them. Nothing to fail over, nothing to
-  re-establish. The gap is ~zero.
+- Outgoing packets are **striped across both** connections, weighted by each
+  path's measured RTT/cwnd — so you get both links' bandwidth, not just
+  failover.
+- Every packet carries a **sequence number**; the receiver dedups and reorders
+  by it, so striping's out-of-order arrival is absorbed transparently.
+- When a path's RTT balloons or its packets stop being acked, it's re-homed
+  onto the survivor **fast** — unplug a cable and the other connection is
+  already carrying traffic. No reconnect, no re-handshake, gap ≈ zero.
 
 ```
    your apps (ssh, browser, git — anything)
         │  plain IP, unchanged
         ▼
    ┌─────────────┐      ┌── conn A (en17, wired) ──┐
-   │  utun dev   │─────►│                          │──► jax ──► internet
+   │  utun dev   │─────►│   striped by RTT/cwnd    │──► router ──► internet
    │ (tun IP)    │      └── conn B (en0,  wifi)  ──┘
-   └─────────────┘   every packet on both, dedup on receipt
+   └─────────────┘   seq-tagged, dedup+reorder on receipt
      stable tunnel IP — apps never see the path change
 ```
 
@@ -73,7 +75,7 @@ server-side forwarding — is being built. See `docs/ARCHITECTURE.md`.
   transport + routing, runs as root on the Mac.
 - `crates/multipass-proto` — the wire format (framing, dedup, control
   messages). Shared by client and server, no I/O.
-- `crates/multipass-server` — the server (jax): decapsulate, forward, NAT.
+- `crates/multipass-server` — the server (router): decapsulate, forward, NAT.
 - `app/` — the SwiftUI menubar app (macOS 27).
 
 ## License
