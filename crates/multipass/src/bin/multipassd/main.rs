@@ -560,8 +560,17 @@ async fn pump(
                 let Some(d) = d else { return PumpEnd::Reconnect };
                 update_active(&shared, d.path);
                 shared.rx_bytes.fetch_add(d.packet.len() as u64, Ordering::Relaxed);
+                // Derive the utun family from the packet's IP version nibble.
+                let family = match d.packet.first().map(|b| b >> 4) {
+                    Some(4) => utun::AddressFamily::Inet,
+                    Some(6) => utun::AddressFamily::Inet6,
+                    _ => {
+                        warn!("dropping packet with unknown IP version");
+                        continue;
+                    }
+                };
                 if shared.enabled.load(Ordering::Relaxed)
-                    && let Err(e) = utun.get_ref().write_packet(&mut wbuf, &d.packet)
+                    && let Err(e) = utun.get_ref().write_packet(&mut wbuf, family, &d.packet)
                 {
                     warn!(%e, "utun write error");
                 }
@@ -640,13 +649,15 @@ fn spawn_utun_reader(utun: Arc<AsyncFd<utun::Utun>>, tx_q: mpsc::Sender<Bytes>) 
             match utun.readable().await {
                 Ok(mut guard) => {
                     match guard.get_inner().read_packet(&mut buf) {
-                        Ok(Some(n)) => {
+                        Ok(Some((_family, n))) => {
+                            // Family is recoverable from the IP version nibble
+                            // downstream; the wire format carries raw bytes.
                             let pkt = Bytes::copy_from_slice(&buf[..n]);
                             if tx_q.send(pkt).await.is_err() {
                                 break; // pump gone
                             }
                         }
-                        Ok(None) => { /* non-IPv4 frame, dropped */ }
+                        Ok(None) => { /* neither IPv4 nor IPv6 frame, dropped */ }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             guard.clear_ready();
                         }

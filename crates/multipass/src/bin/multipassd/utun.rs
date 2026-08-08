@@ -28,8 +28,8 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{
-    AF_INET, AF_SYS_CONTROL, AF_SYSTEM, CTLIOCGINFO, SOCK_DGRAM, SYSPROTO_CONTROL, c_char, c_uchar,
-    ctl_info, sockaddr, sockaddr_ctl,
+    AF_INET, AF_INET6, AF_SYS_CONTROL, AF_SYSTEM, CTLIOCGINFO, SOCK_DGRAM, SYSPROTO_CONTROL,
+    c_char, c_uchar, ctl_info, sockaddr, sockaddr_ctl,
 };
 
 /// Kernel control name for the utun subsystem.
@@ -37,6 +37,31 @@ const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
 
 /// IPv4 address-family tag prepended to every utun frame (big-endian u32).
 const AF_INET_TAG: u32 = AF_INET as u32;
+/// IPv6 address-family tag.
+const AF_INET6_TAG: u32 = AF_INET6 as u32;
+
+/// The address family of a packet read from / written to the utun device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    Inet,
+    Inet6,
+}
+
+impl AddressFamily {
+    fn from_tag(tag: u32) -> Option<Self> {
+        match tag {
+            t if t == AF_INET_TAG => Some(Self::Inet),
+            t if t == AF_INET6_TAG => Some(Self::Inet6),
+            _ => None,
+        }
+    }
+    fn tag(self) -> u32 {
+        match self {
+            Self::Inet => AF_INET_TAG,
+            Self::Inet6 => AF_INET6_TAG,
+        }
+    }
+}
 
 /// An open utun device. `read_packet`/`write_packet` are blocking and expect
 /// to be driven through `tokio::io::unix::AsyncFd` readiness.
@@ -127,11 +152,11 @@ impl AsRawFd for Utun {
 
 impl Utun {
     /// Read one packet into `buf` (which must hold at least 4 bytes for the
-    /// AF header). Strips the 4-byte AF header and validates it is `AF_INET`.
-    /// Returns `Ok(Some(len))` with `buf[..len]` = the raw IPv4 packet, or
-    /// `Ok(None)` when the frame was not IPv4 (dropped). `buf` is left alone
-    /// on `Err`.
-    pub fn read_packet(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+    /// AF header). Strips the 4-byte AF header and returns the address family
+    /// with the payload. Returns `Ok(Some((family, len)))` with `buf[..len]` =
+    /// the raw IP packet, or `Ok(None)` when the frame is neither IPv4 nor
+    /// IPv6 (dropped). `buf` is left alone on `Err`.
+    pub fn read_packet(&self, buf: &mut [u8]) -> io::Result<Option<(AddressFamily, usize)>> {
         let n = unsafe { libc::read(self.fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
         if n < 0 {
             return Err(io::Error::last_os_error());
@@ -141,17 +166,36 @@ impl Utun {
             return Ok(None); // too short even for the AF header
         }
         let af = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        if af != AF_INET_TAG {
-            return Ok(None); // not IPv4, drop
-        }
+        let Some(family) = AddressFamily::from_tag(af) else {
+            return Ok(None); // neither IPv4 nor IPv6, drop
+        };
         let payload = n - 4;
         buf.copy_within(4..n, 0);
-        Ok(Some(payload))
+        Ok(Some((family, payload)))
     }
 
-    /// Write one raw IPv4 packet, prepending the 4-byte AF header. `buf` must
-    /// be at least `payload.len() + 4`. Returns the payload byte count written.
-    pub fn write_packet(&self, buf: &mut [u8], payload: &[u8]) -> io::Result<usize> {
+    /// Write one raw IP packet, prepending the 4-byte AF header for `family`.
+    /// `buf` must be at least `payload.len() + 4`. The payload's IP version
+    /// nibble is validated against `family` so a malformed or mismatched packet
+    /// is never mislabeled to the kernel. Returns the payload byte count written.
+    pub fn write_packet(
+        &self,
+        buf: &mut [u8],
+        family: AddressFamily,
+        payload: &[u8],
+    ) -> io::Result<usize> {
+        // Validate the version nibble matches the claimed family.
+        let version = payload.first().map(|b| b >> 4).unwrap_or(0);
+        let expected = match family {
+            AddressFamily::Inet => 4,
+            AddressFamily::Inet6 => 6,
+        };
+        if version != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("packet version {version} does not match family {family:?}"),
+            ));
+        }
         let total = 4 + payload.len();
         if buf.len() < total {
             return Err(io::Error::new(
@@ -159,7 +203,7 @@ impl Utun {
                 "write buffer too small for AF header + payload",
             ));
         }
-        buf[0..4].copy_from_slice(&AF_INET_TAG.to_be_bytes());
+        buf[0..4].copy_from_slice(&family.tag().to_be_bytes());
         buf[4..total].copy_from_slice(payload);
         let n = unsafe { libc::write(self.fd(), buf.as_ptr() as *const _, total) };
         if n < 0 {
@@ -225,4 +269,25 @@ pub fn iface_for_ip(ip: std::net::Ipv4Addr) -> Option<String> {
     }
     unsafe { libc::freeifaddrs(head) };
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_family_tag_roundtrip() {
+        assert_eq!(AddressFamily::from_tag(AF_INET_TAG), Some(AddressFamily::Inet));
+        assert_eq!(AddressFamily::from_tag(AF_INET6_TAG), Some(AddressFamily::Inet6));
+        assert_eq!(AddressFamily::from_tag(999), None);
+        assert_eq!(AddressFamily::Inet.tag(), AF_INET_TAG);
+        assert_eq!(AddressFamily::Inet6.tag(), AF_INET6_TAG);
+    }
+
+    #[test]
+    fn address_family_from_tag_values() {
+        // macOS AF_INET = 2, AF_INET6 = 30
+        assert_eq!(AddressFamily::from_tag(2), Some(AddressFamily::Inet));
+        assert_eq!(AddressFamily::from_tag(30), Some(AddressFamily::Inet6));
+    }
 }
