@@ -37,6 +37,68 @@
 
 ---
 
+### Task 0: QUIC DATAGRAM Capacity Verification
+
+**Files:**
+- Modify: `crates/multipass/src/lib.rs`
+- Test: `crates/multipass/src/lib.rs` (tests module)
+
+**Interfaces:**
+- Consumes: noq `Connection` APIs
+- Produces: `Transport::verify_datagram_capacity(path) -> bool`
+
+**Rationale:** MTU 1280 + 9 bytes framing = 1289 bytes required. noq's default max_datagram_size may be lower. Must verify and configure before any dual-stack work.
+
+- [ ] **Step 1: Write failing test for capacity check**
+
+```rust
+#[tokio::test]
+async fn datagram_capacity_supports_mtu() {
+    let addr = spawn_echo_server().await;
+    let t = Transport::connect(addr, "127.0.0.1".parse().unwrap(), "127.0.0.1".parse().unwrap()).await.unwrap();
+    
+    // Must be able to send 1289-byte datagrams
+    assert!(t.verify_datagram_capacity(PathKind::Wired));
+    assert!(t.verify_datagram_capacity(PathKind::Wifi));
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo nextest run -p multipass datagram_capacity_supports_mtu`
+Expected: FAIL — method does not exist
+
+- [ ] **Step 3: Implement capacity verification**
+
+Add to `Transport`:
+```rust
+pub fn verify_datagram_capacity(&self, kind: PathKind) -> bool {
+    let conn = self.connection(kind);
+    let max = conn.datagram_send_buffer_space().unwrap_or(0);
+    max >= 1289 // MTU 1280 + 9 bytes framing
+}
+```
+
+- [ ] **Step 4: Configure noq transport for larger datagrams**
+
+In `client_config()` and `server_config()`, set:
+```rust
+tc.datagram_receive_buffer_size(Some(65536));
+tc.datagram_send_buffer_size(65536);
+// Verify noq supports max_datagram_size configuration
+```
+
+- [ ] **Step 5: Run test to verify it passes**
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/multipass/src/lib.rs
+git commit -m "transport: verify DATAGRAM capacity for MTU 1280"
+```
+
+---
+
 ### Task 1: Wire Protocol — SACK Frame
 
 **Files:**
@@ -447,6 +509,10 @@ Modify `Transport`:
 - Change `send_data` to: insert into window, pick path, send on that path only
 - Add `handle_sack(sack)` method: retire acked, retransmit gaps
 - Add `recv_sack()` for the daemon to poll SACK frames
+
+**Send API:** Use `send_datagram_wait` (non-evicting), not `send_datagram`. The latter silently drops oldest queued datagrams under congestion; the former applies backpressure.
+
+**Recovery window:** On path reconnect, enter shadow-copy mode for 100ms: send each new packet on both the recovered path and the primary path. Exit when SACK confirms the recovered path is delivering. This preserves the proven replication behavior during uncertainty.
 
 - [ ] **Step 4: Run test to verify it passes**
 
