@@ -23,6 +23,7 @@ use multipass_proto::{
     Dedup, Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, encode,
 };
 use noq::{Connection, Endpoint, ServerConfig, TransportConfig};
+use noq_proto::crypto::rustls::QuicServerConfig;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, info, warn};
 
@@ -44,8 +45,18 @@ fn server_config() -> ServerConfig {
         .expect("generate self-signed cert");
     let der = rustls::pki_types::CertificateDer::from(cert.cert);
     let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-    let mut cfg = ServerConfig::with_single_cert(vec![der], key.into())
+
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 configuration")
+        .with_no_client_auth()
+        .with_single_cert(vec![der], key.into())
         .expect("server config with cert");
+    tls.alpn_protocols = vec![multipass_proto::ALPN.to_vec()];
+
+    let crypto = QuicServerConfig::try_from(tls).expect("QUIC server config");
+    let mut cfg = ServerConfig::with_crypto(Arc::new(crypto));
     cfg.transport_config(transport());
     cfg
 }
@@ -288,4 +299,37 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .enable_all()
         .build()?;
     rt.block_on(run(bind))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use noq::Endpoint;
+
+    use super::server_config;
+
+    #[tokio::test]
+    async fn production_server_negotiates_wire_protocol_alpn() {
+        let server = Endpoint::server(
+            server_config(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        )
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap();
+        client.set_default_client_config(multipass::client_config());
+        let connecting = client
+            .connect(server_addr, multipass::SERVER_NAME)
+            .unwrap();
+
+        let (accepted, connected) = tokio::join!(
+            async { server.accept().await.unwrap().await },
+            connecting,
+        );
+        accepted.unwrap();
+        connected.unwrap();
+    }
 }

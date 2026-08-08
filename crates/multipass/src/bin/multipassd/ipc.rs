@@ -110,7 +110,7 @@ fn handle_request(line: &str, shared: &Arc<Shared>) -> String {
 
 /// Build the `{"type":"status",...}` line from live state.
 fn status_json(shared: &Shared) -> String {
-    let connected = shared.enabled.load(Ordering::Relaxed);
+    let connected = shared.active.load(Ordering::Relaxed);
     let paths = *shared.paths.read().unwrap();
     let active = match paths.active {
         Some(PathKind::Wired) => "\"wired\"",
@@ -159,6 +159,7 @@ mod tests {
             tx_bytes: AtomicU64::new(100),
             rx_bytes: AtomicU64::new(200),
             enabled: AtomicBool::new(true),
+            active: AtomicBool::new(true),
             paths: std::sync::RwLock::new(crate::PathSnapshot {
                 wired_alive: true,
                 wifi_alive: false,

@@ -72,6 +72,7 @@ pub struct Shared {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub enabled: AtomicBool,
+    pub active: AtomicBool,
     pub paths: RwLock<PathSnapshot>,
     pub server: SocketAddr,
     pub wired_src: IpAddr,
@@ -87,6 +88,7 @@ impl Shared {
             tx_bytes: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
             enabled: AtomicBool::new(false),
+            active: AtomicBool::new(false),
             paths: RwLock::new(PathSnapshot {
                 wired_alive: false,
                 wifi_alive: false,
@@ -193,18 +195,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 continue;
             }
         };
+        if !shared.enabled.load(Ordering::Relaxed) {
+            continue;
+        }
 
         match handshake(&mut transport).await {
             Ok((addr, prefix, mtu)) => {
+                if !shared.enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
                 info!(%addr, prefix, mtu, "assigned; configuring tunnel");
                 let utun_name = shared.utun_name.clone();
-                routes::configure(&utun_name, addr, prefix, mtu);
-                routes::setup(
+                if !routes::configure(&utun_name, addr, prefix, mtu) {
+                    error!("tunnel interface configuration failed; disabling tunnel");
+                    shared.enabled.store(false, Ordering::Relaxed);
+                    continue;
+                }
+                if !shared.enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if !routes::setup(
                     &utun_name,
                     opts.server.ip(),
                     &shared.wired_iface,
                     &shared.wifi_iface,
-                );
+                ) {
+                    error!("route activation failed; rolled back; disabling tunnel");
+                    shared.enabled.store(false, Ordering::Relaxed);
+                    continue;
+                }
+                if !shared.enabled.load(Ordering::Relaxed) {
+                    routes::teardown(
+                        &shared.utun_name,
+                        opts.server.ip(),
+                        &shared.wired_iface,
+                        &shared.wifi_iface,
+                    );
+                    continue;
+                }
+                shared.active.store(true, Ordering::Relaxed);
             }
             Err(e) => {
                 error!(%e, "handshake failed; re-dialing");
@@ -222,18 +251,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        // Pump ended (transport dropped or user disconnected). If the user
-        // disconnected, restore routing; either way we loop back and re-check
-        // `enabled` before re-dialing.
-        if !shared.enabled.load(Ordering::Relaxed) {
-            info!("disconnect requested; restoring routes");
-            routes::teardown(
-                &shared.utun_name,
-                opts.server.ip(),
-                &shared.wired_iface,
-                &shared.wifi_iface,
-            );
-        }
+        // Any pump end deactivates routing immediately, including transport
+        // loss while user intent remains enabled. A later re-dial must complete
+        // a fresh handshake and route transaction before becoming active again.
+        shared.active.store(false, Ordering::Relaxed);
+        info!("transport inactive; restoring routes");
+        routes::teardown(
+            &shared.utun_name,
+            opts.server.ip(),
+            &shared.wired_iface,
+            &shared.wifi_iface,
+        );
     }
 }
 

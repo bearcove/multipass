@@ -51,28 +51,79 @@ pub fn configure(utun: &str, addr: Ipv4Addr, prefix: u8, mtu: u16) -> bool {
     ok
 }
 
-/// Install full-tunnel routing (host-route pins first, then default via utun).
-pub fn setup(utun: &str, server: IpAddr, wired_if: &str, wifi_if: &str) {
+/// Install full-tunnel routing transactionally: host-route pins first, then
+/// the default via utun. Any failure removes every route installed so far.
+pub fn setup(utun: &str, server: IpAddr, wired_if: &str, wifi_if: &str) -> bool {
+    let mut pins = Vec::with_capacity(2);
     for iface in [wired_if, wifi_if] {
         if iface.is_empty() {
             continue;
         }
-        match crate::utun::ipv4_for_iface(iface) {
-            Some(addr) => {
-                run(
-                    "route",
-                    &["-n", "add", "-host", &server.to_string(), "-ifscope", iface, &addr.to_string()],
-                );
-            }
-            None => tracing::warn!(iface, "no ipv4 for interface; skipping server-route pin"),
-        }
+        let Some(addr) = crate::utun::ipv4_for_iface(iface) else {
+            tracing::error!(iface, "no ipv4 for interface; cannot pin server route");
+            return false;
+        };
+        pins.push((iface, addr));
     }
-    run("route", &["-n", "add", "-interface", utun, "default"]);
+
+    setup_with(utun, server, &pins, run)
+}
+
+fn setup_with<F>(
+    utun: &str,
+    server: IpAddr,
+    pins: &[(&str, Ipv4Addr)],
+    mut run_command: F,
+) -> bool
+where
+    F: FnMut(&str, &[&str]) -> bool,
+{
+    let server = server.to_string();
+    let mut installed = Vec::with_capacity(pins.len());
+
+    for &(iface, addr) in pins {
+        let addr = addr.to_string();
+        let args = ["-n", "add", "-host", server.as_str(), "-ifscope", iface, addr.as_str()];
+        if !run_command("route", &args) {
+            rollback_pins(&server, &installed, &mut run_command);
+            return false;
+        }
+        installed.push((iface, addr));
+    }
+
+    let args = default_route_args(utun);
+    if !run_command("route", &args) {
+        rollback_pins(&server, &installed, &mut run_command);
+        return false;
+    }
+
+    true
+}
+
+fn rollback_pins<F>(server: &str, installed: &[(&str, String)], run_command: &mut F)
+where
+    F: FnMut(&str, &[&str]) -> bool,
+{
+    for (iface, addr) in installed.iter().rev() {
+        let args = [
+            "-n",
+            "delete",
+            "-host",
+            server,
+            "-ifscope",
+            *iface,
+            addr.as_str(),
+        ];
+        run_command("route", &args);
+    }
 }
 
 /// Reverse `setup`: restore normal routing.
 pub fn teardown(utun: &str, server: IpAddr, wired_if: &str, wifi_if: &str) {
-    run("route", &["-n", "delete", "-interface", utun, "default"]);
+    run(
+        "route",
+        &["-n", "delete", "default", "-interface", utun],
+    );
     for iface in [wired_if, wifi_if] {
         if iface.is_empty() {
             continue;
@@ -84,6 +135,10 @@ pub fn teardown(utun: &str, server: IpAddr, wired_if: &str, wifi_if: &str) {
             );
         }
     }
+}
+
+fn default_route_args(utun: &str) -> [&str; 5] {
+    ["-n", "add", "default", "-interface", utun]
 }
 
 /// Run a command, logging on failure. Returns success.
@@ -99,5 +154,66 @@ fn run(prog: &str, args: &[&str]) -> bool {
             tracing::warn!(prog, args = ?args, %e, "command failed");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{default_route_args, setup_with};
+
+    #[test]
+    fn default_interface_route_uses_macos_argument_order() {
+        assert_eq!(
+            default_route_args("utun16"),
+            ["-n", "add", "default", "-interface", "utun16"]
+        );
+    }
+
+    #[test]
+    fn default_route_failure_rolls_back_installed_pins() {
+        let mut calls = Vec::new();
+        let ok = setup_with(
+            "utun16",
+            IpAddr::V4(Ipv4Addr::new(10, 10, 10, 1)),
+            &[(&"en17", Ipv4Addr::new(10, 10, 10, 171)), (&"en0", Ipv4Addr::new(10, 10, 10, 169))],
+            |prog, args| {
+                calls.push((prog.to_string(), args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>()));
+                !args.contains(&"default")
+            },
+        );
+
+        assert!(!ok);
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[3].1[1], "delete");
+        assert_eq!(calls[3].1[5], "en0");
+        assert_eq!(calls[4].1[1], "delete");
+        assert_eq!(calls[4].1[5], "en17");
+    }
+
+    #[test]
+    fn pin_failure_rolls_back_prior_pin_without_installing_default() {
+        let mut calls = Vec::new();
+        let mut adds = 0;
+        let ok = setup_with(
+            "utun16",
+            IpAddr::V4(Ipv4Addr::new(10, 10, 10, 1)),
+            &[(&"en17", Ipv4Addr::new(10, 10, 10, 171)), (&"en0", Ipv4Addr::new(10, 10, 10, 169))],
+            |prog, args| {
+                calls.push((prog.to_string(), args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>()));
+                if args.contains(&"add") {
+                    adds += 1;
+                    adds != 2
+                } else {
+                    true
+                }
+            },
+        );
+
+        assert!(!ok);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].1[1], "delete");
+        assert!(!calls.iter().any(|(_, args)| args.contains(&"default".to_string())));
     }
 }
