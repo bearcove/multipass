@@ -51,6 +51,25 @@ pub fn configure(utun: &str, addr: Ipv4Addr, prefix: u8, mtu: u16) -> bool {
     ok
 }
 
+/// `ifconfig utunN inet6 <addr> prefixlen <prefix>` — assign the IPv6 tunnel
+/// address. The utun already has MTU/up from the IPv4 configure.
+pub fn configure_v6(utun: &str, addr: std::net::Ipv6Addr, prefix: u8) -> bool {
+    let ok = run(
+        "ifconfig",
+        &[
+            utun,
+            "inet6",
+            &addr.to_string(),
+            "prefixlen",
+            &prefix.to_string(),
+        ],
+    );
+    if !ok {
+        tracing::error!(utun, %addr, prefix, "ifconfig inet6 failed");
+    }
+    ok
+}
+
 /// Install full-tunnel routing transactionally: host-route pins first, then
 /// two more-specific half-default routes via utun. Any failure removes every
 /// route installed so far without touching the physical default route.
@@ -190,6 +209,57 @@ fn default_route_args(utun: &str) -> [[&str; 6]; 2] {
     ]
 }
 
+/// IPv6 half-default routes into the tunnel (`::/1` + `8000::/1`). These win
+/// longest-prefix over the physical default without replacing it, so teardown
+/// never has to restore the original default.
+fn v6_default_route_args(utun: &str) -> [[&str; 7]; 2] {
+    [
+        ["-n", "add", "-inet6", "-net", "::/1", "-interface", utun],
+        ["-n", "add", "-inet6", "-net", "8000::/1", "-interface", utun],
+    ]
+}
+
+/// Install the IPv6 half-default routes into the tunnel. No server-endpoint
+/// pins are needed for IPv6 because the QUIC underlay remains IPv4; the only
+/// v6 routes are the tunnel defaults. Rolls back on failure.
+pub fn setup_v6(utun: &str) -> bool {
+    let routes = v6_default_route_args(utun);
+    for (index, args) in routes.iter().enumerate() {
+        if !run("route", args) {
+            for installed in routes[..index].iter().rev() {
+                let delete = [
+                    "-n",
+                    "delete",
+                    installed[2],
+                    installed[3],
+                    installed[4],
+                    installed[5],
+                    installed[6],
+                ];
+                run("route", &delete);
+            }
+            return false;
+        }
+    }
+    true
+}
+
+/// Remove the IPv6 half-default routes installed by `setup_v6`.
+pub fn teardown_v6(utun: &str) {
+    for installed in v6_default_route_args(utun) {
+        let delete = [
+            "-n",
+            "delete",
+            installed[2],
+            installed[3],
+            installed[4],
+            installed[5],
+            installed[6],
+        ];
+        run("route", &delete);
+    }
+}
+
 /// Run a command, logging on failure. Returns success.
 fn run(prog: &str, args: &[&str]) -> bool {
     match Command::new(prog).args(args).output() {
@@ -210,7 +280,7 @@ fn run(prog: &str, args: &[&str]) -> bool {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use super::{default_route_args, setup_with, teardown_with};
+    use super::{default_route_args, setup_with, teardown_with, v6_default_route_args};
 
     #[test]
     fn tunnel_routes_preserve_physical_default() {
@@ -219,6 +289,17 @@ mod tests {
             [
                 ["-n", "add", "-net", "0.0.0.0/1", "-interface", "utun16"],
                 ["-n", "add", "-net", "128.0.0.0/1", "-interface", "utun16"],
+            ]
+        );
+    }
+
+    #[test]
+    fn v6_tunnel_routes_preserve_physical_default() {
+        assert_eq!(
+            v6_default_route_args("utun16"),
+            [
+                ["-n", "add", "-inet6", "-net", "::/1", "-interface", "utun16"],
+                ["-n", "add", "-inet6", "-net", "8000::/1", "-interface", "utun16"],
             ]
         );
     }
