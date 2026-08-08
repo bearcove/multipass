@@ -177,13 +177,11 @@ impl Scheduler {
         // Reference RTT = the minimum among alive, non-stalled, measured paths.
         let mut ref_rtt: Option<Duration> = None;
         for h in &self.health {
-            if h.alive && !Self::stalled(&self.cfg, h, now) {
-                if let Some(r) = h.rtt {
-                    ref_rtt = Some(match ref_rtt {
-                        Some(cur) if cur <= r => cur,
-                        _ => r,
-                    });
-                }
+            if h.alive && !Self::stalled(&self.cfg, h, now) && let Some(r) = h.rtt {
+                ref_rtt = Some(match ref_rtt {
+                    Some(cur) if cur <= r => cur,
+                    _ => r,
+                });
             }
         }
         for i in PathKind::ALL {

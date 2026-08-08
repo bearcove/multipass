@@ -6,15 +6,23 @@
 //! noq can't pin one Endpoint to two interfaces (a single UDP socket bound to
 //! one source IP; `IP_PKTINFO` is only a hint). So we run TWO independent QUIC
 //! connections, one per interface (wired / wifi), each on its own Endpoint
-//! bound to that interface's source IP. Every payload datagram is sent on BOTH
-//! connections; the receiver dedups by sequence number. Pulling one interface
-//! blackholes one connection's packets while the other keeps delivering — that
-//! is the seamlessness.
+//! bound to that interface's source IP.
+//!
+//! # Send policy: aggregate, weighted by live health
+//!
+//! Each payload datagram is sent on ONE connection, chosen by the
+//! [`Scheduler`] (deficit-WRR weighted by live RTT and receive liveness), not
+//! duplicated on both. When a path's RTT spikes or its acks stall, its weight
+//! shifts onto the survivor so failover stays seamless. The receiver still
+//! dedups by sequence number ([`multipass_proto::Dedup`]) — that absorbs the
+//! reorder and the brief duplicates that occur while weights re-home.
 //!
 //! This crate is purely I/O: no TUN, no routing, no platform-specific code. It
 //! is macOS + Linux agnostic. The client daemon owns the tunnel device and the
 //! Hello/Assign handshake; it drives them through [`Transport::send_frame`] and
 //! [`Transport::recv_control`].
+
+mod scheduler;
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -29,6 +37,8 @@ use noq_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use tokio::sync::mpsc;
 
+pub use scheduler::{PathHealth, Scheduler, SchedulerConfig};
+
 /// Re-export the wire format so callers don't need a second `use` path.
 pub use multipass_proto;
 
@@ -38,10 +48,11 @@ pub const ALPN: &[u8] = multipass_proto::ALPN;
 /// for this name; the client verifier skips validation anyway.
 pub const SERVER_NAME: &str = "multipass";
 
-/// How long to keep a connection active before surfacing it as dead if no
-/// packets arrive. The daemon uses this to decide when a path has gone silent
-/// (as opposed to a hard read error, which is surfaced immediately).
-pub const PATH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the transport sends a Ping probe on each live path to measure RTT
+/// and re-evaluate scheduler stall detection.
+pub const RTT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+/// A probe with no Pong reply after this long is considered lost.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Strength of the internal channels carrying inbound frames from the reader
 /// tasks to the daemon's `recv_data` / `recv_control` consumers.
@@ -203,15 +214,21 @@ pub async fn dial(
 }
 
 /// A single live QUIC connection on one interface, with its reader task's
-/// liveness bookkeeping. The connection is swappable so a dead path can be
+/// liveness/RTT bookkeeping. The connection is swappable so a dead path can be
 /// re-dialed in place without tearing down the [`Transport`].
 struct Path {
     kind: PathKind,
     conn: Arc<Mutex<Connection>>,
     /// Set false when the reader task hits an error / the conn closes.
     alive: Arc<AtomicBool>,
-    /// Microseconds since `started` of the last datagram received.
+    /// Microseconds since `started` of the last datagram received (0 = none).
     last_recv: Arc<AtomicU64>,
+    /// Last measured RTT in microseconds (0 = none).
+    rtt: Arc<AtomicU64>,
+    /// In-flight Ping probe: (nonce, sent-at), if any.
+    probe: Arc<Mutex<Option<(u64, Instant)>>>,
+    /// Monotonic nonce source for Ping probes.
+    probe_nonce: Arc<AtomicU64>,
     started: Instant,
     /// Datagrams received / transmitted on this path.
     received: Arc<AtomicU64>,
@@ -225,6 +242,9 @@ impl Path {
             conn: Arc::new(Mutex::new(conn)),
             alive: Arc::new(AtomicBool::new(true)),
             last_recv: Arc::new(AtomicU64::new(0)),
+            rtt: Arc::new(AtomicU64::new(0)),
+            probe: Arc::new(Mutex::new(None)),
+            probe_nonce: Arc::new(AtomicU64::new(0)),
             started: Instant::now(),
             received: Arc::new(AtomicU64::new(0)),
             transmitted: Arc::new(AtomicU64::new(0)),
@@ -232,11 +252,15 @@ impl Path {
     }
 
     fn status(&self) -> PathStatus {
-        let micros = self.last_recv.load(Ordering::Relaxed);
-        let last_recv = (micros != 0).then(|| self.started + Duration::from_micros(micros));
+        let last_recv = micros_to_instant(self.started, self.last_recv.load(Ordering::Relaxed));
+        let rtt = {
+            let m = self.rtt.load(Ordering::Relaxed);
+            (m != 0).then(|| Duration::from_micros(m))
+        };
         PathStatus {
             alive: self.alive.load(Ordering::Relaxed),
             last_recv,
+            rtt,
             received: self.received.load(Ordering::Relaxed),
             transmitted: self.transmitted.load(Ordering::Relaxed),
         }
@@ -247,6 +271,14 @@ impl Path {
         self.last_recv
             .store(self.started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
+
+    fn set_rtt(&self, rtt: Duration) {
+        self.rtt.store(rtt.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+fn micros_to_instant(started: Instant, micros: u64) -> Option<Instant> {
+    (micros != 0).then(|| started + Duration::from_micros(micros))
 }
 
 /// Per-path liveness snapshot, for the daemon's status surface.
@@ -256,6 +288,8 @@ pub struct PathStatus {
     pub alive: bool,
     /// When the last datagram arrived on this path, if any.
     pub last_recv: Option<Instant>,
+    /// Last measured round-trip time on this path, if any.
+    pub rtt: Option<Duration>,
     /// Datagrams received on this path.
     pub received: u64,
     /// Datagrams transmitted on this path.
@@ -289,22 +323,28 @@ pub struct Data {
 ///
 /// Holds two [`Connection`]s (wired + wifi), each with a reader task that
 /// decodes inbound datagrams, auto-answers Pings, and feeds the daemon-facing
-/// channels. Sequence dedup is owned here via [`multipass_proto::Dedup`].
+/// channels, plus a probe loop that measures RTT into the [`Scheduler`].
+/// Outbound frames are routed through the scheduler onto ONE path (aggregate,
+/// weighted by live health). Sequence dedup is owned here via
+/// [`multipass_proto::Dedup`].
 pub struct Transport {
     wired: Arc<Path>,
     wifi: Arc<Path>,
-    data_rx: mpsc::Receiver<Data>,
-    control_rx: mpsc::Receiver<(PathKind, Frame)>,
-    dead_rx: mpsc::Receiver<PathKind>,
+    scheduler: Arc<Mutex<Scheduler>>,
+    // Receivers are mutex-guarded so `recv_*` can take `&self` and be selected
+    // over alongside `send_data`/`send_frame` in one tokio::select!.
+    data_rx: tokio::sync::Mutex<mpsc::Receiver<Data>>,
+    control_rx: tokio::sync::Mutex<mpsc::Receiver<(PathKind, Frame)>>,
+    dead_rx: tokio::sync::Mutex<mpsc::Receiver<PathKind>>,
     // Sender clones kept so a re-dialed path can respawn its reader task.
     data_tx: mpsc::Sender<Data>,
     control_tx: mpsc::Sender<(PathKind, Frame)>,
     dead_tx: mpsc::Sender<PathKind>,
-    dedup: Dedup,
+    dedup: Mutex<Dedup>,
 }
 
 impl Transport {
-    /// Dial both paths (wired then wifi) and start their reader tasks.
+    /// Dial both paths (wired then wifi) and start their reader + probe tasks.
     pub async fn connect(
         server: SocketAddr,
         wired_ip: IpAddr,
@@ -320,30 +360,35 @@ impl Transport {
     pub fn from_connections(wired: Connection, wifi: Connection) -> Self {
         let wired = Arc::new(Path::new(PathKind::Wired, wired));
         let wifi = Arc::new(Path::new(PathKind::Wifi, wifi));
+        let scheduler = Arc::new(Mutex::new(Scheduler::new(SchedulerConfig::default())));
 
         let (data_tx, data_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (dead_tx, dead_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
-        spawn_reader(&wired, &data_tx, &control_tx, &dead_tx);
-        spawn_reader(&wifi, &data_tx, &control_tx, &dead_tx);
+        for p in [&wired, &wifi] {
+            spawn_reader(p, &data_tx, &control_tx, &dead_tx, &scheduler);
+        }
+        spawn_probe(&wired, &wifi, &scheduler);
 
         Self {
             wired,
             wifi,
-            data_rx,
-            control_rx,
-            dead_rx,
+            scheduler,
+            data_rx: tokio::sync::Mutex::new(data_rx),
+            control_rx: tokio::sync::Mutex::new(control_rx),
+            dead_rx: tokio::sync::Mutex::new(dead_rx),
             data_tx,
             control_tx,
             dead_tx,
-            dedup: Dedup::new(),
+            dedup: Mutex::new(Dedup::new()),
         }
     }
 
-    /// Re-dial one dead path and swap it in, respawning its reader task.
-    /// The daemon calls this on [`Transport::recv_dead`]. Returns the dial
-    /// error if the interface is still down; callers retry with backoff.
+    /// Re-dial one dead path and swap it in, respawning its reader task and
+    /// restoring it in the scheduler. The daemon calls this on
+    /// [`Transport::recv_dead`]. Returns the dial error if the interface is
+    /// still down; callers retry with backoff.
     pub async fn reconnect_path(
         &self,
         kind: PathKind,
@@ -354,37 +399,49 @@ impl Transport {
         let p = self.path(kind);
         *p.conn.lock().unwrap() = new_conn;
         p.alive.store(true, Ordering::Relaxed);
-        spawn_reader(p, &self.data_tx, &self.control_tx, &self.dead_tx);
+        p.rtt.store(0, Ordering::Relaxed);
+        *p.probe.lock().unwrap() = None;
+        self.scheduler.lock().unwrap().set_alive(kind, true);
+        spawn_reader(p, &self.data_tx, &self.control_tx, &self.dead_tx, &self.scheduler);
         tracing::info!(path = %kind.label(), "path reconnected");
         Ok(())
     }
 
-    /// Send a raw IP packet as a data frame on BOTH live paths. Best-effort:
-    /// a path that is dead (or rejects the datagram) is skipped.
+    /// Send a raw IP packet as a data frame on the scheduler-chosen path.
     pub fn send_data(&self, seq: u64, packet: Bytes) {
         self.send_frame(&Frame::Data { seq, packet });
     }
 
-    /// Send a frame on BOTH live paths. Used for control (Hello, Ping, ...).
+    /// Send a frame on the scheduler-chosen path. Used for data and control
+    /// (Hello, Ping, ...). If the chosen path just died, re-homes to the
+    /// survivor; drops the frame if nothing is alive.
     pub fn send_frame(&self, frame: &Frame) {
         let d = multipass_proto::encode(frame);
-        for p in [&self.wired, &self.wifi] {
-            if !p.alive.load(Ordering::Relaxed) {
-                continue;
+        let kind = self.scheduler.lock().unwrap().pick();
+        let p = if self.is_alive(kind) {
+            self.path(kind)
+        } else {
+            let other = if kind == PathKind::Wired {
+                PathKind::Wifi
+            } else {
+                PathKind::Wired
+            };
+            if !self.is_alive(other) {
+                return;
             }
-            let conn = p.conn.lock().unwrap();
-            if conn.send_datagram(d.clone()).is_ok() {
-                p.transmitted.fetch_add(1, Ordering::Relaxed);
-            }
+            self.path(other)
+        };
+        if p.conn.lock().unwrap().send_datagram(d).is_ok() {
+            p.transmitted.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Receive the next deduped data frame. Returns `None` once the transport
     /// is fully closed (both paths dead / dropped).
-    pub async fn recv_data(&mut self) -> Option<Data> {
+    pub async fn recv_data(&self) -> Option<Data> {
         loop {
-            let d = self.data_rx.recv().await?;
-            if self.dedup.insert(d.seq) {
+            let d = self.data_rx.lock().await.recv().await?;
+            if self.dedup.lock().unwrap().insert(d.seq) {
                 return Some(d);
             }
         }
@@ -392,14 +449,14 @@ impl Transport {
 
     /// Receive the next non-data frame (Hello, Assign, ...) for the daemon's
     /// handshake. Pings are answered internally and never surface here.
-    pub async fn recv_control(&mut self) -> Option<(PathKind, Frame)> {
-        self.control_rx.recv().await
+    pub async fn recv_control(&self) -> Option<(PathKind, Frame)> {
+        self.control_rx.lock().await.recv().await
     }
 
     /// Wait until one path's reader task dies (read error / connection close),
     /// returning which path. The daemon re-dials that path.
-    pub async fn recv_dead(&mut self) -> PathKind {
-        self.dead_rx.recv().await.unwrap_or(PathKind::Wired)
+    pub async fn recv_dead(&self) -> PathKind {
+        self.dead_rx.lock().await.recv().await.unwrap_or(PathKind::Wired)
     }
 
     /// Snapshot of both paths' liveness.
@@ -425,6 +482,11 @@ impl Transport {
         self.path(kind).conn.lock().unwrap().clone()
     }
 
+    /// Handle to the scheduler, for status/tuning (e.g. `set_weight`).
+    pub fn scheduler(&self) -> Arc<Mutex<Scheduler>> {
+        Arc::clone(&self.scheduler)
+    }
+
     fn path(&self, kind: PathKind) -> &Arc<Path> {
         match kind {
             PathKind::Wired => &self.wired,
@@ -434,8 +496,9 @@ impl Transport {
 }
 
 /// Spawn a reader task for `path`: decode inbound datagrams, auto-answer
-/// Pings, and distribute Data / control frames to the shared channels. On a
-/// read error or connection close it marks the path dead and notifies.
+/// Pings, measure RTT from probe Pongs, feed the scheduler, and distribute
+/// Data / control frames to the shared channels. On a read error or connection
+/// close it marks the path dead and notifies.
 ///
 /// `#[allow(clippy::collapsible_match)]`: clippy suggests collapsing the
 /// `if …send().await.is_err() { break }` blocks into async match guards, but
@@ -446,6 +509,7 @@ fn spawn_reader(
     data_tx: &mpsc::Sender<Data>,
     control_tx: &mpsc::Sender<(PathKind, Frame)>,
     dead_tx: &mpsc::Sender<PathKind>,
+    scheduler: &Arc<Mutex<Scheduler>>,
 ) {
     let path = Arc::clone(path);
     let kind = path.kind;
@@ -455,6 +519,12 @@ fn spawn_reader(
         let p = Arc::clone(&path);
         move || p.mark_recv()
     };
+    let set_rtt = {
+        let p = Arc::clone(&path);
+        move |rtt| p.set_rtt(rtt)
+    };
+    let probe = Arc::clone(&path.probe);
+    let scheduler = Arc::clone(scheduler);
     let data_tx = data_tx.clone();
     let control_tx = control_tx.clone();
     let dead_tx = dead_tx.clone();
@@ -465,6 +535,7 @@ fn spawn_reader(
             match conn.read_datagram().await {
                 Ok(d) => {
                     mark_recv();
+                    scheduler.lock().unwrap().note_recv(kind);
                     match multipass_proto::decode(&d) {
                         Some(Frame::Data { seq, packet }) => {
                             if data_tx
@@ -480,8 +551,18 @@ fn spawn_reader(
                                 nonce,
                             }));
                         }
-                        // Pong is liveness-only; last_recv already updated above.
-                        Some(Frame::Pong { .. }) => {}
+                        Some(Frame::Pong { nonce }) => {
+                            // RTT from the matching in-flight probe, if any.
+                            let mut inflight = probe.lock().unwrap();
+                            if let Some((n, sent)) = *inflight
+                                && n == nonce
+                            {
+                                let rtt = sent.elapsed();
+                                *inflight = None;
+                                set_rtt(rtt);
+                                scheduler.lock().unwrap().note_rtt(kind, rtt);
+                            }
+                        }
                         Some(other) => {
                             if control_tx.send((kind, other)).await.is_err() {
                                 break;
@@ -495,8 +576,42 @@ fn spawn_reader(
                 Err(e) => {
                     tracing::warn!(path = %kind.label(), %e, "path read ended");
                     alive.store(false, Ordering::Relaxed);
+                    scheduler.lock().unwrap().set_alive(kind, false);
                     let _ = dead_tx.send(kind).await;
                     break;
+                }
+            }
+        }
+    });
+}
+
+/// Spawn a periodic probe task: re-evaluate the scheduler's stall state and, on
+/// each live path, send a Ping probe and arm the RTT measurement. The matching
+/// Pong (handled by the reader) yields the RTT that feeds the scheduler.
+fn spawn_probe(wired: &Arc<Path>, wifi: &Arc<Path>, scheduler: &Arc<Mutex<Scheduler>>) {
+    let paths = [Arc::clone(wired), Arc::clone(wifi)];
+    let scheduler = Arc::clone(scheduler);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RTT_PROBE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            scheduler.lock().unwrap().tick();
+            for p in &paths {
+                if !p.alive.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // Skip if a probe is still in flight (not yet timed out).
+                let mut inflight = p.probe.lock().unwrap();
+                if let Some((_, sent)) = *inflight
+                    && sent.elapsed() < PROBE_TIMEOUT
+                {
+                    continue;
+                }
+                let nonce = p.probe_nonce.fetch_add(1, Ordering::Relaxed);
+                let d = multipass_proto::encode(&Frame::Ping { nonce });
+                if p.conn.lock().unwrap().send_datagram(d).is_ok() {
+                    *inflight = Some((nonce, Instant::now()));
                 }
             }
         }
@@ -507,9 +622,9 @@ fn spawn_reader(
 mod tests {
     use super::*;
 
-    /// Echo server: decodes inbound data frames and re-sends them (same seq),
-    /// so the client sees ONE copy per seq from EACH path — perfect for
-    /// proving the transport's active-active dedup.
+    /// Echo server: decodes inbound data frames and re-sends them (same seq)
+    /// on the connection they arrived on, so the client sees the aggregate
+    /// scheduler's choice reflected back on the same path.
     async fn spawn_echo_server() -> SocketAddr {
         let server = Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = server.local_addr().unwrap();
@@ -541,10 +656,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_active_sends_on_both_and_dedups() {
+    async fn aggregate_scheduler_delivers_all_and_spreads() {
         let addr = spawn_echo_server().await;
         // Both paths bound to loopback (distinct ephemeral source ports).
-        let mut t = Transport::connect(
+        let t = Transport::connect(
             addr,
             "127.0.0.1".parse().unwrap(),
             "127.0.0.1".parse().unwrap(),
@@ -552,31 +667,32 @@ mod tests {
         .await
         .unwrap();
 
-        const N: u64 = 10;
+        const N: u64 = 20;
         for seq in 0..N {
             t.send_data(seq, Bytes::from_static(b"hello"));
         }
 
-        // Each seq is delivered on BOTH paths -> 2x copies -> dedup must
-        // collapse to exactly the N unique seqs.
-        let mut got = Vec::new();
+        // Every seq is delivered exactly once (the scheduler routes each packet
+        // to one path; the echo reflects it back on that path). Delivery order
+        // is not guaranteed across the two paths' differing RTTs — check the set.
+        let mut got = std::collections::HashSet::new();
         for _ in 0..N {
             let d = t.recv_data().await.unwrap();
-            got.push((d.seq, d.packet));
+            assert_eq!(d.packet, Bytes::from_static(b"hello"));
+            got.insert(d.seq);
         }
-        assert_eq!(got.len(), N as usize);
-        for (i, (seq, pkt)) in got.iter().enumerate() {
-            assert_eq!(*seq, i as u64);
-            assert_eq!(pkt, &Bytes::from_static(b"hello"));
+        assert_eq!(got.len(), N as usize, "each seq delivered exactly once");
+        for seq in 0..N {
+            assert!(got.contains(&seq), "seq {seq} delivered");
         }
 
-        // Both paths alive and each saw at least one datagram.
+        // Both paths alive, and the aggregate scheduler spread load across both
+        // (equal weights -> both transmit and receive).
         let st = t.status();
         assert!(st.wired.alive, "wired path should be alive");
         assert!(st.wifi.alive, "wifi path should be alive");
-        assert!(
-            st.wired.received + st.wifi.received >= N,
-            "both paths should deliver copies"
-        );
+        assert!(st.wired.transmitted > 0, "scheduler must use wired");
+        assert!(st.wifi.transmitted > 0, "scheduler must use wifi");
+        assert!(st.wired.received > 0 && st.wifi.received > 0);
     }
 }

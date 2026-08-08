@@ -108,6 +108,14 @@ actor DaemonClient {
         let socket = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard socket >= 0 else { throw DaemonError.posix(errno: errno) }
 
+        var noSigPipe: Int32 = 1
+        guard setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size)) == 0
+        else {
+            let captured = errno
+            Darwin.close(socket)
+            throw DaemonError.posix(errno: captured)
+        }
+
         var timeout = timeval(
             tv_sec: Int(Self.ioTimeout),
             tv_usec: __darwin_suseconds_t(
