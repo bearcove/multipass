@@ -29,7 +29,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{
-    c_char, c_uchar, c_uint, sockaddr, sockaddr_ctl, AF_INET, AF_SYSTEM, AF_SYS_CONTROL,
+    c_char, c_uchar, sockaddr, sockaddr_ctl, AF_INET, AF_SYSTEM, AF_SYS_CONTROL,
     CTLIOCGINFO, SOCK_DGRAM, SYSPROTO_CONTROL, ctl_info,
 };
 
@@ -226,7 +226,3 @@ pub fn iface_for_ip(ip: std::net::Ipv4Addr) -> Option<String> {
     unsafe { libc::freeifaddrs(head) };
     out
 }
-
-/// The `c_uint` used by `sockaddr_ctl.sc_unit` reads back into the same field.
-#[allow(dead_code)]
-fn _unit_is_c_uint(_: c_uint) {}

@@ -37,7 +37,7 @@ pub fn configure(utun: &str, addr: Ipv4Addr, prefix: u8, mtu: u16) -> bool {
             utun,
             "inet",
             &addr.to_string(),
-            &crate::transport::TUNNEL_SERVER.to_string(),
+            &multipass_proto::TUNNEL_SERVER.to_string(),
             "netmask",
             &netmask.to_string(),
             "mtu",

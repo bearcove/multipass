@@ -32,7 +32,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use crate::transport::{PathKind, Transport};
+use multipass::PathKind;
+
 use crate::Shared;
 
 /// Socket path. The app bundles this; default is the well-known path.
@@ -109,17 +110,17 @@ fn handle_request(line: &str, shared: &Arc<Shared>) -> String {
 /// Build the `{"type":"status",...}` line from live state.
 fn status_json(shared: &Shared) -> String {
     let connected = shared.enabled.load(Ordering::Relaxed);
-    let (wired, wifi, rtt_ms) = match shared.transport.read().unwrap().as_ref() {
-        Some(t) => {
-            let s = t.status();
-            (s.wired.alive, s.wifi.alive, rtt_of(t, shared))
-        }
-        None => (false, false, None),
-    };
-    let active = match &*shared.active_path.read().unwrap() {
+    let paths = *shared.paths.read().unwrap();
+    let active = match paths.active {
         Some(PathKind::Wired) => "\"wired\"",
         Some(PathKind::Wifi) => "\"wifi\"",
         None => "null",
+    };
+    // RTT of the path currently winning dedup, falling back to wired.
+    let rtt_ms = match paths.active {
+        Some(PathKind::Wired) => paths.wired_rtt_ms,
+        Some(PathKind::Wifi) => paths.wifi_rtt_ms,
+        None => paths.wired_rtt_ms,
     };
     let rtt = match rtt_ms {
         Some(v) => format!("{v:.1}"),
@@ -128,14 +129,10 @@ fn status_json(shared: &Shared) -> String {
     let tx = shared.tx_bytes.load(Ordering::Relaxed);
     let rx = shared.rx_bytes.load(Ordering::Relaxed);
     format!(
-        "{{\"type\":\"status\",\"connected\":{connected},\"wired\":{wired},\"wifi\":{wifi},\"active_path\":{active},\"rtt_ms\":{rtt},\"tx\":{tx},\"rx\":{rx}}}"
+        "{{\"type\":\"status\",\"connected\":{connected},\"wired\":{},\"wifi\":{},\"active_path\":{active},\"rtt_ms\":{rtt},\"tx\":{tx},\"rx\":{rx}}}",
+        paths.wired_alive,
+        paths.wifi_alive,
     )
-}
-
-/// RTT (ms) of the path currently winning dedup, falling back to wired.
-fn rtt_of(t: &Transport, shared: &Shared) -> Option<f64> {
-    let kind = shared.active_path.read().unwrap().unwrap_or(PathKind::Wired);
-    t.rtt(kind).map(|d| d.as_secs_f64() * 1000.0)
 }
 
 /// Minimal JSON string-field extractor: pull the value of `"key"` out of a
@@ -149,4 +146,74 @@ fn extract_json_string(line: &str, key: &str) -> Option<String> {
     let val = after.strip_prefix('"')?;
     let end = val.find('"')?;
     Some(val[..end].to_string())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    fn shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            tx_bytes: AtomicU64::new(100),
+            rx_bytes: AtomicU64::new(200),
+            enabled: AtomicBool::new(true),
+            paths: std::sync::RwLock::new(crate::PathSnapshot {
+                wired_alive: true,
+                wifi_alive: false,
+                wired_rtt_ms: Some(5.0),
+                wifi_rtt_ms: None,
+                active: Some(PathKind::Wired),
+            }),
+            server: "10.0.0.5:51823".parse().unwrap(),
+            wired_src: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            wifi_src: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 6)),
+            wired_iface: "en17".into(),
+            wifi_iface: "en0".into(),
+            utun_name: "utun3".into(),
+        })
+    }
+
+    /// The status line must match the menubar app's schema exactly:
+    /// `{"type":"status","connected":..,"wired":..,"wifi":..,
+    ///  "active_path":..,"rtt_ms":..,"tx":..,"rx":..}`.
+    #[test]
+    fn status_json_matches_contract() {
+        let s = status_json(&shared());
+        assert!(s.starts_with("{\"type\":\"status\""), "got: {s}");
+        assert!(s.contains("\"connected\":true"), "got: {s}");
+        assert!(s.contains("\"wired\":true"), "got: {s}");
+        assert!(s.contains("\"wifi\":false"), "got: {s}");
+        assert!(s.contains("\"active_path\":\"wired\""), "got: {s}");
+        assert!(s.contains("\"rtt_ms\":5.0"), "got: {s}");
+        assert!(s.contains("\"tx\":100"), "got: {s}");
+        assert!(s.contains("\"rx\":200"), "got: {s}");
+    }
+
+    /// rtt_ms is null when no path has a measured RTT yet.
+    #[test]
+    fn status_json_null_rtt() {
+        let sh = shared();
+        *sh.paths.write().unwrap() = crate::PathSnapshot {
+            wired_alive: true,
+            wifi_alive: false,
+            wired_rtt_ms: None,
+            wifi_rtt_ms: None,
+            active: Some(PathKind::Wired),
+        };
+        assert!(status_json(&sh).contains("\"rtt_ms\":null"));
+    }
+
+    /// Command routing: status returns a status line; an unknown command is
+    /// an error. (connect/disconnect have route side effects and need root,
+    /// so they are not exercised here.)
+    #[test]
+    fn command_routing() {
+        let sh = shared();
+        assert!(handle_request("{\"cmd\":\"status\"}", &sh).starts_with("{\"type\":\"status\""));
+        assert_eq!(
+            handle_request("{\"cmd\":\"bogus\"}", &sh),
+            "{\"type\":\"error\",\"message\":\"unknown command\"}"
+        );
+    }
 }

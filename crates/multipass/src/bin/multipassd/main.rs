@@ -2,7 +2,7 @@
 //!
 //! Owns the tunnel: creates a utun device, assigns the tunnel IP + MTU,
 //! installs full-tunnel routing, and pumps raw IP packets between the utun
-//! and the dual-connection active-active failover transport.
+//! and the multipass failover transport (`multipass::Transport`).
 //!
 //! # utun creation (macOS)
 //!
@@ -29,33 +29,50 @@
 //! address to the physical interfaces with `-ifscope` host routes so the
 //! tunnel's own QUIC never recurses, then (b) install the default via utun.
 //! See `routes.rs`.
+//!
+//! # Pump structure (why a utun-reader task)
+//!
+//! `multipass::Transport` takes `&mut self` for its receive methods, so one
+//! select can arm only a single receive at a time and cannot hold
+//! `send_data(&self)` and `recv_data(&mut self)` together. We therefore split
+//! the pump: a utun-reader task forwards outbound packets over an mpsc
+//! channel, and the pump owns the `Transport` and selects over
+//! {channel -> send_data, recv_data -> utun, 500ms reconnect tick}.
 
 mod ipc;
 mod routes;
-mod transport;
 mod utun;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use multipass::{PathKind, Transport};
 use multipass_proto::{Frame, TUNNEL_MTU};
 use tokio::io::unix::AsyncFd;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use transport::{Data, PathKind, Transport};
+/// Snapshot of path liveness + RTT, published by the pump for the IPC server.
+/// Kept off the transport so IPC never contends with the pump's `&mut self`.
+#[derive(Debug, Clone, Copy)]
+pub struct PathSnapshot {
+    pub wired_alive: bool,
+    pub wifi_alive: bool,
+    pub wired_rtt_ms: Option<f64>,
+    pub wifi_rtt_ms: Option<f64>,
+    pub active: Option<PathKind>,
+}
 
-/// Live daemon state shared between the pump and the IPC server. The
-/// `transport` is swapped on reconnect (hence `RwLock<Option<…>>`).
+/// Live daemon state shared between the pump and the IPC server.
 pub struct Shared {
-    pub transport: RwLock<Option<Arc<Transport>>>,
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub enabled: AtomicBool,
-    pub active_path: RwLock<Option<PathKind>>,
+    pub paths: RwLock<PathSnapshot>,
     pub server: SocketAddr,
     pub wired_src: IpAddr,
     pub wifi_src: IpAddr,
@@ -67,11 +84,16 @@ pub struct Shared {
 impl Shared {
     fn new(opts: &Opts, wired_iface: String, wifi_iface: String, utun_name: String) -> Arc<Shared> {
         Arc::new(Shared {
-            transport: RwLock::new(None),
             tx_bytes: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
             enabled: AtomicBool::new(false),
-            active_path: RwLock::new(None),
+            paths: RwLock::new(PathSnapshot {
+                wired_alive: false,
+                wifi_alive: false,
+                wired_rtt_ms: None,
+                wifi_rtt_ms: None,
+                active: None,
+            }),
             server: opts.server,
             wired_src: opts.wired,
             wifi_src: opts.wifi,
@@ -148,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Transport lifecycle: connect, handshake, pump; re-dial on any end.
     loop {
-        let transport = match Transport::connect(opts.server, opts.wired, opts.wifi).await {
+        let mut transport = match Transport::connect(opts.server, opts.wired, opts.wifi).await {
             Ok(t) => t,
             Err(e) => {
                 warn!(%e, "transport connect failed; retrying");
@@ -156,10 +178,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 continue;
             }
         };
-        let transport = Arc::new(transport);
-        *shared.transport.write().unwrap() = Some(transport.clone());
 
-        match handshake(&transport).await {
+        match handshake(&mut transport).await {
             Ok((addr, prefix, mtu)) => {
                 info!(%addr, prefix, mtu, "assigned; configuring tunnel");
                 let utun_name = shared.utun_name.clone();
@@ -178,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        match pump(utun.clone(), transport, shared.clone()).await {
+        match pump(utun.clone(), &mut transport, shared.clone()).await {
             PumpEnd::Reconnect => {
                 info!("transport ended; re-dialing");
                 shared.enabled.store(false, Ordering::Relaxed);
@@ -193,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 /// Client handshake: send `Hello`, wait for the server's `Assign`.
 async fn handshake(
-    transport: &Transport,
+    transport: &mut Transport,
 ) -> Result<(Ipv4Addr, u8, u16), Box<dyn std::error::Error>> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -206,8 +226,8 @@ async fn handshake(
             Some((_, Frame::Assign { addr, prefix, mtu })) => {
                 return Ok((addr, prefix, mtu));
             }
-            Some((kind, frame)) => {
-                info!(path = %kind.label(), ?frame, "control frame during handshake");
+            Some((path, frame)) => {
+                info!(path = %path.label(), ?frame, "control frame during handshake");
             }
             None => return Err("transport closed during handshake".into()),
         }
@@ -228,77 +248,145 @@ impl From<io::Error> for PumpEnd {
     }
 }
 
-/// The packet pump: utun <-> transport, with per-path status and reconnect.
+/// How often the pump re-checks path liveness and re-dials dead paths.
+const RECONNECT_TICK: Duration = Duration::from_millis(500);
+/// Minimum spacing between re-dial attempts for an already-failed path.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+
+/// The packet pump: utun <-> transport.
 ///
-///   * utun read  -> `Frame::Data { seq, packet }` -> `send_data` on both conns
-///   * conn read  -> deduped `Data` -> write packet to utun (when enabled)
-///   * path dead  -> `reconnect_path` re-dials just that path
+///   * utun-reader task -> mpsc channel -> `send_data(seq, packet)` (scheduler
+///     picks the live path)
+///   * `recv_data` (deduped) -> write packet to utun (when enabled)
+///   * every 500ms: republish the path snapshot and re-dial dead paths
+///
+/// Reconnect is driven by `is_alive()` polling (the transport's reader marks a
+/// path dead when it errors) rather than `recv_dead`, because the receive
+/// methods take `&mut self` and can't be armed alongside `recv_data`.
 async fn pump(
     utun: Arc<AsyncFd<utun::Utun>>,
-    transport: Arc<Transport>,
+    transport: &mut Transport,
     shared: Arc<Shared>,
 ) -> PumpEnd {
+    // The utun reader needs its own seq counter per outbound packet; the pump
+    // owns it here alongside the transport.
     let mut seq = 0u64;
-    let mut rbuf = vec![0u8; TUNNEL_MTU as usize + 4];
     let mut wbuf = vec![0u8; TUNNEL_MTU as usize + 4];
+    let mut backoff = [Instant::now(); 2];
+
+    let (tx_q, mut rx_q) = mpsc::channel::<Bytes>(256);
+    spawn_utun_reader(utun.clone(), tx_q);
+
+    let mut tick = tokio::time::interval(RECONNECT_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
-            res = utun.readable() => {
-                match res {
-                    Ok(mut guard) => {
-                        match guard.get_inner().read_packet(&mut rbuf) {
-                            Ok(Some(n)) => {
-                                let pkt = Bytes::copy_from_slice(&rbuf[..n]);
-                                seq += 1;
-                                transport.send_data(seq, pkt.clone());
-                                shared.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-                            }
-                            Ok(None) => { /* non-IPv4 frame, dropped */ }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                guard.clear_ready();
-                            }
-                            Err(e) => {
-                                warn!(%e, "utun read error");
-                            }
-                        }
-                    }
-                    Err(e) => return PumpEnd::Fatal(Box::new(e)),
+            Some(pkt) = rx_q.recv() => {
+                if shared.enabled.load(Ordering::Relaxed) {
+                    seq += 1;
+                    transport.send_data(seq, pkt.clone());
+                    shared.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                 }
             }
-            data = transport.recv_data() => {
-                match data {
-                    Some(Data { packet, path, .. }) => {
-                        *shared.active_path.write().unwrap() = Some(path);
-                        shared.rx_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
-                        if shared.enabled.load(Ordering::Relaxed) {
-                            if let Err(e) = guardless_write(&utun, &mut wbuf, &packet) {
-                                warn!(%e, "utun write error");
-                            }
-                        }
-                    }
+            d = transport.recv_data() => {
+                let d = match d {
+                    Some(d) => d,
                     None => return PumpEnd::Reconnect,
+                };
+                update_active(&shared, d.path);
+                shared.rx_bytes.fetch_add(d.packet.len() as u64, Ordering::Relaxed);
+                if shared.enabled.load(Ordering::Relaxed)
+                    && let Err(e) = utun.get_ref().write_packet(&mut wbuf, &d.packet)
+                {
+                    warn!(%e, "utun write error");
                 }
             }
-            kind = transport.recv_dead() => {
-                warn!(path = %kind.label(), "path lost; re-dialing");
-                let src = match kind {
-                    PathKind::Wired => shared.wired_src,
-                    PathKind::Wifi => shared.wifi_src,
-                };
-                match transport.reconnect_path(kind, shared.server, src).await {
-                    Ok(()) => info!(path = %kind.label(), "path re-dialed"),
-                    Err(e) => warn!(path = %kind.label(), %e, "path re-dial failed"),
-                }
+            _ = tick.tick() => {
+                publish_status(transport, &shared);
+                reconnect_dead(transport, &shared, &mut backoff).await;
             }
         }
     }
 }
 
-/// Write a packet to the utun synchronously (fast path; utun never blocks on
-/// write at desk scale). Returns the payload bytes written.
-fn guardless_write(utun: &AsyncFd<utun::Utun>, wbuf: &mut [u8], packet: &[u8]) -> io::Result<usize> {
-    utun.get_ref().write_packet(wbuf, packet)
+/// Republish the path-liveness snapshot for the IPC server.
+fn publish_status(transport: &Transport, shared: &Shared) {
+    let st = transport.status();
+    let active = shared.paths.read().unwrap().active;
+    *shared.paths.write().unwrap() = PathSnapshot {
+        wired_alive: st.wired.alive,
+        wifi_alive: st.wifi.alive,
+        wired_rtt_ms: st.wired.rtt.map(|d| d.as_secs_f64() * 1000.0),
+        wifi_rtt_ms: st.wifi.rtt.map(|d| d.as_secs_f64() * 1000.0),
+        active,
+    };
+}
+
+fn update_active(shared: &Shared, kind: PathKind) {
+    shared.paths.write().unwrap().active = Some(kind);
+}
+
+/// Re-dial any path the transport reports dead, rate-limited per path.
+async fn reconnect_dead(
+    transport: &Transport,
+    shared: &Shared,
+    backoff: &mut [Instant; 2],
+) {
+    for kind in PathKind::ALL {
+        if transport.is_alive(kind) {
+            continue;
+        }
+        let idx = match kind {
+            PathKind::Wired => 0,
+            PathKind::Wifi => 1,
+        };
+        if backoff[idx].elapsed() < RECONNECT_BACKOFF {
+            continue;
+        }
+        backoff[idx] = Instant::now();
+        let src = match kind {
+            PathKind::Wired => shared.wired_src,
+            PathKind::Wifi => shared.wifi_src,
+        };
+        match transport.reconnect_path(kind, shared.server, src).await {
+            Ok(()) => info!(path = %kind.label(), "path re-dialed"),
+            Err(e) => warn!(path = %kind.label(), %e, "path re-dial failed; will retry"),
+        }
+    }
+}
+
+/// Read utun packets and forward them to the pump. Segregated so the pump can
+/// own the `Transport` mutably without a send/receive borrow conflict.
+fn spawn_utun_reader(utun: Arc<AsyncFd<utun::Utun>>, tx_q: mpsc::Sender<Bytes>) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; TUNNEL_MTU as usize + 4];
+        loop {
+            match utun.readable().await {
+                Ok(mut guard) => {
+                    match guard.get_inner().read_packet(&mut buf) {
+                        Ok(Some(n)) => {
+                            let pkt = Bytes::copy_from_slice(&buf[..n]);
+                            if tx_q.send(pkt).await.is_err() {
+                                break; // pump gone
+                            }
+                        }
+                        Ok(None) => { /* non-IPv4 frame, dropped */ }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            guard.clear_ready();
+                        }
+                        Err(e) => {
+                            warn!(%e, "utun read error");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(%e, "utun readable failed");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Extract the IPv4 address from an `IpAddr` (we only tunnel IPv4).
