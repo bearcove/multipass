@@ -74,16 +74,17 @@ Multi-client operation and non-macOS clients are outside the current scope.
 
 ## Status
 
-**Experimental. The dual-stack tunnel works; the seamless-failover contract
-does not yet. Do not rely on the current build to preserve sessions during a
-path failure.**
+**Experimental. The dual-stack tunnel and loss recovery work, but path failure
+still causes a multi-second stall and aggregate throughput remains below either
+raw link's capacity. Do not yet rely on the current build for latency-sensitive
+seamless failover.**
 
 Verified on the real `scooter` ↔ `jax` deployment:
 
 - Both wired and Wi-Fi QUIC connections authenticate concurrently.
-- IPv4 tunnel reachability: 5/5 pings, 0% loss, 1.30 ms average.
-- IPv6 tunnel reachability: 5/5 pings, 0% loss, 3.28 ms average.
-- Public IPv6 through NAT66: 5/5 pings, 0% loss, 1.31 ms average.
+- IPv4 tunnel reachability: 20/20 pings, 0% loss, 1.16 ms average.
+- IPv6 tunnel reachability: 20/20 pings, 0% loss, 3.71 ms average.
+- Public IPv6 through persistent NAT66: 20/20 pings, 0% loss.
 - IPv4 and IPv6 HTTPS both complete through the tunnel.
 - The router has `10.10.99.1/24` and `fd00:99::1/64`; the client has
   `10.10.99.2/24` and `fd00:99::2/64`.
@@ -95,20 +96,20 @@ Current throughput measurements (`iperf3`, four streams):
 | Raw wired | 2.35 Gbit/s |
 | Raw Wi-Fi | 0.68 Gbit/s |
 | Raw combined capacity | 3.03 Gbit/s |
-| Tunnel upload | 0.66 Gbit/s |
-| Tunnel download | 1.38 Gbit/s |
+| Tunnel upload | 0.260 Gbit/s |
+| Tunnel download | 0.266 Gbit/s |
 
-Aggregation machinery exists in both directions, but the tunnel is not yet
-reaching the sum of the physical links.
+The scheduler now preserves an exploration share for every eligible path. In
+production measurements, Wi-Fi carried 32.5 MB of 641.3 MB upload underlay
+traffic (5.1%) and 36.0 MB of 694.6 MB download underlay traffic (5.2%). This
+fixes total path starvation, but does not fix the broader throughput bottleneck;
+the tunnel is still far below the 3.03 Gbit/s simultaneous raw capacity.
 
-The critical correctness defect is silent path loss. In a production test that
-blackholed only wired QUIC traffic for eight seconds, concurrent IPv4 and IPv6
-tunnel pings each delivered 173/250 packets: **30.8% loss**, covering nearly the
-entire blackhole interval. The failed connection remained locally "alive", so
-the scheduler continued choosing it instead of moving traffic to Wi-Fi. Path
-death consumption, bounded liveness detection, non-blocking redial, and the
-resulting retransmission path must be fixed and re-verified before the project
-can claim seamless failover.
+Loss recovery now preserves packets during a silent path failure. In a
+production test that blackholed only wired QUIC traffic for eight seconds,
+concurrent IPv4 and IPv6 tunnel pings each delivered 250/250 packets with 0%
+loss. Recovery still caused a worst observed pause of approximately 2.37
+seconds, so the user-visible failover contract is not yet seamless.
 
 See `docs/ARCHITECTURE.md` for the protocol and component design.
 
