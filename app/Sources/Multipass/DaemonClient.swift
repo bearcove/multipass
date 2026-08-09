@@ -32,12 +32,16 @@ extension DaemonError: LocalizedError {
     }
 }
 
+nonisolated protocol DaemonRequesting: Actor, Sendable {
+    func request(_ request: DaemonRequest) async throws -> DaemonReply
+}
+
 /// Minimal POSIX client for the daemon's newline-JSON unix socket.
 ///
 /// One request line in, one reply line out. The socket is connected lazily and
 /// retried once on a stale connection. Send/receive are bounded by a 2s
 /// timeout so a wedged daemon can never block the cooperative pool for long.
-actor DaemonClient {
+actor DaemonClient: DaemonRequesting {
     static let defaultSocketPath = "/var/run/multipassd.sock"
     private static let ioTimeout: TimeInterval = 2
 

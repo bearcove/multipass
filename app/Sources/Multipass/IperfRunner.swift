@@ -55,7 +55,16 @@ extension IperfRunnerError: LocalizedError {
     }
 }
 
-actor IperfRunner {
+nonisolated protocol BenchmarkRunning: Actor, Sendable {
+    func run(
+        invocation: BenchmarkInvocation,
+        onSample: nonisolated(nonsending) @escaping @Sendable (Double) async -> Void
+    ) async throws -> BenchmarkMeasurement
+
+    func cancelAll() async
+}
+
+actor IperfRunner: BenchmarkRunning {
     private typealias IndexedSampleHandler = @Sendable (Int, Double) async -> Void
     typealias SampleHandler = @Sendable (Double) async -> Void
 

@@ -12,11 +12,39 @@ enum TunnelState: Equatable {
     var isConnected: Bool { self == .connected }
 }
 
+nonisolated enum TunnelTransitionOwner: Sendable, Equatable {
+    case menu
+    case benchmark(UUID)
+}
+
+nonisolated enum TunnelTransitionError: Error, Sendable, Equatable {
+    case lifecycleOwnedByBenchmark
+    case unexpectedReply
+    case unhealthyConnectedStatus
+    case transitionTimedOut(desiredConnected: Bool)
+}
+
+extension TunnelTransitionError: LocalizedError {
+    nonisolated var errorDescription: String? {
+        switch self {
+        case .lifecycleOwnedByBenchmark:
+            "A benchmark is controlling the tunnel"
+        case .unexpectedReply:
+            "The daemon returned an unexpected tunnel reply"
+        case .unhealthyConnectedStatus:
+            "The tunnel connected without a live path"
+        case .transitionTimedOut(let desiredConnected):
+            "Timed out waiting for the tunnel to become \(desiredConnected ? "connected" : "disconnected")"
+        }
+    }
+}
+
 /// Observable bridge between `multipassd` and the menubar UI.
 ///
-/// Polls `{"cmd":"status"}` once per second, sends connect/disconnect, and
-/// derives the failover flash (active path changed while connected) plus
-/// throughput rates from cumulative byte counters.
+/// Polls `{"cmd":"status"}` once per second, serializes owner-aware desired-state
+/// transitions through daemon-observed convergence, derives throughput rates
+/// from cumulative byte counters, and raises the failover flash when
+/// `active_path` changes while connected.
 @Observable
 @MainActor
 final class TunnelController {
@@ -34,50 +62,163 @@ final class TunnelController {
     /// failed over *to*. The view animates on insertion/removal.
     private(set) var failoverTo: ActivePath?
     private(set) var lastError: String?
+    private(set) var benchmarkOwner: UUID?
 
-    private let client = DaemonClient()
+    var benchmarkOwnsLifecycle: Bool { benchmarkOwner != nil }
+    var canToggle: Bool {
+        benchmarkOwner == nil && state != .daemonUnavailable && state != .transitioning
+    }
+
+    private let client: any DaemonRequesting
     private var pollTask: Task<Void, Never>?
-    /// Toggle intent is serialized through this task so a double-click can't
-    /// interleave two commands.
-    private var commandTask: Task<Void, Never>?
+    private var transition: (id: UUID, task: Task<Void, Error>)?
     private var previousSample: (tx: UInt64, rx: UInt64, at: ContinuousClock.Instant)?
+
+    init(client: any DaemonRequesting = DaemonClient()) {
+        self.client = client
+    }
 
     func start() {
         guard pollTask == nil else { return }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.poll()
+                await self?.refreshStatus()
                 try? await Task.sleep(for: .seconds(1))
             }
         }
     }
 
     func toggle() {
-        guard commandTask == nil else { return }
+        guard canToggle else { return }
         let connect = !state.isConnected
-        commandTask = Task { [weak self] in
+        Task { [weak self] in
             guard let self else { return }
-            defer { commandTask = nil }
-            state = .transitioning
             do {
-                _ = try await client.request(connect ? .connect : .disconnect)
-                lastError = nil
+                try await setConnected(connect, owner: .menu)
             } catch {
                 lastError = error.localizedDescription
             }
-            // The daemon's own status is the source of truth for state; the
-            // next poll settles us, but poll immediately so the UI doesn't sit
-            // in "transitioning" for up to a second.
-            await poll()
         }
     }
 
-    private func poll() async {
+    /// Claims lifecycle ownership after every already-admitted transition has
+    func acquireBenchmarkOwnership(_ owner: UUID) async throws {
+        if let benchmarkOwner, benchmarkOwner != owner {
+            throw TunnelTransitionError.lifecycleOwnedByBenchmark
+        }
+        while let active = transition {
+            _ = try? await active.task.value
+            if transition?.id == active.id {
+                transition = nil
+            }
+        }
+        if let benchmarkOwner, benchmarkOwner != owner {
+            throw TunnelTransitionError.lifecycleOwnedByBenchmark
+        }
+        benchmarkOwner = owner
+    }
+
+    func releaseBenchmarkOwnership(_ owner: UUID) {
+        guard benchmarkOwner == owner else { return }
+        benchmarkOwner = nil
+    }
+
+    /// Returns the daemon's observed status. No connection truth is mirrored
+    /// for orchestration: callers capture state from this snapshot.
+    func observedStatus() async throws -> StatusSnapshot {
+        let reply = try await client.request(.status)
+        guard case .status(let snapshot) = reply else {
+            throw TunnelTransitionError.unexpectedReply
+        }
+        apply(snapshot)
+        lastError = nil
+        return snapshot
+    }
+
+    /// Idempotently requests and waits for the desired daemon-observed state.
+    /// The command reply is not completion; following status replies are truth.
+    func setConnected(_ connected: Bool, owner: TunnelTransitionOwner) async throws {
+        try validate(owner: owner)
+        let preceding = transition?.task
+        let client = self.client
+        let transitionID = UUID()
+        let task = Task<Void, Error> { @MainActor [weak self] in
+            if let preceding {
+                _ = try? await preceding.value
+            }
+            guard let self else { throw CancellationError() }
+            try validate(owner: owner)
+            try Task.checkCancellation()
+
+            let beforeReply = try await client.request(.status)
+            guard case .status(let before) = beforeReply else {
+                throw TunnelTransitionError.unexpectedReply
+            }
+            if !matchesDesiredStatus(before, connected: connected) {
+                let commandReply = try await client.request(connected ? .connect : .disconnect)
+                guard case .ok = commandReply else {
+                    throw TunnelTransitionError.unexpectedReply
+                }
+            }
+
+            let clock = ContinuousClock()
+            let deadline = clock.now + .seconds(10)
+            var observed = before
+            while !matchesDesiredStatus(observed, connected: connected) {
+                try Task.checkCancellation()
+                guard clock.now < deadline else {
+                    throw TunnelTransitionError.transitionTimedOut(desiredConnected: connected)
+                }
+                await Task.yield()
+                let observedReply = try await client.request(.status)
+                guard case .status(let snapshot) = observedReply else {
+                    throw TunnelTransitionError.unexpectedReply
+                }
+                observed = snapshot
+            }
+        }
+        transition = (transitionID, task)
+        state = .transitioning
+
         do {
-            let reply = try await client.request(.status)
-            guard case .status(let snapshot) = reply else { return }
-            apply(snapshot)
-            lastError = nil
+            try await task.value
+            if transition?.id == transitionID {
+                transition = nil
+            }
+            _ = try await observedStatus()
+        } catch {
+            if transition?.id == transitionID {
+                transition = nil
+            }
+            await refreshStatus()
+            throw error
+        }
+    }
+
+    private nonisolated func matchesDesiredStatus(
+        _ snapshot: StatusSnapshot,
+        connected: Bool
+    ) -> Bool {
+        snapshot.connected == connected
+            && (!connected || snapshot.wired || snapshot.wifi)
+    }
+
+    private func validate(owner: TunnelTransitionOwner) throws {
+        switch owner {
+        case .menu:
+            guard benchmarkOwner == nil else {
+                throw TunnelTransitionError.lifecycleOwnedByBenchmark
+            }
+        case .benchmark(let owner):
+            guard benchmarkOwner == owner else {
+                throw TunnelTransitionError.lifecycleOwnedByBenchmark
+            }
+        }
+    }
+
+    private func refreshStatus() async {
+        do {
+            _ = try await observedStatus()
         } catch {
             state = .daemonUnavailable
             wiredLive = false
@@ -114,7 +255,6 @@ final class TunnelController {
         totalRx = snapshot.rx
 
         if snapshot.activePath != activePath {
-            // A path change while staying connected IS a failover event.
             if wasConnected, snapshot.connected, let newPath = snapshot.activePath {
                 flashFailover(to: newPath)
             }

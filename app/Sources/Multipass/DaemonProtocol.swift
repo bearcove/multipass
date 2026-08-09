@@ -6,7 +6,7 @@ import Foundation
 /// request object followed by `\n`, the daemon answers with exactly one
 /// response object followed by `\n`. The canonical schema lives in
 /// `app/README.md`; these types are the Swift encoding of it.
-nonisolated enum DaemonRequest: Encodable {
+nonisolated enum DaemonRequest: Encodable, Sendable, Equatable {
     case status
     case connect
     case disconnect

@@ -216,7 +216,7 @@ struct MenuBarView: View {
         }
         .buttonStyle(.borderedProminent)
         .tint(controller.state.isConnected ? .red : .accentColor)
-        .disabled(controller.state == .daemonUnavailable || controller.state == .transitioning)
+        .disabled(!controller.canToggle)
         .keyboardShortcut("d")
     }
 
