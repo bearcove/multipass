@@ -119,12 +119,22 @@ impl Scheduler {
     /// and pays the total weight. Over a batch this yields the capacity ratio
     /// while retaining deterministic, per-packet decisions.
     pub fn pick(&mut self) -> Option<PathKind> {
-        let weights = [self.weight(PathKind::Wired), self.weight(PathKind::Wifi)];
-        let total: f64 = weights.iter().flatten().sum();
-        if total == 0.0 {
+        let mut weights = [self.weight(PathKind::Wired), self.weight(PathKind::Wifi)];
+        let strongest = weights.iter().flatten().copied().fold(0.0, f64::max);
+        if strongest == 0.0 {
             return None;
         }
 
+        // A path that receives no traffic cannot grow its congestion window,
+        // so a pure cwnd/RTT weight creates a positive-feedback starvation
+        // loop. Give every eligible path at least 5% of picks against the
+        // strongest path: floor / (strongest + floor) = 1 / 20.
+        let exploration_floor = strongest / 19.0;
+        for weight in weights.iter_mut().flatten() {
+            *weight = weight.max(exploration_floor);
+        }
+
+        let total: f64 = weights.iter().flatten().sum();
         let mut chosen = None;
         let mut best = f64::NEG_INFINITY;
         for (index, weight) in weights.into_iter().enumerate() {
@@ -209,6 +219,27 @@ mod tests {
         }
 
         assert_eq!((wired, wifi), (200, 100));
+    }
+
+    #[test]
+    fn scheduler_preserves_exploration_share_for_low_cwnd_path() {
+        let mut sched = Scheduler::new();
+        sched.set_eligible(PathKind::Wired, true);
+        sched.set_eligible(PathKind::Wifi, true);
+        sched.note_path_stats(PathKind::Wired, Duration::from_millis(1), 4 * 1024 * 1024);
+        sched.note_path_stats(PathKind::Wifi, Duration::from_millis(2), 16 * 1024);
+
+        let mut wifi = 0;
+        for _ in 0..1_000 {
+            if sched.pick() == Some(PathKind::Wifi) {
+                wifi += 1;
+            }
+        }
+
+        assert!(
+            wifi >= 50,
+            "an eligible path needs at least a 5% exploration share to grow its congestion window"
+        );
     }
     #[test]
     fn scheduler_skips_ineligible_path() {
