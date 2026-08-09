@@ -12,13 +12,19 @@ nonisolated struct BenchmarkParameters: Codable, Sendable, Equatable {
     let intervalSeconds: Int
     let connectTimeoutSeconds: Int
 
-    init() {
+    init(
+        parallelStreams: Int = 4,
+        measuredSeconds: Int = 10,
+        omittedSeconds: Int = 3,
+        intervalSeconds: Int = 1,
+        connectTimeoutSeconds: Int = 5
+    ) {
         self.protocol = .tcp
-        self.parallelStreams = 4
-        self.measuredSeconds = 10
-        self.omittedSeconds = 3
-        self.intervalSeconds = 1
-        self.connectTimeoutSeconds = 5
+        self.parallelStreams = parallelStreams
+        self.measuredSeconds = measuredSeconds
+        self.omittedSeconds = omittedSeconds
+        self.intervalSeconds = intervalSeconds
+        self.connectTimeoutSeconds = connectTimeoutSeconds
     }
 
     var isCanonical: Bool {

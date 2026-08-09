@@ -22,7 +22,8 @@ let package = Package(
         ),
         .testTarget(
             name: "MultipassTests",
-            dependencies: ["Multipass"]
+            dependencies: ["Multipass"],
+            resources: [.copy("Fixtures")]
         )
     ],
     swiftLanguageModes: [.v6]
