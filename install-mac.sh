@@ -22,6 +22,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_BIN="$REPO/target/release/multipassd"
 APP_BIN="$REPO/app/.build/release/Multipass"
+SOURCE_APP_PLIST="$REPO/app/Sources/Multipass/Info.plist"
 LABEL="eu.bearcove.multipassd"
 PLIST="/Library/LaunchDaemons/$LABEL.plist"
 LIBEXEC="/usr/local/libexec"
@@ -34,6 +35,7 @@ fi
 # --- locate binaries ---
 [ -x "$DAEMON_BIN" ] || { echo "missing $DAEMON_BIN — run: cargo build --release -p multipass --bin multipassd" >&2; exit 1; }
 [ -x "$APP_BIN" ] || { echo "missing $APP_BIN — run: (cd app && swift build -c release)" >&2; exit 1; }
+[ -f "$SOURCE_APP_PLIST" ] || { echo "missing $SOURCE_APP_PLIST" >&2; exit 1; }
 
 # --- figure out wired + wifi interfaces and their IPs ---
 WIFI_IF="${MULTIPASS_WIFI_IF:-en0}"
@@ -106,9 +108,14 @@ chmod 644 "$PLIST"; chown root:wheel "$PLIST"
 
 # --- install app as a .app bundle ---
 APP_DIR="/Applications/Multipass.app/Contents"
+APP_PLIST="$(mktemp "${TMPDIR:-/tmp}/multipass-info.XXXXXX.plist")"
+trap 'rm -f "$APP_PLIST"' EXIT
+cp "$SOURCE_APP_PLIST" "$APP_PLIST"
+GIT_COMMIT="$(/usr/bin/git -C "$REPO" rev-parse HEAD)"
+/usr/libexec/PlistBuddy -c "Set :MultipassGitCommit $GIT_COMMIT" "$APP_PLIST"
 mkdir -p "$APP_DIR/MacOS" "$APP_DIR/Resources"
 install -m 755 "$APP_BIN" "$APP_DIR/MacOS/Multipass"
-[ -f "$REPO/app/Sources/Multipass/Info.plist" ] && install -m 644 "$REPO/app/Sources/Multipass/Info.plist" "$APP_DIR/Info.plist"
+install -m 644 "$APP_PLIST" "$APP_DIR/Info.plist"
 
 # --- load daemon (not started until you toggle connect in the app) ---
 launchctl bootout "system/$LABEL" 2>/dev/null || true

@@ -6,14 +6,43 @@ directory documents the *delta* the aggregation+IPv6 build needs.
 
 ## Binary
 
-Cross-build on scooter and install:
+Cross-build on scooter from the exact commit being deployed, install, and verify
+that the installed binary carries that identity:
 
 ```bash
-cargo zigbuild --target x86_64-unknown-linux-gnu --release -p multipass-server
+COMMIT="$(git rev-parse HEAD)"
+MULTIPASS_BUILD_COMMIT="$COMMIT" cargo zigbuild --target x86_64-unknown-linux-gnu --release -p multipass-server
 scp target/x86_64-unknown-linux-gnu/release/multipass-server jax.vxn.rs:/tmp/
 ssh jax.vxn.rs 'sudo install -m 0755 /tmp/multipass-server /usr/local/bin/multipass-server'
 ssh jax.vxn.rs 'sudo systemctl restart multipass-server'
 ```
+
+Build `multipassd` and the app from the same exact commit. After installing both
+ends, query `benchmark_topology`: `daemon_version` must match the installed
+client artifact and `server_version` must match `COMMIT`. The server identity is
+reported by the live server during the QUIC handshake; `multipassd` does not
+infer it from its own source tree.
+
+Verify the installed app metadata and the authenticated daemon/server topology
+with copy-pasteable production-path commands:
+
+```bash
+/usr/libexec/PlistBuddy -c 'Print :MultipassGitCommit' /Applications/Multipass.app/Contents/Info.plist
+printf '%s\n' '{"cmd":"connect"}' | nc -U /var/run/multipassd.sock
+for attempt in {1..50}; do
+    STATUS="$(printf '%s\n' '{"cmd":"status"}' | nc -U /var/run/multipassd.sock)"
+    [[ "$STATUS" == *'"connected":true'* ]] && break
+    sleep 0.1
+done
+[[ "$STATUS" == *'"connected":true'* ]] || { echo "multipassd did not authenticate a server" >&2; exit 1; }
+printf '%s\n' '{"cmd":"benchmark_topology"}' | nc -U /var/run/multipassd.sock
+```
+
+The plist value and both `daemon_version` and `server_version` in the topology
+reply must equal `COMMIT`. The `connect` reply only acknowledges enablement, so
+the bounded status loop waits for authenticated connectivity before querying
+topology. While disconnected, `server_version` is intentionally `unknown`
+because no server artifact is authenticated.
 
 ## IPv6 forwarding
 

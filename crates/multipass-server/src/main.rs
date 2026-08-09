@@ -343,6 +343,16 @@ impl Session {
     }
 }
 
+fn server_assignment() -> Frame {
+    Frame::Assign {
+        ipv4: Some((TUNNEL_CLIENT, TUNNEL_PREFIX)),
+        ipv6: Some((TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX)),
+        mtu: TUNNEL_MTU,
+        dns: vec![],
+        server_version: env!("MULTIPASS_BUILD_COMMIT").into(),
+    }
+}
+
 /// Drive one client connection: read datagrams, decode, dispatch.
 async fn conn_handler(
     conn: Connection,
@@ -362,12 +372,7 @@ async fn conn_handler(
                         if !session.authenticate(id, client_nonce).await {
                             break;
                         }
-                        let assign = Frame::Assign {
-                            ipv4: Some((TUNNEL_CLIENT, TUNNEL_PREFIX)),
-                            ipv6: Some((TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX)),
-                            mtu: TUNNEL_MTU,
-                            dns: vec![],
-                        };
+                        let assign = server_assignment();
                         if conn.send_datagram(encode(&assign)).is_err() {
                             break;
                         }
@@ -561,9 +566,9 @@ mod tests {
 
     use noq::Endpoint;
 
-    use super::{Frame, Session, server_config};
+    use super::{Frame, Session, server_assignment, server_config};
     use multipass_proto::{
-        TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX, encode,
+        TUNNEL_CLIENT, TUNNEL_PREFIX, TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX, encode,
     };
 
     #[tokio::test]
@@ -691,12 +696,7 @@ mod tests {
     async fn server_assigns_both_families() {
         // The Assign the server sends on Hello must carry both an IPv4 and an
         // IPv6 tunnel address, and the shared MTU 1280.
-        let assign = Frame::Assign {
-            ipv4: Some((TUNNEL_CLIENT, TUNNEL_PREFIX)),
-            ipv6: Some((TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX)),
-            mtu: TUNNEL_MTU,
-            dns: vec![],
-        };
+        let assign = server_assignment();
         let encoded = encode(&assign);
         let decoded = multipass_proto::decode(&encoded).unwrap();
         match decoded {
@@ -706,6 +706,17 @@ mod tests {
                 assert_eq!(ipv4, Some((TUNNEL_CLIENT, TUNNEL_PREFIX)));
                 assert_eq!(ipv6, Some((TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX)));
                 assert_eq!(mtu, 1280);
+            }
+            _ => panic!("expected Assign"),
+        }
+    }
+
+    #[test]
+    fn server_assign_carries_compile_time_build_identity() {
+        match server_assignment() {
+            Frame::Assign { server_version, .. } => {
+                assert_eq!(server_version, env!("MULTIPASS_BUILD_COMMIT"));
+                assert!(!server_version.is_empty());
             }
             _ => panic!("expected Assign"),
         }

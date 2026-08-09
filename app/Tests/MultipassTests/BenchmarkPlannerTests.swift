@@ -347,7 +347,8 @@ private func topology(
     paths: [BenchmarkPath]
 ) -> BenchmarkTopology {
     BenchmarkTopology(
-        protocolVersion: 1,
+        protocolVersion: 2,
+        daemonVersion: "daemon-build",
         serverVersion: "server-build",
         underlayTarget: underlayTarget,
         tunnelIPv4Target: tunnelIPv4Target,

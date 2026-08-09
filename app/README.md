@@ -66,7 +66,7 @@ Unknown `cmd` values MUST be answered with a `type:"error"` reply.
 **Benchmark topology** — reply to `{"cmd":"benchmark_topology"}`:
 
 ```json
-{"type":"benchmark_topology","protocol_version":1,"server_version":"unknown","underlay_target":"10.10.10.1","tunnel_ipv4_target":"10.10.99.1","tunnel_ipv6_target":"fd00:99::1","listener_base_port":5210,"listener_count":16,"paths":[{"id":"wired","display_name":"Wired","interface":"en17","source_address":"10.10.10.171"},{"id":"wifi","display_name":"Wi-Fi","interface":"en0","source_address":"10.10.10.169"}]}
+{"type":"benchmark_topology","protocol_version":2,"daemon_version":"<multipassd commit>","server_version":"<authenticated multipass-server commit or unknown while disconnected>","underlay_target":"10.10.10.1","tunnel_ipv4_target":"10.10.99.1","tunnel_ipv6_target":"fd00:99::1","listener_base_port":5210,"listener_count":16,"paths":[{"id":"wired","display_name":"Wired","interface":"en17","source_address":"10.10.10.171"},{"id":"wifi","display_name":"Wi-Fi","interface":"en0","source_address":"10.10.10.169"}]}
 ```
 
 `paths` is ordered and uses stable IDs; benchmark code MUST treat it as an
@@ -76,6 +76,9 @@ when that family is unsupported. The half-open listener range is
 `listener_base_port ..< listener_base_port + listener_count`; simultaneous
 tests require at least one distinct listener per path. `protocol_version`
 versions this control contract independently from the QUIC wire protocol.
+`daemon_version` identifies the installed client daemon. `server_version`
+identifies the currently authenticated server learned through the live QUIC
+handshake and is `unknown` while disconnected.
 
 **OK** — reply to successful connect/disconnect:
 

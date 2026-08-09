@@ -510,7 +510,6 @@ private nonisolated final class OutcomeRace: @unchecked Sendable {
     }
 }
 
-
 private nonisolated func consumeStdout(
     _ handle: FileHandle,
     direction: BenchmarkDirection,
@@ -520,19 +519,19 @@ private nonisolated func consumeStdout(
     var pending = Data()
     var warnings: [String] = []
 
-    for try await byte in handle.bytes {
-        if byte == 0x0A {
-            if !pending.isEmpty {
+    for try await chunk in pipeChunks(from: handle) {
+        pending.append(chunk)
+        while let newline = pending.firstIndex(of: 0x0A) {
+            let line = pending[..<newline]
+            if !line.isEmpty {
                 await consumeLine(
-                    String(decoding: pending, as: UTF8.self),
+                    String(decoding: line, as: UTF8.self),
                     parser: &parser,
                     warnings: &warnings,
                     onSample: onSample
                 )
-                pending.removeAll(keepingCapacity: true)
             }
-        } else {
-            pending.append(byte)
+            pending.removeSubrange(...newline)
         }
     }
     if !pending.isEmpty {
@@ -566,8 +565,27 @@ private nonisolated func consumeLine(
 
 private nonisolated func readAll(_ handle: FileHandle) async throws -> Data {
     var data = Data()
-    for try await byte in handle.bytes {
-        data.append(byte)
+    for try await chunk in pipeChunks(from: handle) {
+        data.append(chunk)
     }
     return data
+}
+
+private nonisolated func pipeChunks(
+    from handle: FileHandle
+) -> AsyncThrowingStream<Data, any Error> {
+    AsyncThrowingStream { continuation in
+        handle.readabilityHandler = { readableHandle in
+            let chunk = readableHandle.availableData
+            guard !chunk.isEmpty else {
+                readableHandle.readabilityHandler = nil
+                continuation.finish()
+                return
+            }
+            continuation.yield(chunk)
+        }
+        continuation.onTermination = { _ in
+            handle.readabilityHandler = nil
+        }
+    }
 }

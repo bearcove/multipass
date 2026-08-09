@@ -74,7 +74,6 @@ pub struct Shared {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub enabled: AtomicBool,
-    pub active: AtomicBool,
     pub paths: RwLock<PathSnapshot>,
     pub server: SocketAddr,
     pub wired_src: IpAddr,
@@ -82,6 +81,7 @@ pub struct Shared {
     pub wired_iface: String,
     pub wifi_iface: String,
     pub utun_name: String,
+    pub server_version: RwLock<Option<String>>,
 }
 
 impl Shared {
@@ -90,7 +90,6 @@ impl Shared {
             tx_bytes: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
             enabled: AtomicBool::new(false),
-            active: AtomicBool::new(false),
             paths: RwLock::new(PathSnapshot {
                 wired_alive: false,
                 wifi_alive: false,
@@ -104,7 +103,33 @@ impl Shared {
             wired_iface,
             wifi_iface,
             utun_name,
+            server_version: RwLock::new(None),
         })
+    }
+
+    fn disconnect(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+        self.transport_inactive();
+    }
+
+    fn transport_active(&self, server_version: String) {
+        *self.server_version.write().unwrap() = Some(server_version);
+    }
+
+    fn transport_inactive(&self) {
+        *self.server_version.write().unwrap() = None;
+    }
+
+    fn is_transport_active(&self) -> bool {
+        self.server_version.read().unwrap().is_some()
+    }
+
+    fn authenticated_server_version(&self) -> String {
+        self.server_version
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "unknown".into())
     }
 }
 
@@ -190,6 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
     let transport_lifecycle = async {
         loop {
+            shared.transport_inactive();
             // Wait until enabled, but make IPC failure terminate the daemon.
             if !shared.enabled.load(Ordering::Relaxed) {
                 tokio::select! {
@@ -223,11 +249,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 break;
             }
             match handshake(&mut transport, client_nonce).await {
-                Ok((ipv4, ipv6, mtu)) => {
+                Ok((ipv4, ipv6, mtu, server_version)) => {
                     if !shared.enabled.load(Ordering::Relaxed) {
                         continue;
                     }
-                    info!(?ipv4, ?ipv6, mtu, "assigned; configuring tunnel");
+                    info!(?ipv4, ?ipv6, mtu, %server_version, "assigned; configuring tunnel");
                     let utun_name = shared.utun_name.clone();
                     let Some((v4_addr, v4_prefix)) = ipv4 else {
                         error!("no IPv4 assignment received; disabling tunnel");
@@ -307,7 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         );
                         continue;
                     }
-                    shared.active.store(true, Ordering::Relaxed);
+                    shared.transport_active(server_version);
                     let pump_end = pump(
                         utun.clone(),
                         &mut transport,
@@ -319,7 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     )
                     .await;
 
-                    shared.active.store(false, Ordering::Relaxed);
+                    shared.transport_inactive();
                     info!("transport inactive; restoring routes");
                     if v6_active {
                         routes::teardown_v6(&shared.utun_name);
@@ -369,6 +395,7 @@ async fn handshake(
         Option<(Ipv4Addr, u8)>,
         Option<(std::net::Ipv6Addr, u8)>,
         u16,
+        String,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -394,11 +421,21 @@ async fn handshake(
             Ok(Some((
                 path,
                 Frame::Assign {
-                    ipv4, ipv6, mtu, ..
+                    ipv4,
+                    ipv6,
+                    mtu,
+                    server_version,
+                    ..
                 },
             ))) => {
                 transport.mark_ready(path);
-                assignment.get_or_insert((ipv4, ipv6, mtu));
+                if let Some((_, _, _, assigned_version)) = &assignment {
+                    if assigned_version != &server_version {
+                        return Err("paths reported different server build identities".into());
+                    }
+                } else {
+                    assignment = Some((ipv4, ipv6, mtu, server_version));
+                }
             }
             Ok(Some((path, frame))) => {
                 info!(path = %path.label(), ?frame, "control frame during handshake");
@@ -756,7 +793,17 @@ async fn pump(
             }
             control = transport.recv_control() => {
                 match control {
-                    Some((path, Frame::Assign { .. })) => {
+                    Some((path, Frame::Assign { server_version, .. })) => {
+                        let matches_active_server = shared
+                            .server_version
+                            .read()
+                            .unwrap()
+                            .as_deref()
+                            .is_some_and(|active_version| active_version == server_version);
+                        if !matches_active_server {
+                            warn!(path = %path.label(), %server_version, "path reported a different or inactive server build identity");
+                            return PumpEnd::Reconnect;
+                        }
                         transport.mark_ready(path);
                         info!(path = %path.label(), "path epoch acknowledged");
                     }
@@ -910,11 +957,14 @@ fn source_ipv4(ip: &IpAddr) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CanaryReject, Redials, build_canary_request, build_canary_request_v6, canary_identity,
-        icmpv6_checksum, internet_checksum, validate_canary_reply, validate_canary_reply_v6,
+        CanaryReject, Redials, Shared, build_canary_request, build_canary_request_v6,
+        canary_identity, icmpv6_checksum, internet_checksum, validate_canary_reply,
+        validate_canary_reply_v6,
     };
     use multipass::PathKind;
     use multipass_proto::{TUNNEL_V6_CLIENT, TUNNEL_V6_SERVER};
+    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     #[tokio::test]
@@ -933,6 +983,60 @@ mod tests {
             !redials.start(PathKind::Wired, server, source),
             "only one dial per path may be in flight"
         );
+    }
+
+    #[test]
+    fn server_identity_is_unknown_until_activation_becomes_live() {
+        let shared = shared_with_server_version(None);
+
+        assert_eq!(shared.authenticated_server_version(), "unknown");
+        shared.transport_active("server-commit-456".into());
+        assert!(shared.is_transport_active());
+        assert_eq!(shared.authenticated_server_version(), "server-commit-456");
+    }
+
+    #[test]
+    fn clearing_inactive_transport_forgets_server_identity() {
+        let shared = shared_with_server_version(Some("server-commit-456"));
+
+        shared.transport_inactive();
+
+        assert!(!shared.is_transport_active());
+        assert_eq!(shared.authenticated_server_version(), "unknown");
+        assert_eq!(*shared.server_version.read().unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_disconnect_clears_authenticated_server_identity() {
+        let shared = shared_with_server_version(Some("server-commit-456"));
+
+        shared.disconnect();
+
+        assert!(!shared.enabled.load(Ordering::Relaxed));
+        assert!(!shared.is_transport_active());
+        assert_eq!(*shared.server_version.read().unwrap(), None);
+    }
+
+    fn shared_with_server_version(server_version: Option<&str>) -> Shared {
+        Shared {
+            tx_bytes: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+            enabled: AtomicBool::new(true),
+            paths: RwLock::new(super::PathSnapshot {
+                wired_alive: true,
+                wifi_alive: true,
+                wired_rtt_ms: None,
+                wifi_rtt_ms: None,
+                active: Some(PathKind::Wired),
+            }),
+            server: "127.0.0.1:51823".parse().unwrap(),
+            wired_src: "127.0.0.1".parse().unwrap(),
+            wifi_src: "127.0.0.1".parse().unwrap(),
+            wired_iface: "en1".into(),
+            wifi_iface: "en0".into(),
+            utun_name: "utun3".into(),
+            server_version: RwLock::new(server_version.map(str::to_string)),
+        }
     }
     #[test]
     fn raw_canary_request_is_valid_ipv4_icmp() {

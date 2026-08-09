@@ -35,8 +35,8 @@ impl PathKind {
     }
 }
 
-/// ALPN for the multipass tunnel connection.
-pub const ALPN: &[u8] = b"multipass/1";
+/// ALPN for wire protocol version 2. Version 2 requires `Assign.server_version`.
+pub const ALPN: &[u8] = b"multipass/2";
 
 /// Well-known tunnel subnet layout. Server is .1, first client is .2.
 pub const TUNNEL_SERVER: Ipv4Addr = Ipv4Addr::new(10, 10, 99, 1);
@@ -61,8 +61,8 @@ pub enum Tag {
     Data = 0,
     /// Client -> server handshake. Payload: [client_nonce u64].
     Hello = 1,
-    /// Server -> client address assignment.
-    /// Payload: [addr u32][prefix u8][mtu u16].
+    /// Server -> client address assignment and build identity.
+    /// Payload: [addr flags + values][mtu u16][dns][version_len u16][version bytes].
     Assign = 2,
     /// Liveness probe either direction. Payload: [nonce u64].
     Ping = 3,
@@ -101,6 +101,7 @@ pub enum Frame {
         ipv6: Option<(Ipv6Addr, u8)>,
         mtu: u16,
         dns: Vec<IpAddr>,
+        server_version: String,
     },
     Ping {
         nonce: u64,
@@ -133,6 +134,7 @@ pub fn encode(frame: &Frame) -> Bytes {
             ipv6,
             mtu,
             dns,
+            server_version,
         } => {
             out.put_u8(Tag::Assign as u8);
             // flags: bit 0 = ipv4 present, bit 1 = ipv6 present
@@ -166,6 +168,10 @@ pub fn encode(frame: &Frame) -> Bytes {
                     }
                 }
             }
+            let version = server_version.as_bytes();
+            let version_len = u16::try_from(version.len()).expect("server version exceeds u16");
+            out.put_u16(version_len);
+            out.extend_from_slice(version);
         }
         Frame::Ping { nonce } => {
             out.put_u8(Tag::Ping as u8);
@@ -266,11 +272,20 @@ pub fn decode(mut buf: &[u8]) -> Option<Frame> {
                     _ => return None,
                 }
             }
+            if buf.remaining() < 2 {
+                return None;
+            }
+            let version_len = buf.get_u16() as usize;
+            if buf.remaining() != version_len {
+                return None;
+            }
+            let server_version = String::from_utf8(buf.copy_to_bytes(version_len).to_vec()).ok()?;
             Some(Frame::Assign {
                 ipv4,
                 ipv6,
                 mtu,
                 dns,
+                server_version,
             })
         }
         Tag::Ping => {
@@ -398,6 +413,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn alpn_identifies_assign_server_version_contract() {
+        assert_eq!(ALPN, b"multipass/2");
+    }
+
+    #[test]
     fn data_roundtrip() {
         let pkt = Bytes::from_static(&[0x45, 0x00, 0x00, 0x3c, 1, 2, 3]);
         let f = Frame::Data {
@@ -425,6 +445,7 @@ mod tests {
                 ipv6: None,
                 mtu: TUNNEL_MTU,
                 dns: vec![],
+                server_version: "test-server".into(),
             },
             Frame::Ping { nonce: 7 },
             Frame::Pong { nonce: 7 },
@@ -463,6 +484,7 @@ mod tests {
             ipv6: Some((Ipv6Addr::new(0xfd00, 0x99, 0, 0, 0, 0, 0, 2), 64)),
             mtu: 1280,
             dns: vec![],
+            server_version: "test-server".into(),
         };
         let encoded = encode(&assign);
         let decoded = decode(&encoded).unwrap();
@@ -472,6 +494,7 @@ mod tests {
                 ipv6,
                 mtu,
                 dns,
+                server_version,
             } => {
                 assert_eq!(ipv4, Some((Ipv4Addr::new(10, 10, 99, 2), 24)));
                 assert_eq!(
@@ -480,9 +503,43 @@ mod tests {
                 );
                 assert_eq!(mtu, 1280);
                 assert!(dns.is_empty());
+                assert_eq!(server_version, "test-server");
             }
             _ => panic!("wrong frame"),
         }
+    }
+
+    #[test]
+    fn assign_roundtrip_preserves_server_version() {
+        let assign = Frame::Assign {
+            ipv4: Some((TUNNEL_CLIENT, TUNNEL_PREFIX)),
+            ipv6: None,
+            mtu: TUNNEL_MTU,
+            dns: vec![],
+            server_version: "server-commit-123".into(),
+        };
+
+        let decoded = decode(&encode(&assign)).unwrap();
+        match decoded {
+            Frame::Assign { server_version, .. } => {
+                assert_eq!(server_version, "server-commit-123");
+            }
+            _ => panic!("expected Assign"),
+        }
+    }
+
+    #[test]
+    fn assign_decode_rejects_truncated_server_version() {
+        let assign = Frame::Assign {
+            ipv4: Some((TUNNEL_CLIENT, TUNNEL_PREFIX)),
+            ipv6: None,
+            mtu: TUNNEL_MTU,
+            dns: vec![],
+            server_version: "server-commit-123".into(),
+        };
+        let encoded = encode(&assign);
+
+        assert!(decode(&encoded[..encoded.len() - 1]).is_none());
     }
 
     #[test]

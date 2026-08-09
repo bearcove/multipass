@@ -95,6 +95,8 @@ nonisolated struct BenchmarkRun: Codable, Sendable, Equatable {
 
 nonisolated enum BenchmarkControllerError: Error, Sendable, Equatable {
     case unexpectedDaemonReply
+    case refreshedTopologyChanged
+    case refreshedServerIdentityUnavailable
     case missingInvocation(BenchmarkTestID)
     case noCompletedRun
 }
@@ -104,6 +106,10 @@ extension BenchmarkControllerError: LocalizedError {
         switch self {
         case .unexpectedDaemonReply:
             "The daemon returned an unexpected benchmark reply"
+        case .refreshedTopologyChanged:
+            "The benchmark topology changed after the tunnel connected"
+        case .refreshedServerIdentityUnavailable:
+            "The connected tunnel did not report an authenticated server identity"
         case .missingInvocation:
             "The benchmark test is not part of this suite"
         case .noCompletedRun:
@@ -210,7 +216,6 @@ final class BenchmarkController {
     private let store: BenchmarkStore
     private let parameters: BenchmarkParameters
     private let appBuild: String
-    private let clientBuild: String
     private var suiteTask: Task<Void, Never>?
     private var iperfVersion: String?
     private var cancellationRequested = false
@@ -225,7 +230,6 @@ final class BenchmarkController {
         store: BenchmarkStore = BenchmarkStore(),
         parameters: BenchmarkParameters = .init(),
         appBuild: String = "unknown",
-        clientBuild: String = "unknown",
         iperfVersion: String? = "unknown"
     ) {
         self.daemon = daemon
@@ -234,7 +238,6 @@ final class BenchmarkController {
         self.store = store
         self.parameters = parameters
         self.appBuild = appBuild
-        self.clientBuild = clientBuild
         self.iperfVersion = iperfVersion
     }
 
@@ -450,6 +453,10 @@ final class BenchmarkController {
                     }
                     try await tunnel.setConnected(true, owner: .benchmark(owner))
                     try checkCancellation()
+                    if !initialStatus.connected {
+                        topology = try await refreshedTopology(from: loadedTopology)
+                        runningTopology = topology
+                    }
                     for invocation in tunnelInvocations {
                         try checkCancellation()
                         state = .measuringTunnel(invocation.id)
@@ -460,6 +467,10 @@ final class BenchmarkController {
                     }
                 } catch is CancellationError {
                     throw CancellationError()
+                } catch let error as BenchmarkControllerError where error == .refreshedTopologyChanged
+                    || error == .refreshedServerIdentityUnavailable
+                    || error == .unexpectedDaemonReply {
+                    throw error
                 } catch {
                     let message = error.localizedDescription
                     for invocation in tunnelInvocations where results[invocation.id] == nil {
@@ -499,7 +510,7 @@ final class BenchmarkController {
                 completedAt: Date(),
                 identities: BenchmarkRunIdentities(
                     appBuild: appBuild,
-                    clientBuild: clientBuild,
+                    clientBuild: topology.daemonVersion,
                     serverBuild: topology.serverVersion,
                     iperfVersion: iperfVersion
                 ),
@@ -624,6 +635,38 @@ final class BenchmarkController {
         if cancellationRequested || Task.isCancelled {
             throw CancellationError()
         }
+    }
+    private func refreshedTopology(
+        from captured: BenchmarkTopology
+    ) async throws -> BenchmarkTopology {
+        let reply = try await daemon.request(.benchmarkTopology)
+        guard case .benchmarkTopology(let refreshed) = reply else {
+            throw BenchmarkControllerError.unexpectedDaemonReply
+        }
+        guard Self.matchesPlanningTopology(refreshed, captured) else {
+            throw BenchmarkControllerError.refreshedTopologyChanged
+        }
+        let serverVersion = refreshed.serverVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serverVersion.isEmpty, serverVersion.lowercased() != "unknown" else {
+            throw BenchmarkControllerError.refreshedServerIdentityUnavailable
+        }
+        var topology = captured
+        topology.serverVersion = refreshed.serverVersion
+        return topology
+    }
+
+    private nonisolated static func matchesPlanningTopology(
+        _ refreshed: BenchmarkTopology,
+        _ captured: BenchmarkTopology
+    ) -> Bool {
+        refreshed.protocolVersion == captured.protocolVersion
+            && refreshed.daemonVersion == captured.daemonVersion
+            && refreshed.underlayTarget == captured.underlayTarget
+            && refreshed.tunnelIPv4Target == captured.tunnelIPv4Target
+            && refreshed.tunnelIPv6Target == captured.tunnelIPv6Target
+            && refreshed.listenerBasePort == captured.listenerBasePort
+            && refreshed.listenerCount == captured.listenerCount
+            && refreshed.paths == captured.paths
     }
 
     private func runMeasurement(_ invocation: BenchmarkInvocation) async -> BenchmarkResult {

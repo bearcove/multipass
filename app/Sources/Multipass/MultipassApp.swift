@@ -106,7 +106,6 @@ struct MultipassApp: App {
             store: BenchmarkStore(),
             parameters: parameters,
             appBuild: Self.bundleIdentity,
-            clientBuild: Self.bundleIdentity,
             iperfVersion: iperfVersion
         )
         _tunnelController = State(initialValue: tunnel)
@@ -146,11 +145,17 @@ struct MultipassApp: App {
         }
     }
 
-    private static var bundleIdentity: String {
-        let bundle = Bundle.main
-        return (bundle.object(forInfoDictionaryKey: "MultipassBuildCommit") as? String)
-            ?? (bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String)
-            ?? "unknown"
+    static var bundleIdentity: String {
+        bundleIdentity(infoDictionary: Bundle.main.infoDictionary ?? [:])
+    }
+
+    nonisolated static func bundleIdentity(infoDictionary: [String: Any]) -> String {
+        for key in ["MultipassGitCommit", "CFBundleVersion"] {
+            if let value = infoDictionary[key] as? String, !value.isEmpty {
+                return value
+            }
+        }
+        return "unknown"
     }
 }
 private struct OpenWindowButton: View {

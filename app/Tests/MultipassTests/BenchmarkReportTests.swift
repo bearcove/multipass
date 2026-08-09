@@ -101,7 +101,7 @@ struct BenchmarkReportTests {
         | Client/daemon | `client-def5678` |
         | Server | `server-abc1234` |
         | iperf | `iperf 3.21` |
-        | Benchmark protocol | `1` |
+        | Benchmark protocol | `2` |
 
         ## Topology
 
@@ -169,7 +169,8 @@ struct BenchmarkReportTests {
                 iperfVersion: "iperf|3\r\n`bad`"
             ),
             topology: BenchmarkTopology(
-                protocolVersion: 1,
+                protocolVersion: 2,
+                daemonVersion: "client ``build``",
                 serverVersion: "server",
                 underlayTarget: " underlay ",
                 tunnelIPv4Target: "a`b",
@@ -203,7 +204,7 @@ struct BenchmarkReportTests {
         | Client/daemon | ``` client ``build`` ``` |
         | Server | `  leading and trailing  ` |
         | iperf | `` iperf\\|3 `bad` `` |
-        | Benchmark protocol | `1` |
+        | Benchmark protocol | `2` |
 
         ## Topology
 
@@ -305,7 +306,8 @@ struct BenchmarkReportTests {
                 iperfVersion: ""
             ),
             topology: BenchmarkTopology(
-                protocolVersion: 1,
+                protocolVersion: 2,
+                daemonVersion: "",
                 serverVersion: "",
                 underlayTarget: "",
                 tunnelIPv4Target: "",

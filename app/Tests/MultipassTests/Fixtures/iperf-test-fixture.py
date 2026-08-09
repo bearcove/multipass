@@ -66,7 +66,16 @@ if mode == "capture":
     emit(final_line())
 elif mode == "incremental":
     emit(interval(111.0, 0.0, 1.0))
-    time.sleep(0.5)
+    with open(os.environ["IPERF_FIXTURE_READY_FILE"], "w", encoding="utf-8"):
+        pass
+    release_path = os.environ["IPERF_FIXTURE_RELEASE_FILE"]
+    release_deadline = time.monotonic() + 5.0
+    while not os.path.exists(release_path):
+        if time.monotonic() >= release_deadline:
+            sys.stderr.write("incremental fixture release timed out\n")
+            sys.stderr.flush()
+            sys.exit(24)
+        time.sleep(0.01)
     emit(interval(222.0, 1.0, 2.0))
     emit(final_line())
 elif mode == "large-stderr":

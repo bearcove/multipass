@@ -2,6 +2,7 @@
 name = "multipass"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 license = "MIT OR Apache-2.0"
 description = "multipass client daemon (multipassd): utun + dual-connection seamless failover transport"
 default-run = "multipass"

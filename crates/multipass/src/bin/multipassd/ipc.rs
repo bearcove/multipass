@@ -81,6 +81,7 @@ enum Reply {
     },
     BenchmarkTopology {
         protocol_version: u32,
+        daemon_version: String,
         server_version: String,
         underlay_target: String,
         tunnel_ipv4_target: Option<String>,
@@ -188,7 +189,7 @@ fn handle_request(line: &str, shared: &Shared) -> String {
         Ok(Request {
             cmd: Command::Disconnect,
         }) => {
-            shared.enabled.store(false, Ordering::Relaxed);
+            shared.disconnect();
             Reply::Ok
         }
         Ok(Request {
@@ -202,7 +203,7 @@ fn handle_request(line: &str, shared: &Shared) -> String {
 }
 
 fn status_reply(shared: &Shared) -> Reply {
-    let connected = shared.active.load(Ordering::Relaxed);
+    let connected = shared.is_transport_active();
     let paths = *shared.paths.read().unwrap();
     let active_path = paths.active.map(|path| path.label().to_string());
     let rtt_ms = match paths.active {
@@ -223,8 +224,9 @@ fn status_reply(shared: &Shared) -> Reply {
 
 fn benchmark_topology_reply(shared: &Shared) -> Reply {
     Reply::BenchmarkTopology {
-        protocol_version: 1,
-        server_version: "unknown".into(),
+        protocol_version: 2,
+        daemon_version: env!("MULTIPASS_BUILD_COMMIT").into(),
+        server_version: shared.authenticated_server_version(),
         underlay_target: shared.server.ip().to_string(),
         tunnel_ipv4_target: Some(TUNNEL_SERVER.to_string()),
         tunnel_ipv6_target: Some(TUNNEL_V6_SERVER.to_string()),
@@ -258,7 +260,6 @@ mod tests {
             tx_bytes: AtomicU64::new(tx),
             rx_bytes: AtomicU64::new(200),
             enabled: AtomicBool::new(true),
-            active: AtomicBool::new(true),
             paths: std::sync::RwLock::new(crate::PathSnapshot {
                 wired_alive: true,
                 wifi_alive: false,
@@ -272,11 +273,18 @@ mod tests {
             wired_iface: "en17".into(),
             wifi_iface: "en0".into(),
             utun_name: "utun3".into(),
+            server_version: std::sync::RwLock::new(Some("test-server".into())),
         })
     }
 
     fn shared() -> Arc<Shared> {
         shared_with_tx(100)
+    }
+
+    fn inactive_shared() -> Arc<Shared> {
+        let shared = shared_with_tx(100);
+        shared.transport_inactive();
+        shared
     }
 
     #[test]
@@ -322,11 +330,12 @@ mod tests {
 
     #[test]
     fn benchmark_topology_matches_contract() {
-        let json = handle_request("{\"cmd\":\"benchmark_topology\"}", &shared());
+        let json = handle_request("{\"cmd\":\"benchmark_topology\"}", &inactive_shared());
         let reply: Reply = facet_json::from_str(&json).unwrap();
         match reply {
             Reply::BenchmarkTopology {
                 protocol_version,
+                daemon_version,
                 server_version,
                 underlay_target,
                 tunnel_ipv4_target,
@@ -335,7 +344,8 @@ mod tests {
                 listener_count,
                 paths,
             } => {
-                assert_eq!(protocol_version, 1);
+                assert_eq!(protocol_version, 2);
+                assert_eq!(daemon_version, env!("MULTIPASS_BUILD_COMMIT"));
                 assert_eq!(server_version, "unknown");
                 assert_eq!(underlay_target, "10.0.0.5");
                 assert_eq!(tunnel_ipv4_target.as_deref(), Some("10.10.99.1"));
@@ -354,6 +364,53 @@ mod tests {
             }
             other => panic!("expected benchmark topology reply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn benchmark_topology_reports_learned_server_version() {
+        let sh = shared();
+        sh.transport_active("server-commit-456".into());
+
+        let json = handle_request("{\"cmd\":\"benchmark_topology\"}", &sh);
+        let reply: Reply = facet_json::from_str(&json).unwrap();
+        let Reply::BenchmarkTopology {
+            daemon_version,
+            server_version,
+            ..
+        } = reply
+        else {
+            panic!("expected benchmark topology reply");
+        };
+        assert_eq!(daemon_version, env!("MULTIPASS_BUILD_COMMIT"));
+        assert_eq!(server_version, "server-commit-456");
+    }
+
+    #[test]
+    fn benchmark_topology_hides_identity_when_transport_is_inactive() {
+        let sh = shared();
+        sh.transport_active("server-commit-456".into());
+        sh.transport_inactive();
+
+        let json = handle_request("{\"cmd\":\"benchmark_topology\"}", &sh);
+        let reply: Reply = facet_json::from_str(&json).unwrap();
+        let Reply::BenchmarkTopology { server_version, .. } = reply else {
+            panic!("expected benchmark topology reply");
+        };
+
+        assert_eq!(server_version, "unknown");
+    }
+
+    #[test]
+    fn disconnect_forgets_authenticated_server_version_immediately() {
+        let sh = shared();
+        *sh.server_version.write().unwrap() = Some("server-commit-456".into());
+
+        let json = handle_request("{\"cmd\":\"disconnect\"}", &sh);
+        let reply: Reply = facet_json::from_str(&json).unwrap();
+
+        assert!(matches!(reply, Reply::Ok));
+        assert!(!sh.enabled.load(Ordering::Relaxed));
+        assert_eq!(*sh.server_version.read().unwrap(), None);
     }
 
     #[test]

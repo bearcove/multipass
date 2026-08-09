@@ -70,7 +70,8 @@ func benchmarkTopology(
     paths: [BenchmarkPath] = [benchmarkWiredPath, benchmarkWiFiPath]
 ) -> BenchmarkTopology {
     BenchmarkTopology(
-        protocolVersion: 1,
+        protocolVersion: 2,
+        daemonVersion: "daemon-def5678",
         serverVersion: "server-abc1234",
         underlayTarget: "10.10.10.1",
         tunnelIPv4Target: "10.10.99.1",

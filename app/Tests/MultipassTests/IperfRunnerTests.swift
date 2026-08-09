@@ -82,24 +82,52 @@ struct IperfRunnerTests {
 
     @Test("delivers interval samples before process completion")
     func streamsSamplesIncrementally() async throws {
+        let controlDirectory = temporaryURL(named: "incremental-control", directory: true)
+        let readyFile = controlDirectory.appending(path: "ready")
+        let releaseFile = controlDirectory.appending(path: "release")
+        defer { try? FileManager.default.removeItem(at: controlDirectory) }
         let runner = IperfRunner(
             executableURL: try fixtureExecutable(),
             parameters: fastParameters,
-            environment: fixtureEnvironment(mode: "incremental")
+            environment: fixtureEnvironment(
+                mode: "incremental",
+                extra: [
+                    "IPERF_FIXTURE_READY_FILE": readyFile.path,
+                    "IPERF_FIXTURE_RELEASE_FILE": releaseFile.path,
+                ]
+            )
         )
         let recorder = SampleRecorder()
+        let completion = CompletionRecorder()
         let task = Task {
-            try await runner.run(invocation: uploadInvocation()) { sample in
-                await recorder.record(sample)
+            do {
+                let measurement = try await runner.run(invocation: uploadInvocation()) { sample in
+                    await recorder.record(sample)
+                }
+                await completion.record()
+                return measurement
+            } catch {
+                await completion.record()
+                throw error
             }
         }
 
-        try await waitUntil { await recorder.values.count == 1 }
-        #expect(await recorder.values == [111])
+        do {
+            try await waitUntil {
+                guard FileManager.default.fileExists(atPath: readyFile.path) else { return false }
+                return await recorder.values == [111]
+            }
+            #expect(!(await completion.didComplete))
 
-        let measurement = try await task.value
-        #expect(await recorder.values == [111, 222])
-        #expect(measurement.result?.bitsPerSecond == 222)
+            try Data().write(to: releaseFile, options: .atomic)
+            let measurement = try await task.value
+            #expect(await recorder.values == [111, 222])
+            #expect(measurement.result?.bitsPerSecond == 222)
+        } catch {
+            try? Data().write(to: releaseFile, options: .atomic)
+            _ = await task.result
+            throw error
+        }
     }
 
     @Test("surfaces stderr and exit status on failure")
@@ -331,6 +359,14 @@ private actor SampleRecorder {
 
     func record(_ value: Double) {
         values.append(value)
+    }
+}
+
+private actor CompletionRecorder {
+    private(set) var didComplete = false
+
+    func record() {
+        didComplete = true
     }
 }
 

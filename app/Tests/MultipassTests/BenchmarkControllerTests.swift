@@ -690,6 +690,98 @@ struct BenchmarkControllerTests {
         #expect(controller.liveSamples.values.allSatisfy { $0.count <= 10 })
     }
 
+    @Test("a disconnected suite captures the authenticated server identity after connecting")
+    func disconnectedSuiteRefreshesServerIdentity() async throws {
+        var disconnectedTopology = testTopology
+        disconnectedTopology.serverVersion = "unknown"
+        var connectedTopology = disconnectedTopology
+        connectedTopology.serverVersion = "authenticated-server-build"
+        let daemon = FakeDaemon(
+            connected: false,
+            topology: disconnectedTopology,
+            connectedTopology: connectedTopology
+        )
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner
+        )
+
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+
+        let run = try #require(controller.completedRun)
+        #expect(controller.state == .completed)
+        #expect(run.topology.serverVersion == "authenticated-server-build")
+        #expect(run.identities.serverBuild == "authenticated-server-build")
+        #expect(run.identities.serverBuild == run.topology.serverVersion)
+        #expect(await daemon.requests.filter { $0 == .benchmarkTopology }.count == 2)
+        #expect(await daemon.connected == false)
+    }
+
+    @Test("a disconnected suite rejects changed topology after connecting and restores")
+    func disconnectedSuiteRejectsChangedTopology() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = BenchmarkStore(directory: directory)
+        var disconnectedTopology = testTopology
+        disconnectedTopology.serverVersion = "unknown"
+        var connectedTopology = disconnectedTopology
+        connectedTopology.serverVersion = "authenticated-server-build"
+        connectedTopology.listenerBasePort += 1
+        let daemon = FakeDaemon(
+            connected: false,
+            topology: disconnectedTopology,
+            connectedTopology: connectedTopology
+        )
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner,
+            store: store
+        )
+
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+
+        #expect(controller.state == .failed)
+        #expect(controller.lastError?.contains("topology changed") == true)
+        #expect(controller.completedRun == nil)
+        #expect(try await store.loadRuns().runs.isEmpty)
+        #expect(await runner.invocationIDs == rawInvocations.map(\.id))
+        #expect(await daemon.connected == false)
+    }
+
+    @Test("a disconnected suite rejects an unknown authenticated server identity and restores")
+    func disconnectedSuiteRejectsUnknownAuthenticatedServerIdentity() async throws {
+        var disconnectedTopology = testTopology
+        disconnectedTopology.serverVersion = "stale-server-build"
+        var connectedTopology = disconnectedTopology
+        connectedTopology.serverVersion = "unknown"
+        let daemon = FakeDaemon(
+            connected: false,
+            topology: disconnectedTopology,
+            connectedTopology: connectedTopology
+        )
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner
+        )
+
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+
+        #expect(controller.state == .failed)
+        #expect(controller.lastError?.contains("authenticated server identity") == true)
+        #expect(controller.completedRun == nil)
+        #expect(await runner.invocationIDs == rawInvocations.map(\.id))
+        #expect(await daemon.connected == false)
+    }
+
     @Test("initially disconnected runs raw, connects, runs tunnel, then disconnects")
     func disconnectedFullSuiteRestoresDisconnected() async throws {
         let daemon = FakeDaemon(connected: false)
@@ -700,7 +792,6 @@ struct BenchmarkControllerTests {
             tunnel: tunnel,
             runner: runner,
             appBuild: "app-build",
-            clientBuild: "client-build",
             iperfVersion: "iperf 3.21"
         )
 
@@ -711,7 +802,7 @@ struct BenchmarkControllerTests {
         #expect(controller.completedRun?.results.count == allInvocations.count + 2)
         #expect(controller.completedRun?.identities == BenchmarkRunIdentities(
             appBuild: "app-build",
-            clientBuild: "client-build",
+            clientBuild: "daemon-build",
             serverBuild: "server-build",
             iperfVersion: "iperf 3.21"
         ))
@@ -744,6 +835,7 @@ struct BenchmarkControllerTests {
             .request(.connect),
             .request(.status),
             .request(.status),
+            .request(.benchmarkTopology),
             .run(tunnelInvocations[0].id),
             .run(tunnelInvocations[1].id),
             .request(.status),
@@ -757,7 +849,8 @@ struct BenchmarkControllerTests {
     @Test("an unavailable tunnel IPv4 target is skipped without a runner invocation")
     func unavailableTunnelIPv4IsSkippedWithoutRunning() async throws {
         let topology = BenchmarkTopology(
-            protocolVersion: 1,
+            protocolVersion: 2,
+            daemonVersion: "daemon-build",
             serverVersion: "server-build",
             underlayTarget: "10.10.10.1",
             tunnelIPv4Target: nil,
@@ -893,7 +986,7 @@ struct BenchmarkControllerTests {
         #expect(tunnel.state == .disconnected)
     }
 
-    @Test("initially connected never disconnects after the suite")
+    @Test("initially connected uses its initial authenticated topology and never disconnects")
     func connectedFullSuiteStaysConnected() async throws {
         let daemon = FakeDaemon(connected: true)
         let runner = FakeBenchmarkRunner(recorder: daemon)
@@ -905,9 +998,11 @@ struct BenchmarkControllerTests {
 
         #expect(controller.state == .completed)
         #expect(await daemon.connected)
+        #expect(await daemon.requests.filter { $0 == .benchmarkTopology }.count == 1)
         #expect(await daemon.requests.filter { $0 == .disconnect }.isEmpty)
         #expect(await runner.invocationIDs == allInvocations.map(\.id))
     }
+
 
     @Test("a raw measurement failure does not stop independent tests")
     func rawFailureContinuesIndependentTests() async throws {
@@ -1080,7 +1175,8 @@ struct BenchmarkControllerTests {
         let prior = try #require(controller.completedRun)
 
         await daemon.setTopology(BenchmarkTopology(
-            protocolVersion: 1,
+            protocolVersion: 2,
+            daemonVersion: "daemon-build",
             serverVersion: "invalid",
             underlayTarget: "not-an-address",
             tunnelIPv4Target: nil,
@@ -1176,7 +1272,8 @@ struct BenchmarkControllerTests {
         controller.startFullSuite()
         try await waitUntil { await daemon.waitingRequest == .benchmarkTopology }
         await daemon.setTopology(BenchmarkTopology(
-            protocolVersion: 1,
+            protocolVersion: 2,
+            daemonVersion: "daemon-build",
             serverVersion: "invalid",
             underlayTarget: "not-an-address",
             tunnelIPv4Target: nil,
@@ -1251,6 +1348,7 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
     private(set) var events: [Event] = []
     private(set) var waitingRequest: DaemonRequest?
     private var topology: BenchmarkTopology
+    private let connectedTopology: BenchmarkTopology?
     private let connectError: (any Error & Sendable)?
     private let disconnectError: (any Error & Sendable)?
     private let staleStatusRepliesAfterCommand: Int
@@ -1263,6 +1361,7 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
     init(
         connected: Bool,
         topology: BenchmarkTopology = testTopology,
+        connectedTopology: BenchmarkTopology? = nil,
         connectError: (any Error & Sendable)? = nil,
         disconnectError: (any Error & Sendable)? = nil,
         staleStatusRepliesAfterCommand: Int = 0,
@@ -1271,6 +1370,7 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
     ) {
         self.connected = connected
         self.topology = topology
+        self.connectedTopology = connectedTopology
         self.connectError = connectError
         self.disconnectError = disconnectError
         self.staleStatusRepliesAfterCommand = staleStatusRepliesAfterCommand
@@ -1302,7 +1402,7 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
             }
             return .status(statusSnapshot(connected: connected))
         case .benchmarkTopology:
-            return .benchmarkTopology(topology)
+            return .benchmarkTopology(connected ? connectedTopology ?? topology : topology)
         case .connect:
             if let connectError { throw connectError }
             pendingConnected = true
@@ -1505,7 +1605,8 @@ private enum TestFailure: Error, Sendable {
 }
 
 private let testTopology = BenchmarkTopology(
-    protocolVersion: 1,
+    protocolVersion: 2,
+    daemonVersion: "daemon-build",
     serverVersion: "server-build",
     underlayTarget: "10.10.10.1",
     tunnelIPv4Target: "10.10.99.1",

@@ -81,6 +81,7 @@ nonisolated struct BenchmarkPath: Codable, Sendable, Equatable {
 
 nonisolated struct BenchmarkTopology: Codable, Sendable, Equatable {
     var protocolVersion: UInt32
+    var daemonVersion: String
     var serverVersion: String
     var underlayTarget: String
     var tunnelIPv4Target: String?
@@ -91,6 +92,7 @@ nonisolated struct BenchmarkTopology: Codable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
+        case daemonVersion = "daemon_version"
         case serverVersion = "server_version"
         case underlayTarget = "underlay_target"
         case tunnelIPv4Target = "tunnel_ipv4_target"
