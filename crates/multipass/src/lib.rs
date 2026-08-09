@@ -443,16 +443,16 @@ impl Transport {
             let mut sched = self.scheduler.lock().unwrap();
             for kind in PathKind::ALL {
                 sched.set_eligible(kind, self.is_ready(kind) && self.is_alive(kind));
-                let rtt = self.path(kind).rtt.load(Ordering::Relaxed);
-                if rtt > 0 {
-                    sched.note_rtt(kind, Duration::from_micros(rtt));
+                let connection = self.path(kind).conn.lock().unwrap();
+                if let Some(stats) = connection.path_stats(noq_proto::PathId::ZERO) {
+                    sched.note_path_stats(kind, stats.rtt, stats.cwnd);
+                } else {
+                    let rtt = self.path(kind).rtt.load(Ordering::Relaxed);
+                    if rtt > 0 {
+                        sched.note_rtt(kind, Duration::from_micros(rtt));
+                    }
                 }
-                let space = self
-                    .path(kind)
-                    .conn
-                    .lock()
-                    .unwrap()
-                    .datagram_send_buffer_space();
+                let space = connection.datagram_send_buffer_space();
                 sched.note_queue_space(kind, space);
             }
         }

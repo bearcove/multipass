@@ -264,7 +264,7 @@ impl Session {
         let epoch = state.epoch;
 
         // Collect per-connection stats first (immutable borrow), then release.
-        let stats: Vec<(PathKind, Option<Duration>, usize)> = state
+        let stats: Vec<(PathKind, Option<noq_proto::PathStats>, usize)> = state
             .conns
             .iter()
             .filter(|live| live.epoch == epoch)
@@ -273,14 +273,16 @@ impl Session {
                 let conn = live.conn.as_ref()?;
                 Some((
                     path,
-                    conn.rtt(noq_proto::PathId::ZERO),
+                    conn.path_stats(noq_proto::PathId::ZERO),
                     conn.datagram_send_buffer_space(),
                 ))
             })
             .collect();
-        for (path, rtt, space) in stats {
-            if let Some(rtt) = rtt {
-                state.scheduler.note_rtt(path, rtt);
+        for (path, path_stats, space) in stats {
+            if let Some(path_stats) = path_stats {
+                state
+                    .scheduler
+                    .note_path_stats(path, path_stats.rtt, path_stats.cwnd);
             }
             state.scheduler.note_queue_space(path, space);
         }
