@@ -208,7 +208,7 @@ actor BenchmarkStore {
             completedAt: run.completedAt,
             automaticLabel: BenchmarkFormatting.automaticLabel(for: run),
             userLabel: run.userLabel,
-            hasErrors: run.restorationError != nil || run.results.values.contains(where: \.isFailure)
+            hasErrors: run.hasErrors
         )
     }
 

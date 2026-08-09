@@ -150,14 +150,15 @@ nonisolated enum BenchmarkReport {
             return ResultCell(value: "Not run", retransmits: "—", delta: "—")
         }
         switch result {
-        case .failed(let message):
-            let lowercased = message.lowercased()
-            let prefix = lowercased.hasPrefix("skipped:") ? "Skipped:" : "Failed:"
-            let detail = lowercased.hasPrefix("skipped:")
-                ? message.dropFirst("skipped:".count).trimmingCharacters(in: .whitespaces)
-                : message
+        case .skipped(let reason):
             return ResultCell(
-                value: "\(prefix) \(escapedTable(detail))",
+                value: "Skipped: \(escapedTable(reason))",
+                retransmits: "—",
+                delta: "—"
+            )
+        case .failed(let message):
+            return ResultCell(
+                value: "Failed: \(escapedTable(message))",
                 retransmits: "—",
                 delta: "—"
             )

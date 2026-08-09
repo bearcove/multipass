@@ -5,11 +5,696 @@ import Testing
 @Suite("Benchmark lifecycle", .serialized)
 @MainActor
 struct BenchmarkControllerTests {
+    @Test("missing iperf prevents a new suite with the actionable prerequisite")
+    func missingIperfPreventsNewSuite() {
+        let daemon = FakeDaemon(connected: false)
+        let tunnel = TunnelController(client: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: tunnel,
+            runner: nil
+        )
+
+        #expect(controller.canStartFullSuite == false)
+        #expect(controller.prerequisiteError == "iperf3 is required. Install it with Homebrew: brew install iperf3.")
+        controller.startFullSuite()
+        #expect(controller.state == .idle)
+        #expect(controller.isRunning == false)
+    }
+
+
+    @Test("daemon availability remains unknown until the first app-scope observation")
+    func daemonAvailabilityRequiresObservation() async throws {
+        let daemon = FakeDaemon(connected: false)
+        let tunnel = TunnelController(client: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: tunnel,
+            runner: FakeBenchmarkRunner()
+        )
+
+        #expect(controller.daemonAvailability == .unknown)
+        #expect(controller.canRunFullSuite == false)
+        #expect(controller.runDisabledReason == "Checking multipassd availability…")
+
+        tunnel.start()
+        try await waitUntil { controller.daemonAvailability == .available }
+
+        #expect(controller.canRunFullSuite)
+        await tunnel.stop()
+    }
+
+
+    @Test("a suite cannot start before daemon availability is confirmed")
+    func suiteCannotStartBeforeDaemonObservation() {
+        let daemon = FakeDaemon(connected: false)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: TunnelController(client: daemon),
+            runner: FakeBenchmarkRunner()
+        )
+
+        controller.startFullSuite()
+
+        #expect(controller.isRunning == false)
+        #expect(controller.state == .idle)
+    }
+    @Test("iperf identity publication gates a suite snapshot without blocking controller creation")
+    func iperfIdentityPublicationGatesSuiteSnapshot() async throws {
+        let daemon = FakeDaemon(connected: false)
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let tunnel = testTunnel(client: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: tunnel,
+            runner: runner,
+            iperfVersion: nil
+        )
+        tunnel.start()
+        try await waitUntil { controller.daemonAvailability == .available }
+
+        #expect(controller.canRunFullSuite == false)
+        #expect(controller.runDisabledReason == "Checking iperf3 version…")
+
+        controller.publishIperfVersion("iperf 3.21")
+        #expect(controller.canRunFullSuite)
+
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+
+        #expect(controller.completedRun?.identities.iperfVersion == "iperf 3.21")
+        await tunnel.stop()
+    }
+
+    @Test("iperf identity cannot change after a suite snapshots it")
+    func iperfIdentityDoesNotChangeDuringSuite() async throws {
+        let daemon = FakeDaemon(connected: false)
+        let runner = FakeBenchmarkRunner(
+            suspendOn: rawInvocations[0].id,
+            recorder: daemon
+        )
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner,
+            iperfVersion: "iperf 3.21"
+        )
+
+        controller.startFullSuite()
+        try await waitUntil { await runner.suspended }
+        controller.publishIperfVersion("changed")
+        await runner.resumeSuspendedRun()
+        try await waitUntil { !controller.isRunning }
+
+        #expect(controller.completedRun?.identities.iperfVersion == "iperf 3.21")
+    }
+
+    @Test("bounded iperf probing terminates a hung process and publishes unknown")
+    func boundedIperfProbeTerminatesHungProcess() async throws {
+        let process = FakeVersionProcess()
+        let probe = IperfVersionProbe(
+            processFactory: { process },
+            timeout: .milliseconds(10),
+            terminationGrace: .milliseconds(10)
+        )
+
+        let version = await probe.version(at: URL(filePath: "/tmp/fake-iperf3"))
+
+        #expect(version == "unknown")
+        #expect(process.runCount == 1)
+        #expect(process.terminateCount == 1)
+        #expect(process.forceKillCount == 1)
+        #expect(process.waitCount == 1)
+    }
+
+    @Test("bounded iperf probing publishes the first version line")
+    func boundedIperfProbePublishesFirstLine() async {
+        let process = FakeVersionProcess(
+            output: Data("iperf 3.21\nDarwin host\n".utf8),
+            finishesAfterRun: true
+        )
+        let probe = IperfVersionProbe(processFactory: { process })
+
+        let version = await probe.version(at: URL(filePath: "/tmp/fake-iperf3"))
+
+        #expect(version == "iperf 3.21")
+        #expect(process.terminateCount == 0)
+        #expect(process.forceKillCount == 0)
+    }
+
+    @Test("loads persisted history newest first and restores the selected baseline")
+    func loadsHistoryAndBaseline() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = BenchmarkStore(directory: directory)
+        let older = benchmarkRun(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000101")!,
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let newer = benchmarkRun(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000102")!,
+            startedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        try await store.saveRun(older)
+        try await store.saveRun(newer)
+        try await store.selectBaseline(older.id)
+        let daemon = FakeDaemon(connected: false)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: FakeBenchmarkRunner(),
+            store: store
+        )
+
+        await controller.loadHistory()
+
+        #expect(controller.history.map(\.id) == [newer.id, older.id])
+        #expect(controller.selectedRunID == newer.id)
+        #expect(controller.selectedRun == newer)
+        #expect(controller.baselineRunID == older.id)
+        #expect(controller.baselineRun == older)
+        #expect(controller.loadError == nil)
+    }
+
+    @Test("reopening history loading is idempotent and preserves an active presentation")
+    func repeatedHistoryLoadPreservesActivePresentation() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = BenchmarkStore(directory: directory)
+        let saved = benchmarkRun(startedAt: Date(timeIntervalSince1970: 1_000))
+        try await store.saveRun(saved)
+        let daemon = FakeDaemon(connected: false)
+        let runner = FakeBenchmarkRunner(
+            suspendOn: rawInvocations[1].id,
+            recorder: daemon
+        )
+        let tunnel = testTunnel(client: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: tunnel,
+            runner: runner,
+            store: store
+        )
+
+        await controller.loadHistory()
+        controller.startFullSuite()
+        try await waitUntil { await runner.suspended }
+        let activeMeasurements = controller.measurements
+        let activeSelection = controller.selectedRunID
+
+        await controller.loadHistory()
+
+        #expect(controller.measurements == activeMeasurements)
+        #expect(controller.selectedRunID == activeSelection)
+        #expect(controller.completedRun == saved)
+        controller.cancel()
+        try await waitUntil { !controller.isRunning }
+    }
+
+    @Test("reopening history loading preserves a separately retained unsaved presentation")
+    func repeatedHistoryLoadPreservesUnsavedPresentation() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fault = ControllerStoreCommitFault()
+        let store = BenchmarkStore(directory: directory, beforeCommit: fault.check)
+        let saved = benchmarkRun(startedAt: Date(timeIntervalSince1970: 1_000))
+        try await store.saveRun(saved)
+        let daemon = FakeDaemon(connected: false)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: FakeBenchmarkRunner(recorder: daemon),
+            store: store
+        )
+        await controller.loadHistory()
+        fault.failNextCommit(to: "index.json")
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+        let unsaved = try #require(controller.unsavedRun)
+
+        await controller.loadHistory()
+
+        #expect(controller.unsavedRun == unsaved)
+        #expect(controller.selectedRunID == unsaved.id)
+        #expect(controller.selectedRun == unsaved)
+        #expect(controller.history == [saved])
+    }
+
+    @Test("selecting saved history retains an addressable retryable unsaved run")
+    func selectingHistoryRetainsUnsavedRun() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fault = ControllerStoreCommitFault()
+        let store = BenchmarkStore(directory: directory, beforeCommit: fault.check)
+        let saved = benchmarkRun(startedAt: Date(timeIntervalSince1970: 1_000))
+        try await store.saveRun(saved)
+        let daemon = FakeDaemon(connected: false)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: FakeBenchmarkRunner(recorder: daemon),
+            store: store
+        )
+        await controller.loadHistory()
+        fault.failNextCommit(to: "index.json")
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+        let unsaved = try #require(controller.unsavedRun)
+
+        controller.selectRun(saved.id)
+        #expect(controller.selectedRun == saved)
+        #expect(controller.unsavedRun == unsaved)
+        #expect(controller.canRetrySave)
+
+        controller.selectRun(unsaved.id)
+        #expect(controller.selectedRun == unsaved)
+        await controller.retrySave()
+
+        #expect(controller.unsavedRun == nil)
+        #expect(controller.history.contains(where: { $0.id == unsaved.id }))
+        #expect(controller.selectedRunID == unsaved.id)
+        #expect(controller.saveError == nil)
+    }
+
+    @Test("isolates corrupt history files while exposing their load errors")
+    func exposesHistoryFileErrors() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = BenchmarkStore(directory: directory)
+        let run = benchmarkRun()
+        try await store.saveRun(run)
+        try Data("not json".utf8).write(to: directory.appending(path: "corrupt.json"))
+        let daemon = FakeDaemon(connected: false)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: FakeBenchmarkRunner(),
+            store: store
+        )
+
+        await controller.loadHistory()
+
+        #expect(controller.history == [run])
+        #expect(controller.historyLoadErrors == [BenchmarkStoreLoadError(
+            fileName: "corrupt.json",
+            reason: .corrupt
+        )])
+        #expect(controller.loadError == nil)
+    }
+
+    @Test("skipped and absent IDs cannot rerun and explain why")
+    func skippedAndAbsentIDsCannotRerun() async throws {
+        let daemon = FakeDaemon(connected: false)
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner
+        )
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+        let skipped = BenchmarkTestID(
+            route: .tunnel,
+            direction: .upload,
+            addressFamily: .ipv6
+        )
+        let absent = BenchmarkTestID(
+            route: .physical(pathID: "missing"),
+            direction: .upload,
+            addressFamily: .ipv4
+        )
+
+        #expect(controller.canRerun(skipped) == false)
+        #expect(controller.rerunDisabledReason(skipped) == "This measurement was skipped because the captured suite has no tunnel IPv6 target.")
+        #expect(controller.canRerun(absent) == false)
+        #expect(controller.rerunDisabledReason(absent) == "This measurement is not part of the captured benchmark suite.")
+        let priorInvocationIDs = await runner.invocationIDs
+
+        controller.rerun(skipped)
+        controller.rerun(absent)
+        await Task.yield()
+
+        #expect(controller.isRunning == false)
+        #expect(await runner.invocationIDs == priorInvocationIDs)
+    }
+
+    @Test("controller shutdown cancels, joins restoration, and reaps the runner")
+    func shutdownCancelsJoinsRestorationAndReapsRunner() async throws {
+        let daemon = FakeDaemon(
+            connected: false,
+            suspendOnRequest: .disconnect
+        )
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let tunnel = testTunnel(client: daemon)
+        let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
+
+        controller.startFullSuite()
+        try await waitUntil { await daemon.waitingRequest == .disconnect }
+        let shutdown = Task { await controller.shutdown() }
+        await Task.yield()
+
+        #expect(controller.isRunning)
+        #expect(await runner.cancelAllCount == 1)
+        await daemon.resumeSuspendedRequest()
+        await shutdown.value
+
+        #expect(controller.isRunning == false)
+        #expect(controller.state == .cancelled)
+        #expect(await daemon.connected == false)
+        #expect(tunnel.benchmarkOwnsLifecycle == false)
+        #expect(await runner.cancelAllCount >= 2)
+    }
+
+    @Test("termination coordinator waits for shutdown before requesting termination")
+    func terminationCoordinatorWaitsForShutdown() async {
+        let shutdown = FakeApplicationShutdown()
+        let coordinator = ApplicationTerminationCoordinator(shutdown: shutdown.perform)
+
+        let reply = coordinator.requestTermination()
+        #expect(reply == .terminateLater)
+        await Task.yield()
+        #expect(coordinator.isWaiting)
+        #expect(coordinator.shouldReplyToApplication == false)
+
+        await shutdown.finish()
+        await coordinator.waitForDecision()
+
+        #expect(coordinator.shouldReplyToApplication)
+        #expect(coordinator.isWaiting == false)
+    }
+
+    @Test("termination coordinator handles shutdown finishing before the decision waiter attaches")
+    func terminationCoordinatorHandlesImmediateShutdown() async {
+        let coordinator = ApplicationTerminationCoordinator(shutdown: {})
+
+        let reply = coordinator.requestTermination()
+        #expect(reply == .terminateLater)
+        await Task.yield()
+        await coordinator.waitForDecision()
+
+        #expect(coordinator.shouldReplyToApplication)
+        #expect(coordinator.isWaiting == false)
+    }
+
+    @Test("repeated termination requests share one shutdown and one decision")
+    func repeatedTerminationRequestsShareShutdown() async {
+        let shutdown = FakeApplicationShutdown()
+        let coordinator = ApplicationTerminationCoordinator(shutdown: shutdown.perform)
+
+        #expect(coordinator.requestTermination() == .terminateLater)
+        #expect(coordinator.requestTermination() == .terminateLater)
+        await Task.yield()
+        #expect(await shutdown.performCount == 1)
+
+        await shutdown.finish()
+        await coordinator.waitForDecision()
+
+        #expect(coordinator.shouldReplyToApplication)
+        #expect(coordinator.requestTermination() == .terminateNow)
+    }
+
+    @Test("app delegate creates one waiter and one reply for repeated termination requests")
+    func appDelegateSharesTerminationWaiter() async throws {
+        let shutdown = FakeApplicationShutdown()
+        let coordinator = ApplicationTerminationCoordinator(shutdown: shutdown.perform)
+        let delegate = MultipassApplicationDelegate(terminationCoordinator: coordinator)
+        let replies = TerminationReplyRecorder()
+
+        let first = delegate.requestTermination { replies.record() }
+        let second = delegate.requestTermination { replies.record() }
+
+        #expect(first == .terminateLater)
+        #expect(second == .terminateLater)
+        await Task.yield()
+        #expect(replies.count == 0)
+        #expect(await shutdown.performCount == 1)
+
+        await shutdown.finish()
+        try await waitUntil { replies.count == 1 }
+
+        let completed = delegate.requestTermination { replies.record() }
+        #expect(completed == .terminateNow)
+        await Task.yield()
+        #expect(replies.count == 1)
+    }
+
+    @Test("termination waits beyond the former fallback until shutdown completes")
+    func terminationWaitsBeyondFormerFallback() async throws {
+        let shutdown = FakeApplicationShutdown()
+        let coordinator = ApplicationTerminationCoordinator(shutdown: shutdown.perform)
+
+        #expect(coordinator.requestTermination() == .terminateLater)
+        try await Task.sleep(for: .milliseconds(20))
+
+        #expect(coordinator.isWaiting)
+        #expect(coordinator.shouldReplyToApplication == false)
+
+        await shutdown.finish()
+        await coordinator.waitForDecision()
+
+        #expect(coordinator.shouldReplyToApplication)
+        #expect(coordinator.isWaiting == false)
+    }
+
+    @Test("persists a completed suite and selects it in history")
+    func persistsCompletedSuite() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = BenchmarkStore(directory: directory)
+        let daemon = FakeDaemon(connected: false)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: FakeBenchmarkRunner(recorder: daemon),
+            store: store
+        )
+        await controller.loadHistory()
+
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+
+        let completed = try #require(controller.completedRun)
+        let persisted = try #require(try await store.loadRuns().runs.first)
+        #expect(persisted.id == completed.id)
+        #expect(persisted.identities == completed.identities)
+        #expect(persisted.topology == completed.topology)
+        #expect(persisted.parameters == completed.parameters)
+        #expect(persisted.initiallyConnected == completed.initiallyConnected)
+        #expect(persisted.results == completed.results)
+        #expect(persisted.restorationError == completed.restorationError)
+        #expect(controller.history == [completed])
+        #expect(controller.selectedRunID == completed.id)
+        #expect(controller.saveError == nil)
+    }
+
+    @Test("a save failure keeps the completed result visible but out of history")
+    func saveFailureKeepsCompletedResultVisible() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fault = ControllerStoreCommitFault()
+        let store = BenchmarkStore(directory: directory, beforeCommit: fault.check)
+        let daemon = FakeDaemon(connected: false)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: FakeBenchmarkRunner(recorder: daemon),
+            store: store
+        )
+        await controller.loadHistory()
+        fault.failNextCommit(to: "index.json")
+
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+
+        let completed = try #require(controller.completedRun)
+        #expect(controller.state == .completed)
+        #expect(controller.selectedRun == completed)
+        #expect(controller.history.isEmpty)
+        #expect(controller.saveError?.contains("Failed to save benchmark") == true)
+        #expect(try await store.loadRuns().runs.isEmpty)
+
+        await controller.retrySave()
+
+        #expect(controller.history == [completed])
+        #expect(controller.saveError == nil)
+        #expect(controller.canRetrySave == false)
+        #expect(try await store.loadRuns().runs.first?.id == completed.id)
+    }
+
+    @Test("an unsaved result blocks a new suite until Retry Save succeeds")
+    func unsavedResultBlocksNewSuite() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fault = ControllerStoreCommitFault()
+        let store = BenchmarkStore(directory: directory, beforeCommit: fault.check)
+        let daemon = FakeDaemon(connected: false)
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner,
+            store: store
+        )
+        await controller.loadHistory()
+        fault.failNextCommit(to: "index.json")
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+        let unsaved = try #require(controller.unsavedRun)
+        let invocationCount = await runner.invocationIDs.count
+
+        #expect(controller.canRunFullSuite == false)
+        #expect(controller.runDisabledReason == "Retry Save before starting another benchmark so this unsaved result is not lost.")
+
+        controller.startFullSuite()
+        await Task.yield()
+
+        #expect(controller.isRunning == false)
+        #expect(controller.unsavedRun == unsaved)
+        #expect(await runner.invocationIDs.count == invocationCount)
+
+        await controller.retrySave()
+        #expect(controller.canRunFullSuite)
+    }
+
+    @Test("a rerun publishes its replacement only after atomic persistence succeeds")
+    func rerunPublishesOnlyAfterPersistence() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fault = ControllerStoreCommitFault()
+        let store = BenchmarkStore(directory: directory, beforeCommit: fault.check)
+        let daemon = FakeDaemon(connected: true)
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner,
+            store: store
+        )
+        await controller.loadHistory()
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+        let selected = rawInvocations[0].id
+        let original = try #require(controller.completedRun?.results[selected]?.measurement)
+        let replacement = measurement(for: selected, bitsPerSecond: 999)
+        await runner.setResponse(.succeed(replacement), for: selected)
+        fault.failNextCommit(to: "index.json")
+
+        controller.rerun(selected)
+        try await waitUntil { !controller.isRunning }
+
+        #expect(controller.completedRun?.results[selected]?.measurement == original)
+        #expect(controller.history.first?.results[selected]?.measurement == original)
+        #expect(try await store.loadRuns().runs.first?.results[selected]?.measurement == original)
+        #expect(controller.saveError?.contains("Failed to save benchmark") == true)
+
+        controller.rerun(selected)
+        try await waitUntil { !controller.isRunning }
+
+        #expect(controller.completedRun?.results[selected]?.measurement == replacement)
+        #expect(controller.history.first?.results[selected]?.measurement == replacement)
+        #expect(try await store.loadRuns().runs.first?.results[selected]?.measurement == replacement)
+        #expect(controller.saveError == nil)
+    }
+
+    @Test("renaming through the controller persists a normalized human label")
+    func renamePersistsNormalizedLabel() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = BenchmarkStore(directory: directory)
+        let run = benchmarkRun(userLabel: nil)
+        try await store.saveRun(run)
+        let daemon = FakeDaemon(connected: false)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: FakeBenchmarkRunner(),
+            store: store
+        )
+        await controller.loadHistory()
+
+        await controller.renameRun(run.id, userLabel: "  Office regression  ")
+
+        #expect(controller.history.first?.userLabel == "Office regression")
+        #expect(controller.selectedRun?.userLabel == "Office regression")
+        #expect(try await store.loadRuns().runs.first?.userLabel == "Office regression")
+        #expect(controller.saveError == nil)
+    }
+
+    @Test("baseline changes persist through the controller")
+    func baselineChangesPersist() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = BenchmarkStore(directory: directory)
+        let run = benchmarkRun()
+        try await store.saveRun(run)
+        let daemon = FakeDaemon(connected: false)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: FakeBenchmarkRunner(),
+            store: store
+        )
+        await controller.loadHistory()
+
+        await controller.setBaseline(run.id)
+
+        #expect(controller.baselineRunID == run.id)
+        #expect(try await store.loadIndex().selectedBaselineID == run.id)
+
+        await controller.setBaseline(nil)
+
+        #expect(controller.baselineRunID == nil)
+        #expect(try await store.loadIndex().selectedBaselineID == nil)
+    }
+
+    @Test("running progress exposes current and remaining planned measurements")
+    func runningProgressTracksPlan() async throws {
+        let daemon = FakeDaemon(connected: false)
+        let runner = FakeBenchmarkRunner(suspendOn: rawInvocations[0].id, recorder: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner
+        )
+
+        controller.startFullSuite()
+        try await waitUntil { await runner.suspended }
+
+        #expect(controller.totalMeasurementCount == allInvocations.count)
+        #expect(controller.completedMeasurementCount == 0)
+        #expect(controller.currentMeasurementID == rawInvocations[0].id)
+        #expect(controller.remainingMeasurementIDs == Array(allInvocations.dropFirst()).map(\.id))
+        #expect(controller.currentLiveSamples == [100])
+
+        controller.cancel()
+        try await waitUntil { !controller.isRunning }
+    }
+
+    @Test("live samples retain only the bounded measured interval window")
+    func liveSamplesStayBounded() async throws {
+        let daemon = FakeDaemon(connected: true)
+        let runner = FakeBenchmarkRunner(
+            samples: (1 ... 15).map(Double.init),
+            recorder: daemon
+        )
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner
+        )
+
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+
+        #expect(controller.liveSamples[rawInvocations[0].id] == (6 ... 15).map(Double.init))
+        #expect(controller.liveSamples.values.allSatisfy { $0.count <= 10 })
+    }
+
     @Test("initially disconnected runs raw, connects, runs tunnel, then disconnects")
     func disconnectedFullSuiteRestoresDisconnected() async throws {
         let daemon = FakeDaemon(connected: false)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(
             daemon: daemon,
             tunnel: tunnel,
@@ -41,11 +726,11 @@ struct BenchmarkControllerTests {
             direction: .download,
             addressFamily: .ipv6
         )
-        #expect(controller.completedRun?.results[skippedIPv6Upload] == .failed(
-            "skipped: tunnel IPv6 target unavailable"
+        #expect(controller.completedRun?.results[skippedIPv6Upload] == .skipped(
+            "tunnel IPv6 target unavailable"
         ))
-        #expect(controller.completedRun?.results[skippedIPv6Download] == .failed(
-            "skipped: tunnel IPv6 target unavailable"
+        #expect(controller.completedRun?.results[skippedIPv6Download] == .skipped(
+            "tunnel IPv6 target unavailable"
         ))
         #expect(await runner.invocationIDs == allInvocations.map(\.id))
         #expect(await daemon.events == [
@@ -94,7 +779,7 @@ struct BenchmarkControllerTests {
         ).invocations
         let daemon = FakeDaemon(connected: false, topology: topology)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
         let skippedIPv4Upload = BenchmarkTestID(
             route: .tunnel,
@@ -113,11 +798,11 @@ struct BenchmarkControllerTests {
         let invocationIDs = await runner.invocationIDs
         #expect(controller.state == .completed)
         #expect(controller.completedRun?.results.count == plannedInvocations.count + 2)
-        #expect(controller.completedRun?.results[skippedIPv4Upload] == .failed(
-            "skipped: tunnel IPv4 target unavailable"
+        #expect(controller.completedRun?.results[skippedIPv4Upload] == .skipped(
+            "tunnel IPv4 target unavailable"
         ))
-        #expect(controller.completedRun?.results[skippedIPv4Download] == .failed(
-            "skipped: tunnel IPv4 target unavailable"
+        #expect(controller.completedRun?.results[skippedIPv4Download] == .skipped(
+            "tunnel IPv4 target unavailable"
         ))
         #expect(invocationIDs == plannedInvocations.map(\.id))
         #expect(invocationIDs.contains(skippedIPv4Upload) == false)
@@ -128,7 +813,7 @@ struct BenchmarkControllerTests {
     @Test("tunnel transitions wait through stale status until daemon convergence")
     func transitionWaitsForObservedConvergence() async throws {
         let daemon = FakeDaemon(connected: false, staleStatusRepliesAfterCommand: 1)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let owner = UUID()
         try await tunnel.acquireBenchmarkOwnership(owner)
 
@@ -158,7 +843,7 @@ struct BenchmarkControllerTests {
             rejectConcurrentRequestsWhileSuspended: true
         )
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         tunnel.toggle()
@@ -177,7 +862,7 @@ struct BenchmarkControllerTests {
     @Test("benchmark ownership drains menu transitions admitted while acquisition waits")
     func benchmarkDrainsSecondAdmittedMenuTransition() async throws {
         let daemon = FakeDaemon(connected: false, suspendOnRequest: .connect)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let owner = UUID()
 
         let first = Task {
@@ -212,7 +897,7 @@ struct BenchmarkControllerTests {
     func connectedFullSuiteStaysConnected() async throws {
         let daemon = FakeDaemon(connected: true)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -231,7 +916,7 @@ struct BenchmarkControllerTests {
             failures: [rawInvocations[0].id: TestFailure.measurement],
             recorder: daemon
         )
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -249,7 +934,7 @@ struct BenchmarkControllerTests {
     func connectFailureFailsTunnelGroupAndRestores() async throws {
         let daemon = FakeDaemon(connected: false, connectError: TestFailure.connect)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -271,7 +956,7 @@ struct BenchmarkControllerTests {
             suspendOn: tunnelInvocations[0].id,
             recorder: daemon
         )
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -291,7 +976,7 @@ struct BenchmarkControllerTests {
         let daemon = FakeDaemon(connected: false)
         let finalInvocation = try #require(tunnelInvocations.last)
         let runner = FakeBenchmarkRunner(suspendOn: finalInvocation.id, recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -308,7 +993,7 @@ struct BenchmarkControllerTests {
     func cancellationDuringConnectRestoresAndStaysCancelled() async throws {
         let daemon = FakeDaemon(connected: false, suspendOnRequest: .connect)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -326,7 +1011,7 @@ struct BenchmarkControllerTests {
     func cancellationDuringRestorationCompletesThenCancels() async throws {
         let daemon = FakeDaemon(connected: false, suspendOnRequest: .disconnect)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -348,7 +1033,7 @@ struct BenchmarkControllerTests {
             suspendOnRequest: .disconnect
         )
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -366,7 +1051,7 @@ struct BenchmarkControllerTests {
     func cancelledSecondSuitePreservesCompletedRun() async throws {
         let daemon = FakeDaemon(connected: false)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -387,7 +1072,7 @@ struct BenchmarkControllerTests {
     func failedSecondSuitePreservesCompletedRun() async throws {
         let daemon = FakeDaemon(connected: false)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -415,14 +1100,14 @@ struct BenchmarkControllerTests {
     func restorationFailureIsDistinct() async throws {
         let daemon = FakeDaemon(connected: false, disconnectError: DaemonError.unavailable)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
         try await waitUntil { !controller.isRunning }
 
         #expect(controller.state == .completed)
-        #expect(controller.completedRun?.results.values.filter { !$0.isFailure }
+        #expect(controller.completedRun?.results.values.filter { !$0.isFailure && !$0.isSkipped }
             .allSatisfy { $0.measurement != nil } == true)
         #expect(controller.completedRun?.restorationError?.contains("restore") == true)
         #expect(controller.lastError == nil)
@@ -435,7 +1120,7 @@ struct BenchmarkControllerTests {
             suspendOn: rawInvocations[0].id,
             recorder: daemon
         )
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -457,7 +1142,7 @@ struct BenchmarkControllerTests {
     func cancelledSecondSuiteRestoresPriorLiveState() async throws {
         let daemon = FakeDaemon(connected: false)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -479,7 +1164,7 @@ struct BenchmarkControllerTests {
     func failedSecondSuiteRestoresPriorLiveState() async throws {
         let daemon = FakeDaemon(connected: false)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -511,7 +1196,7 @@ struct BenchmarkControllerTests {
     func rerunResetsSelectedLiveSamples() async throws {
         let daemon = FakeDaemon(connected: true)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -533,7 +1218,7 @@ struct BenchmarkControllerTests {
         let daemon = FakeDaemon(connected: true)
         let replacement = measurement(for: rawInvocations[0].id, bitsPerSecond: 999)
         let runner = FakeBenchmarkRunner(recorder: daemon)
-        let tunnel = TunnelController(client: daemon)
+        let tunnel = testTunnel(client: daemon)
         let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
 
         controller.startFullSuite()
@@ -656,6 +1341,85 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
         requestToSuspend = request
     }
 }
+@MainActor
+private func testTunnel(client: any DaemonRequesting) -> TunnelController {
+    TunnelController(client: client, initialDaemonAvailability: .available)
+}
+
+private final class FakeVersionProcess: IperfVersionProcess, @unchecked Sendable {
+    private let lock = NSLock()
+    private let output: Data
+    private let finishesAfterRun: Bool
+    private var running = false
+    private var _runCount = 0
+    private var _terminateCount = 0
+    private var _forceKillCount = 0
+    private var _waitCount = 0
+
+    init(output: Data = Data(), finishesAfterRun: Bool = false) {
+        self.output = output
+        self.finishesAfterRun = finishesAfterRun
+    }
+
+    var runCount: Int { lock.withLock { _runCount } }
+    var terminateCount: Int { lock.withLock { _terminateCount } }
+    var forceKillCount: Int { lock.withLock { _forceKillCount } }
+    var waitCount: Int { lock.withLock { _waitCount } }
+    var isRunning: Bool { lock.withLock { running } }
+
+    func run(executableURL: URL, arguments: [String]) throws {
+        lock.withLock {
+            _runCount += 1
+            running = !finishesAfterRun
+        }
+    }
+
+    func terminate() {
+        lock.withLock {
+            _terminateCount += 1
+        }
+    }
+
+    func forceKill() {
+        lock.withLock {
+            _forceKillCount += 1
+            running = false
+        }
+    }
+
+    func waitUntilExit() {
+        lock.withLock {
+            _waitCount += 1
+        }
+    }
+
+    func collectedOutput() -> Data { output }
+}
+
+private actor FakeApplicationShutdown {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var performCount = 0
+
+    func perform() async {
+        performCount += 1
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func finish() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+@MainActor
+private final class TerminationReplyRecorder {
+    private(set) var count = 0
+
+    func record() {
+        count += 1
+    }
+}
+
 
 private actor FakeBenchmarkRunner: BenchmarkRunning {
     enum Response: Sendable {
@@ -669,13 +1433,16 @@ private actor FakeBenchmarkRunner: BenchmarkRunning {
     private(set) var suspended = false
     private var responses: [BenchmarkTestID: Response]
     private var continuation: CheckedContinuation<Void, Never>?
+    private let samples: [Double]
     private let recorder: (any BenchmarkEventRecording)?
 
     init(
         failures: [BenchmarkTestID: any Error & Sendable] = [:],
         suspendOn: BenchmarkTestID? = nil,
+        samples: [Double] = [100],
         recorder: (any BenchmarkEventRecording)? = nil
     ) {
+        self.samples = samples
         self.recorder = recorder
         var responses: [BenchmarkTestID: Response] = failures.mapValues(Response.fail)
         if let suspendOn {
@@ -691,7 +1458,9 @@ private actor FakeBenchmarkRunner: BenchmarkRunning {
         let id = invocation.id
         invocationIDs.append(id)
         await recorder?.recordRun(id)
-        await onSample(100)
+        for sample in samples {
+            await onSample(sample)
+        }
         switch responses[id] ?? .succeed(measurement(for: id)) {
         case .succeed(let measurement):
             return measurement
@@ -810,4 +1579,29 @@ private func waitUntil(
 
 private enum TestWaitError: Error {
     case timeout
+}
+
+
+private final class ControllerStoreCommitFault: @unchecked Sendable {
+    private var fileNameToFail: String?
+
+    func failNextCommit(to fileName: String) {
+        fileNameToFail = fileName
+    }
+
+    func check(_ destination: URL) throws {
+        if fileNameToFail == destination.lastPathComponent {
+            fileNameToFail = nil
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+}
+
+private func temporaryControllerStoreDirectory() throws -> URL {
+    let directory = FileManager.default.temporaryDirectory.appending(
+        path: "multipass-benchmark-controller-tests-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
 }

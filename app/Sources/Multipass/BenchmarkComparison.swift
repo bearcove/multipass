@@ -163,6 +163,59 @@ nonisolated enum BenchmarkFormatting {
         let sign = value < 0 ? "−" : "+"
         return sign + fixed(abs(value), places: 1) + "%"
     }
+    static func unsignedInteger(_ value: UInt64?) -> String {
+        value.map(String.init) ?? "—"
+    }
+
+    static func duration(_ startedAt: Date, _ completedAt: Date) -> String {
+        fixed(max(0, completedAt.timeIntervalSince(startedAt)), places: 1) + " s"
+    }
+
+    static func listenerRange(base: UInt16, count: UInt16) -> String {
+        let end = UInt32(base) + UInt32(count) - 1
+        return "\(base)–\(end)"
+    }
+
+    static func delta(_ comparison: BenchmarkResultComparison?) -> String {
+        switch comparison {
+        case .comparable(let delta):
+            "\(signedGbitsPerSecond(delta.absoluteBitsPerSecond)) (\(signedPercentage(delta.percentage)))"
+        case .aggregatePathSetMismatch(let current, let baseline):
+            "Path set differs (current: \(current.joined(separator: ", ")); baseline: \(baseline.joined(separator: ", ")))"
+        case .incompatibleRun:
+            "Incompatible baseline"
+        case .unavailable, nil:
+            "—"
+        }
+    }
+
+    static func resultStatus(_ result: BenchmarkResult?) -> String {
+        guard let result else { return "Not run" }
+        switch result {
+        case .measured(let measurement):
+            guard let final = measurement.result else { return "Failed: missing final result" }
+            return gbitsPerSecond(final.bitsPerSecond)
+        case .skipped(let reason):
+            return "Skipped: \(reason)"
+        case .failed(let message):
+            return "Failed: \(message)"
+        }
+    }
+
+    static func routeLabel(for id: BenchmarkTestID, topology: BenchmarkTopology?) -> String {
+        switch id.route {
+        case .physical(let pathID):
+            return topology?.paths.first(where: { $0.id == pathID })?.displayName ?? pathID
+        case .physicalAggregate:
+            return "Raw Aggregate"
+        case .tunnel:
+            return "Tunnel \(id.addressFamily == .ipv4 ? "IPv4" : "IPv6")"
+        }
+    }
+
+    static func directionLabel(_ direction: BenchmarkDirection) -> String {
+        direction == .upload ? "Upload" : "Download"
+    }
     static func iso8601(_ date: Date) -> String {
         ISO8601DateFormatter.string(from: date, timeZone: reportTimeZone, formatOptions: [.withInternetDateTime])
     }

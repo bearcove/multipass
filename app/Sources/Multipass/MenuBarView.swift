@@ -5,6 +5,9 @@ import SwiftUI
 /// view is a pure projection of the daemon's status replies.
 struct MenuBarView: View {
     @Bindable var controller: TunnelController
+    @Bindable var benchmarkController: BenchmarkController
+    let requestQuit: () -> Void
+    @Environment(\.openWindow) private var openWindow
     @State private var launchAtLogin = LaunchAtLogin.status == .enabled
 
     var body: some View {
@@ -16,12 +19,12 @@ struct MenuBarView: View {
                 statusBody
             }
             toggleButton
+            benchmarkButton
             Divider()
             footer
         }
         .padding(16)
         .frame(width: 292)
-        .onAppear { controller.start() }
     }
 
     // MARK: - Header
@@ -218,7 +221,35 @@ struct MenuBarView: View {
         .tint(controller.state.isConnected ? .red : .accentColor)
         .disabled(!controller.canToggle)
         .keyboardShortcut("d")
+        .help(toggleHelp)
+        .accessibilityHint(toggleHelp)
     }
+
+    private var toggleHelp: String {
+        if controller.benchmarkOwnsLifecycle {
+            return "A benchmark is running and controls the tunnel until restoration completes."
+        }
+        if controller.state == .daemonUnavailable {
+            return "multipassd is unavailable."
+        }
+        if controller.state == .transitioning {
+            return "The tunnel is changing state."
+        }
+        return controller.state.isConnected ? "Disconnect the Multipass tunnel." : "Connect the Multipass tunnel."
+    }
+
+    private var benchmarkButton: some View {
+        Button {
+            openWindow(id: MultipassApp.benchmarkWindowID)
+        } label: {
+            Label("Benchmark…", systemImage: "speedometer")
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut("b", modifiers: [.command, .shift])
+        .help("Open the benchmark window. Saved history remains available when the daemon is offline.")
+    }
+
 
     // MARK: - Footer
 
@@ -240,15 +271,19 @@ struct MenuBarView: View {
                     }
                 }
             Spacer()
-            Button("Quit") {
-                NSApplication.shared.terminate(nil)
-            }
+            Button("Quit", action: requestQuit)
             .keyboardShortcut("q")
         }
     }
 }
 
 #Preview("Connected") {
-    let controller = TunnelController()
-    MenuBarView(controller: controller)
+    let daemon = DaemonClient()
+    let controller = TunnelController(client: daemon)
+    let benchmark = BenchmarkController(daemon: daemon, tunnel: controller, runner: nil)
+    MenuBarView(
+        controller: controller,
+        benchmarkController: benchmark,
+        requestQuit: { NSApplication.shared.terminate(nil) }
+    )
 }

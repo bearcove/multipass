@@ -75,8 +75,8 @@ struct BenchmarkReportTests {
                     bitsPerSecond: 2_100_000_000,
                     retransmits: 2
                 )),
-                tunnelIPv6UploadID: .failed("skipped: tunnel IPv6 target unavailable"),
-                tunnelIPv6DownloadID: .failed("skipped: tunnel IPv6 target unavailable"),
+                tunnelIPv6UploadID: .skipped("tunnel IPv6 target unavailable"),
+                tunnelIPv6DownloadID: .skipped("tunnel IPv6 target unavailable"),
             ],
             restorationError: "Failed to restore the initial tunnel state: multipassd did not answer in time"
         )

@@ -53,6 +53,29 @@ struct BenchmarkStoreTests {
         #expect(try await firstStore.loadIndex().selectedBaselineID == nil)
     }
 
+    @Test("expected skips do not mark the history index entry as an error")
+    func skippedResultsAreNotIndexedAsErrors() async throws {
+        let directory = try temporaryBenchmarkDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = BenchmarkStore(directory: directory)
+        let skippedID = BenchmarkTestID(
+            route: .tunnel,
+            direction: .upload,
+            addressFamily: .ipv6
+        )
+        var run = benchmarkRun()
+        run.results[skippedID] = .skipped("tunnel IPv6 target unavailable")
+
+        try await store.saveRun(run)
+
+        let entry = try #require(try await store.loadIndex().entries.first)
+        #expect(entry.id == run.id)
+        #expect(entry.hasErrors == false)
+        #expect(run.hasErrors == false)
+        #expect(run.results[skippedID]?.isSkipped == true)
+        #expect(run.results[skippedID]?.isFailure == false)
+    }
+
     @Test("isolates corrupt run files while loading valid history")
     func isolatesCorruptRunFiles() async throws {
         let directory = try temporaryBenchmarkDirectory()

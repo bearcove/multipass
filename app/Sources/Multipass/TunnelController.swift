@@ -1,6 +1,12 @@
 import Foundation
 
 /// What the UI knows about the tunnel right now.
+nonisolated enum DaemonAvailability: Sendable, Equatable {
+    case unknown
+    case available
+    case unavailable
+}
+
 enum TunnelState: Equatable {
     /// The daemon socket is unreachable — nothing else is meaningful.
     case daemonUnavailable
@@ -49,6 +55,7 @@ extension TunnelTransitionError: LocalizedError {
 @MainActor
 final class TunnelController {
     private(set) var state: TunnelState = .disconnected
+    private(set) var daemonAvailability: DaemonAvailability = .unknown
     private(set) var wiredLive = false
     private(set) var wifiLive = false
     private(set) var activePath: ActivePath?
@@ -66,7 +73,7 @@ final class TunnelController {
 
     var benchmarkOwnsLifecycle: Bool { benchmarkOwner != nil }
     var canToggle: Bool {
-        benchmarkOwner == nil && state != .daemonUnavailable && state != .transitioning
+        benchmarkOwner == nil && daemonAvailability == .available && state != .transitioning
     }
 
     private let client: any DaemonRequesting
@@ -74,8 +81,12 @@ final class TunnelController {
     private var transition: (id: UUID, task: Task<Void, Error>)?
     private var previousSample: (tx: UInt64, rx: UInt64, at: ContinuousClock.Instant)?
 
-    init(client: any DaemonRequesting = DaemonClient()) {
+    init(
+        client: any DaemonRequesting = DaemonClient(),
+        initialDaemonAvailability: DaemonAvailability = .unknown
+    ) {
         self.client = client
+        daemonAvailability = initialDaemonAvailability
     }
 
     func start() {
@@ -86,6 +97,12 @@ final class TunnelController {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+
+    func stop() async {
+        pollTask?.cancel()
+        await pollTask?.value
+        pollTask = nil
     }
 
     func toggle() {
@@ -132,6 +149,7 @@ final class TunnelController {
         }
         apply(snapshot)
         lastError = nil
+        daemonAvailability = .available
         return snapshot
     }
 
@@ -221,6 +239,7 @@ final class TunnelController {
             _ = try await observedStatus()
         } catch {
             state = .daemonUnavailable
+            daemonAvailability = .unavailable
             wiredLive = false
             wifiLive = false
             activePath = nil
@@ -248,6 +267,7 @@ final class TunnelController {
 
         let wasConnected = state.isConnected
         state = snapshot.connected ? .connected : .disconnected
+        daemonAvailability = .available
         wiredLive = snapshot.wired
         wifiLive = snapshot.wifi
         rttMs = snapshot.rttMs
