@@ -10,7 +10,7 @@ struct IperfStreamParserTests {
         let events = try fixtureLines(named: "iperf-upload").flatMap { parser.consume(line: $0) }
 
         let samples = events.compactMap { event -> Double? in
-            guard case .interval(_, _, let bitsPerSecond) = event else { return nil }
+            guard case .interval(_, let bitsPerSecond) = event else { return nil }
             return bitsPerSecond
         }
 
@@ -68,6 +68,51 @@ struct IperfStreamParserTests {
         #expect(completedResult(in: events) != nil)
     }
 
+    @Test("recognizable malformed measured intervals reserve their ordinal")
+    func malformedMeasuredIntervalReservesOrdinal() {
+        var parser = IperfStreamParser(direction: .upload)
+
+        let first = parser.consume(line: intervalLine(start: 0.15, end: 1.15, bitsPerSecond: 100))
+        let malformed = parser.consume(line: "{\"event\":\"interval\",\"data\":{\"sum\":{\"start\":1.15,\"end\":2.15,\"omitted\":false}}}")
+        let third = parser.consume(line: intervalLine(start: 2.15, end: 3.15, bitsPerSecond: 300))
+
+        #expect(first == [.interval(ordinal: 0, bitsPerSecond: 100)])
+        #expect(malformed.contains { if case .warning = $0 { true } else { false } })
+        #expect(third == [.interval(ordinal: 2, bitsPerSecond: 300)])
+    }
+
+    @Test("generic malformed lines do not consume measured ordinals")
+    func genericMalformedLineDoesNotConsumeOrdinal() {
+        var parser = IperfStreamParser(direction: .upload)
+
+        _ = parser.consume(line: "not-json")
+        let event = parser.consume(line: intervalLine(start: 7.2, end: 8.2, bitsPerSecond: 100))
+
+        #expect(event == [.interval(ordinal: 0, bitsPerSecond: 100)])
+    }
+
+    @Test("type-malformed measured throughput reserves its ordinal")
+    func typeMalformedMeasuredThroughputReservesOrdinal() {
+        var parser = IperfStreamParser(direction: .upload)
+
+        _ = parser.consume(line: intervalLine(start: 0, end: 1, bitsPerSecond: 100))
+        let malformed = parser.consume(line: "{\"event\":\"interval\",\"data\":{\"sum\":{\"start\":1,\"end\":2,\"bits_per_second\":\"bad\",\"omitted\":false}}}")
+        let third = parser.consume(line: intervalLine(start: 2, end: 3, bitsPerSecond: 300))
+
+        #expect(malformed.contains { if case .warning = $0 { true } else { false } })
+        #expect(third == [.interval(ordinal: 2, bitsPerSecond: 300)])
+    }
+
+    @Test("omitted intervals do not consume measured ordinals")
+    func omittedIntervalDoesNotConsumeOrdinal() {
+        var parser = IperfStreamParser(direction: .upload)
+
+        _ = parser.consume(line: "{\"event\":\"interval\",\"data\":{\"sum\":{\"start\":0,\"end\":1,\"bits_per_second\":100,\"omitted\":true}}}")
+        let measured = parser.consume(line: intervalLine(start: 1, end: 2, bitsPerSecond: 200))
+
+        #expect(measured == [.interval(ordinal: 0, bitsPerSecond: 200)])
+    }
+
     @Test("a malformed final line is a warning and leaves the stream incomplete")
     func malformedFinalLineDoesNotComplete() throws {
         var parser = IperfStreamParser(direction: .upload)
@@ -109,4 +154,9 @@ private func completedResult(in events: [IperfStreamEvent]) -> IperfFinalResult?
         guard case .completed(let result) = event else { return nil }
         return result
     }.last
+}
+
+
+private func intervalLine(start: Double, end: Double, bitsPerSecond: Double) -> String {
+    "{\"event\":\"interval\",\"data\":{\"sum\":{\"start\":\(start),\"end\":\(end),\"bits_per_second\":\(bitsPerSecond),\"omitted\":false}}}"
 }

@@ -18,7 +18,7 @@ nonisolated struct IperfFinalResult: Codable, Sendable, Equatable {
 }
 
 nonisolated enum IperfStreamEvent: Sendable, Equatable {
-    case interval(start: Double, end: Double, bitsPerSecond: Double)
+    case interval(ordinal: Int, bitsPerSecond: Double)
     case completed(IperfFinalResult)
     case warning(String)
 }
@@ -30,6 +30,7 @@ nonisolated enum IperfStreamParserError: Error, Sendable, Equatable {
 nonisolated struct IperfStreamParser: Sendable {
     private let direction: BenchmarkDirection
     private var finalResult: IperfFinalResult?
+    private var nextMeasuredIntervalOrdinal = 0
 
     init(direction: BenchmarkDirection) {
         self.direction = direction
@@ -53,13 +54,19 @@ nonisolated struct IperfStreamParser: Sendable {
             return []
         case "interval":
             do {
-                let envelope = try decoder.decode(IntervalEnvelope.self, from: data)
-                guard !envelope.data.sum.omitted else { return [] }
-                return [.interval(
-                    start: envelope.data.sum.start,
-                    end: envelope.data.sum.end,
-                    bitsPerSecond: envelope.data.sum.bitsPerSecond
-                )]
+                let classification = try decoder.decode(IntervalClassificationEnvelope.self, from: data)
+                guard !classification.data.sum.omitted else { return [] }
+                let ordinal = nextMeasuredIntervalOrdinal
+                nextMeasuredIntervalOrdinal += 1
+                do {
+                    let envelope = try decoder.decode(IntervalEnvelope.self, from: data)
+                    return [.interval(
+                        ordinal: ordinal,
+                        bitsPerSecond: envelope.data.sum.bitsPerSecond
+                    )]
+                } catch {
+                    return [.warning("malformed iperf interval line: \(line)")]
+                }
             } catch {
                 return [.warning("malformed iperf interval line: \(line)")]
             }
@@ -109,6 +116,18 @@ nonisolated struct IperfStreamParser: Sendable {
 
 private nonisolated struct EventNameEnvelope: Decodable, Sendable {
     let event: String
+}
+
+private nonisolated struct IntervalClassificationEnvelope: Decodable, Sendable {
+    let data: IntervalClassificationData
+}
+
+private nonisolated struct IntervalClassificationData: Decodable, Sendable {
+    let sum: IntervalClassificationSummary
+}
+
+private nonisolated struct IntervalClassificationSummary: Decodable, Sendable {
+    let omitted: Bool
 }
 
 private nonisolated struct IntervalEnvelope: Decodable, Sendable {

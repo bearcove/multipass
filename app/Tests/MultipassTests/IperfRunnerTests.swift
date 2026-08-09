@@ -308,6 +308,22 @@ struct IperfRunnerTests {
 
         #expect(await recorder.values == [300, 330])
     }
+
+    @Test("aggregate reserves a type-malformed measured interval ordinal")
+    func aggregateDoesNotShiftAfterTypeMalformedInterval() async throws {
+        let runner = IperfRunner(
+            executableURL: try fixtureExecutable(),
+            parameters: fastParameters,
+            environment: fixtureEnvironment(mode: "type-malformed-middle-aggregate")
+        )
+        let recorder = SampleRecorder()
+
+        _ = try await runner.run(invocation: aggregateInvocation()) { sample in
+            await recorder.record(sample)
+        }
+
+        #expect(await recorder.values == [300, 330])
+    }
 }
 
 private actor SampleRecorder {

@@ -126,7 +126,6 @@ actor IperfRunner {
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        let intervalSeconds = parameters.intervalSeconds
         process.executableURL = executableURL
         process.arguments = try arguments(for: invocation)
         process.environment = environment
@@ -137,7 +136,6 @@ actor IperfRunner {
             try await consumeStdout(
                 stdoutPipe.fileHandleForReading,
                 direction: id.direction,
-                intervalSeconds: intervalSeconds,
                 onSample: onSample
             )
         }
@@ -503,17 +501,10 @@ private nonisolated final class OutcomeRace: @unchecked Sendable {
     }
 }
 
-private nonisolated func intervalSlot(
-    start: Double,
-    intervalSeconds: Int
-) -> Int {
-    Int(start / Double(intervalSeconds) + 0.5)
-}
 
 private nonisolated func consumeStdout(
     _ handle: FileHandle,
     direction: BenchmarkDirection,
-    intervalSeconds: Int,
     onSample: @escaping @Sendable (Int, Double) async -> Void
 ) async throws -> StdoutResult {
     var parser = IperfStreamParser(direction: direction)
@@ -526,7 +517,6 @@ private nonisolated func consumeStdout(
                 await consumeLine(
                     String(decoding: pending, as: UTF8.self),
                     parser: &parser,
-                    intervalSeconds: intervalSeconds,
                     warnings: &warnings,
                     onSample: onSample
                 )
@@ -540,7 +530,6 @@ private nonisolated func consumeStdout(
         await consumeLine(
             String(decoding: pending, as: UTF8.self),
             parser: &parser,
-            intervalSeconds: intervalSeconds,
             warnings: &warnings,
             onSample: onSample
         )
@@ -551,17 +540,13 @@ private nonisolated func consumeStdout(
 private nonisolated func consumeLine(
     _ line: String,
     parser: inout IperfStreamParser,
-    intervalSeconds: Int,
     warnings: inout [String],
     onSample: @escaping @Sendable (Int, Double) async -> Void
 ) async {
     for event in parser.consume(line: line) {
         switch event {
-        case .interval(let start, _, let bitsPerSecond):
-            await onSample(
-                intervalSlot(start: start, intervalSeconds: intervalSeconds),
-                bitsPerSecond
-            )
+        case .interval(let ordinal, let bitsPerSecond):
+            await onSample(ordinal, bitsPerSecond)
         case .completed:
             break
         case .warning(let warning):

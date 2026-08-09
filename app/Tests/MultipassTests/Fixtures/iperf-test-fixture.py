@@ -78,19 +78,30 @@ elif mode == "large-stderr":
 elif mode == "skewed-aggregate":
     target = sys.argv[sys.argv.index("--client") + 1]
     if target.endswith(".1"):
-        emit(interval(100.0, 0.00008, 1.001))
-        emit(interval(110.0, 1.001, 2.002))
+        emit(interval(100.0, 0.15, 1.15))
+        emit(interval(110.0, 1.15, 2.15))
     else:
         time.sleep(0.1)
-        emit(interval(200.0, 0.00011, 0.9999))
+        emit(interval(200.0, 0.85, 1.85))
         time.sleep(0.1)
-        emit(interval(220.0, 0.9999, 2.0002))
+        emit(interval(220.0, 1.85, 2.85))
     emit(final_line())
 elif mode == "malformed-middle-aggregate":
     target = sys.argv[sys.argv.index("--client") + 1]
     if target.endswith(".1"):
         emit(interval(100.0, 0.0, 1.0))
         emit({"event": "interval", "data": {"sum": {"start": 1.0, "end": 2.0, "omitted": False}}})
+        emit(interval(110.0, 2.0, 3.0))
+    else:
+        emit(interval(200.0, 0.0, 1.0))
+        emit(interval(210.0, 1.0, 2.0))
+        emit(interval(220.0, 2.0, 3.0))
+    emit(final_line())
+elif mode == "type-malformed-middle-aggregate":
+    target = sys.argv[sys.argv.index("--client") + 1]
+    if target.endswith(".1"):
+        emit(interval(100.0, 0.0, 1.0))
+        emit({"event": "interval", "data": {"sum": {"start": 1.0, "end": 2.0, "bits_per_second": "bad", "omitted": False}}})
         emit(interval(110.0, 2.0, 3.0))
     else:
         emit(interval(200.0, 0.0, 1.0))
