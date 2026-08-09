@@ -40,6 +40,7 @@ connection, the client transparently reconnects and retries once.
 | `{"cmd":"status"}` | Query tunnel status. Always answered, connected or not. |
 | `{"cmd":"connect"}` | Bring the tunnel up (dial both underlays, configure utun). |
 | `{"cmd":"disconnect"}` | Tear the tunnel down (remove routes, close connections). |
+| `{"cmd":"benchmark_topology"}` | Query authoritative underlay paths, tunnel targets, and the reserved jax listener range. |
 
 Unknown `cmd` values MUST be answered with a `type:"error"` reply.
 
@@ -61,6 +62,20 @@ Unknown `cmd` values MUST be answered with a `type:"error"` reply.
 | `rtt_ms` | number \| null | Smoothed RTT of the active path in milliseconds. null when unknown/disconnected. |
 | `tx` | u64 | Cumulative tunnel payload bytes sent (into the tunnel) since the session started. MUST be monotonically non-decreasing across polls (the app derives rates from deltas); reset only on daemon restart / tunnel re-establishment. |
 | `rx` | u64 | Cumulative tunnel payload bytes received. Same monotonicity rule. |
+
+**Benchmark topology** — reply to `{"cmd":"benchmark_topology"}`:
+
+```json
+{"type":"benchmark_topology","protocol_version":1,"server_version":"unknown","underlay_target":"10.10.10.1","tunnel_ipv4_target":"10.10.99.1","tunnel_ipv6_target":"fd00:99::1","listener_base_port":5210,"listener_count":16,"paths":[{"id":"wired","display_name":"Wired","interface":"en17","source_address":"10.10.10.171"},{"id":"wifi","display_name":"Wi-Fi","interface":"en0","source_address":"10.10.10.169"}]}
+```
+
+`paths` is ordered and uses stable IDs; benchmark code MUST treat it as an
+array rather than fixed wired/Wi-Fi fields. `interface` and `source_address`
+are the exact values resolved by the daemon. Either tunnel target may be null
+when that family is unsupported. The half-open listener range is
+`listener_base_port ..< listener_base_port + listener_count`; simultaneous
+tests require at least one distinct listener per path. `protocol_version`
+versions this control contract independently from the QUIC wire protocol.
 
 **OK** — reply to successful connect/disconnect:
 

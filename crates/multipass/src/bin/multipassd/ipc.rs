@@ -1,6 +1,6 @@
 //! IPC for the menubar app: a SOCK_STREAM unix socket at
-//! `/var/run/multipassd.sock`. Newline-delimited JSON — one request line in,
-//! one response line out.
+//! `/var/run/multipassd.sock`. Newline-delimited JSON — one typed request in,
+//! one typed response out, serialized with facet-json.
 //!
 //! # Schema (agreed with the menubar app)
 //!
@@ -21,10 +21,11 @@
 //! ```
 //!
 //! `active_path` is the path currently winning thread-local dedup (the one
-//! the last inbound datagram arrived on) — the failover-flash signal.
-//! `rtt_ms` is the active path's smoothed RTT. `tx`/`rx` are cumulative
-//! tunnel bytes up/down. JSON is hand-rolled (no serde in this codebase).
+//! the last inbound datagram arrived on). `tx`/`rx` are cumulative tunnel
+//! bytes up/down.
 
+use facet::Facet;
+use multipass_proto::{TUNNEL_SERVER, TUNNEL_V6_SERVER};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -40,6 +41,59 @@ use crate::Shared;
 
 /// Socket path. The app bundles this; default is the well-known path.
 pub const DEFAULT_SOCKET: &str = "/var/run/multipassd.sock";
+
+#[derive(Debug, Facet)]
+#[repr(u8)]
+#[facet(rename_all = "snake_case")]
+enum Command {
+    Status,
+    Connect,
+    Disconnect,
+    BenchmarkTopology,
+}
+
+#[derive(Debug, Facet)]
+struct Request {
+    cmd: Command,
+}
+
+#[derive(Debug, Facet)]
+struct BenchmarkPath {
+    id: String,
+    display_name: String,
+    interface: String,
+    source_address: String,
+}
+
+#[allow(dead_code, reason = "fields are read reflectively by facet-json")]
+#[derive(Debug, Facet)]
+#[repr(u8)]
+#[facet(tag = "type", rename_all = "snake_case")]
+enum Reply {
+    Status {
+        connected: bool,
+        wired: bool,
+        wifi: bool,
+        active_path: Option<String>,
+        rtt_ms: Option<f64>,
+        tx: u64,
+        rx: u64,
+    },
+    BenchmarkTopology {
+        protocol_version: u32,
+        server_version: String,
+        underlay_target: String,
+        tunnel_ipv4_target: Option<String>,
+        tunnel_ipv6_target: Option<String>,
+        listener_base_port: u16,
+        listener_count: u16,
+        paths: Vec<BenchmarkPath>,
+    },
+    Ok,
+    Error {
+        message: String,
+    },
+}
 
 pub struct IpcServer {
     listener: UnixListener,
@@ -106,7 +160,7 @@ async fn handle_conn(stream: tokio::net::UnixStream, shared: Arc<Shared>) -> io:
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
-            break; // client hung up
+            break;
         }
         let line = line.trim();
         if line.is_empty() {
@@ -120,64 +174,79 @@ async fn handle_conn(stream: tokio::net::UnixStream, shared: Arc<Shared>) -> io:
     Ok(())
 }
 
-fn handle_request(line: &str, shared: &Arc<Shared>) -> String {
-    match extract_json_string(line, "cmd").as_deref() {
-        Some("status") => status_json(shared),
-        // connect/disconnect only flip `enabled`. The daemon's control loop
-        // owns dialing, the handshake, and route setup/teardown — doing them
-        // here (in the IPC handler) would race the loop and double-install
-        // routes. The status reply reflects `enabled` on the next poll.
-        Some("connect") => {
+fn handle_request(line: &str, shared: &Shared) -> String {
+    let reply = match facet_json::from_str::<Request>(line) {
+        Ok(Request {
+            cmd: Command::Status,
+        }) => status_reply(shared),
+        Ok(Request {
+            cmd: Command::Connect,
+        }) => {
             shared.enabled.store(true, Ordering::Relaxed);
-            "{\"type\":\"ok\"}".to_string()
+            Reply::Ok
         }
-        Some("disconnect") => {
+        Ok(Request {
+            cmd: Command::Disconnect,
+        }) => {
             shared.enabled.store(false, Ordering::Relaxed);
-            "{\"type\":\"ok\"}".to_string()
+            Reply::Ok
         }
-        _ => "{\"type\":\"error\",\"message\":\"unknown command\"}".to_string(),
-    }
+        Ok(Request {
+            cmd: Command::BenchmarkTopology,
+        }) => benchmark_topology_reply(shared),
+        Err(_) => Reply::Error {
+            message: "unknown command".into(),
+        },
+    };
+    facet_json::to_string(&reply).expect("IPC reply schema must serialize")
 }
 
-/// Build the `{"type":"status",...}` line from live state.
-fn status_json(shared: &Shared) -> String {
+fn status_reply(shared: &Shared) -> Reply {
     let connected = shared.active.load(Ordering::Relaxed);
     let paths = *shared.paths.read().unwrap();
-    let active = match paths.active {
-        Some(PathKind::Wired) => "\"wired\"",
-        Some(PathKind::Wifi) => "\"wifi\"",
-        None => "null",
-    };
-    // RTT of the path currently winning dedup, falling back to wired.
+    let active_path = paths.active.map(|path| path.label().to_string());
     let rtt_ms = match paths.active {
         Some(PathKind::Wired) => paths.wired_rtt_ms,
         Some(PathKind::Wifi) => paths.wifi_rtt_ms,
         None => paths.wired_rtt_ms,
     };
-    let rtt = match rtt_ms {
-        Some(v) => format!("{v:.1}"),
-        None => "null".to_string(),
-    };
-    let tx = shared.tx_bytes.load(Ordering::Relaxed);
-    let rx = shared.rx_bytes.load(Ordering::Relaxed);
-    format!(
-        "{{\"type\":\"status\",\"connected\":{connected},\"wired\":{},\"wifi\":{},\"active_path\":{active},\"rtt_ms\":{rtt},\"tx\":{tx},\"rx\":{rx}}}",
-        paths.wired_alive, paths.wifi_alive,
-    )
+    Reply::Status {
+        connected,
+        wired: paths.wired_alive,
+        wifi: paths.wifi_alive,
+        active_path,
+        rtt_ms,
+        tx: shared.tx_bytes.load(Ordering::Relaxed),
+        rx: shared.rx_bytes.load(Ordering::Relaxed),
+    }
 }
 
-/// Minimal JSON string-field extractor: pull the value of `"key"` out of a
-/// `{"key":"value"}` line. Enough for the fixed command vocabulary.
-fn extract_json_string(line: &str, key: &str) -> Option<String> {
-    let keypat = format!("\"{key}\"");
-    let start = line.find(&keypat)? + keypat.len();
-    let rest = &line[start..];
-    let colon = rest.find(':')?;
-    let after = rest[colon + 1..].trim_start();
-    let val = after.strip_prefix('"')?;
-    let end = val.find('"')?;
-    Some(val[..end].to_string())
+fn benchmark_topology_reply(shared: &Shared) -> Reply {
+    Reply::BenchmarkTopology {
+        protocol_version: 1,
+        server_version: "unknown".into(),
+        underlay_target: shared.server.ip().to_string(),
+        tunnel_ipv4_target: Some(TUNNEL_SERVER.to_string()),
+        tunnel_ipv6_target: Some(TUNNEL_V6_SERVER.to_string()),
+        listener_base_port: 5210,
+        listener_count: 16,
+        paths: vec![
+            BenchmarkPath {
+                id: "wired".into(),
+                display_name: "Wired".into(),
+                interface: shared.wired_iface.clone(),
+                source_address: shared.wired_src.to_string(),
+            },
+            BenchmarkPath {
+                id: "wifi".into(),
+                display_name: "Wi-Fi".into(),
+                interface: shared.wifi_iface.clone(),
+                source_address: shared.wifi_src.to_string(),
+            },
+        ],
+    }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,25 +279,34 @@ mod tests {
         shared_with_tx(100)
     }
 
-    /// The status line must match the menubar app's schema exactly:
-    /// `{"type":"status","connected":..,"wired":..,"wifi":..,
-    ///  "active_path":..,"rtt_ms":..,"tx":..,"rx":..}`.
     #[test]
-    fn status_json_matches_contract() {
-        let s = status_json(&shared());
-        assert!(s.starts_with("{\"type\":\"status\""), "got: {s}");
-        assert!(s.contains("\"connected\":true"), "got: {s}");
-        assert!(s.contains("\"wired\":true"), "got: {s}");
-        assert!(s.contains("\"wifi\":false"), "got: {s}");
-        assert!(s.contains("\"active_path\":\"wired\""), "got: {s}");
-        assert!(s.contains("\"rtt_ms\":5.0"), "got: {s}");
-        assert!(s.contains("\"tx\":100"), "got: {s}");
-        assert!(s.contains("\"rx\":200"), "got: {s}");
+    fn status_reply_matches_contract() {
+        let json = handle_request("{\"cmd\":\"status\"}", &shared());
+        let reply: Reply = facet_json::from_str(&json).unwrap();
+        match reply {
+            Reply::Status {
+                connected,
+                wired,
+                wifi,
+                active_path,
+                rtt_ms,
+                tx,
+                rx,
+            } => {
+                assert!(connected);
+                assert!(wired);
+                assert!(!wifi);
+                assert_eq!(active_path.as_deref(), Some("wired"));
+                assert_eq!(rtt_ms, Some(5.0));
+                assert_eq!(tx, 100);
+                assert_eq!(rx, 200);
+            }
+            other => panic!("expected status reply, got {other:?}"),
+        }
     }
 
-    /// rtt_ms is null when no path has a measured RTT yet.
     #[test]
-    fn status_json_null_rtt() {
+    fn status_reply_preserves_unknown_rtt() {
         let sh = shared();
         *sh.paths.write().unwrap() = crate::PathSnapshot {
             wired_alive: true,
@@ -237,20 +315,65 @@ mod tests {
             wifi_rtt_ms: None,
             active: Some(PathKind::Wired),
         };
-        assert!(status_json(&sh).contains("\"rtt_ms\":null"));
+        let json = handle_request("{\"cmd\":\"status\"}", &sh);
+        let reply: Reply = facet_json::from_str(&json).unwrap();
+        assert!(matches!(reply, Reply::Status { rtt_ms: None, .. }));
     }
 
-    /// Command routing: status returns a status line; an unknown command is
-    /// an error. (connect/disconnect have route side effects and need root,
-    /// so they are not exercised here.)
+    #[test]
+    fn benchmark_topology_matches_contract() {
+        let json = handle_request("{\"cmd\":\"benchmark_topology\"}", &shared());
+        let reply: Reply = facet_json::from_str(&json).unwrap();
+        match reply {
+            Reply::BenchmarkTopology {
+                protocol_version,
+                server_version,
+                underlay_target,
+                tunnel_ipv4_target,
+                tunnel_ipv6_target,
+                listener_base_port,
+                listener_count,
+                paths,
+            } => {
+                assert_eq!(protocol_version, 1);
+                assert_eq!(server_version, "unknown");
+                assert_eq!(underlay_target, "10.0.0.5");
+                assert_eq!(tunnel_ipv4_target.as_deref(), Some("10.10.99.1"));
+                assert_eq!(tunnel_ipv6_target.as_deref(), Some("fd00:99::1"));
+                assert_eq!(listener_base_port, 5210);
+                assert_eq!(listener_count, 16);
+                assert_eq!(paths.len(), 2);
+                assert_eq!(paths[0].id, "wired");
+                assert_eq!(paths[0].display_name, "Wired");
+                assert_eq!(paths[0].interface, "en17");
+                assert_eq!(paths[0].source_address, "192.168.1.5");
+                assert_eq!(paths[1].id, "wifi");
+                assert_eq!(paths[1].display_name, "Wi-Fi");
+                assert_eq!(paths[1].interface, "en0");
+                assert_eq!(paths[1].source_address, "192.168.1.6");
+            }
+            other => panic!("expected benchmark topology reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn benchmark_topology_round_trips_interface_names() {
+        let sh = shared();
+        let mut sh = Arc::try_unwrap(sh).ok().unwrap();
+        sh.wired_iface = "en\"17\\uplink".into();
+        let json = facet_json::to_string(&benchmark_topology_reply(&sh)).unwrap();
+        let reply: Reply = facet_json::from_str(&json).unwrap();
+        let Reply::BenchmarkTopology { paths, .. } = reply else {
+            panic!("expected benchmark topology reply");
+        };
+        assert_eq!(paths[0].interface, "en\"17\\uplink");
+    }
+
     #[test]
     fn command_routing() {
-        let sh = shared();
-        assert!(handle_request("{\"cmd\":\"status\"}", &sh).starts_with("{\"type\":\"status\""));
-        assert_eq!(
-            handle_request("{\"cmd\":\"bogus\"}", &sh),
-            "{\"type\":\"error\",\"message\":\"unknown command\"}"
-        );
+        let json = handle_request("{\"cmd\":\"bogus\"}", &shared());
+        let reply: Reply = facet_json::from_str(&json).unwrap();
+        assert!(matches!(reply, Reply::Error { message } if message == "unknown command"));
     }
 
     #[tokio::test]

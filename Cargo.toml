@@ -18,6 +18,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 libc = "0.2"
 n0-error = "1.0.0"
+facet = "0.50.0-rc.5"
+facet-json = "0.50.0-rc.5"
 
 [profile.release]
 lto = true

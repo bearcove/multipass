@@ -10,6 +10,7 @@ nonisolated enum DaemonRequest: Encodable {
     case status
     case connect
     case disconnect
+    case benchmarkTopology
 
     private enum CodingKeys: String, CodingKey {
         case cmd
@@ -22,6 +23,7 @@ nonisolated enum DaemonRequest: Encodable {
             case .status: "status"
             case .connect: "connect"
             case .disconnect: "disconnect"
+            case .benchmarkTopology: "benchmark_topology"
             }
         try container.encode(cmd, forKey: .cmd)
     }
@@ -63,9 +65,46 @@ nonisolated struct StatusSnapshot: Decodable, Sendable {
     }
 }
 
+nonisolated struct BenchmarkPath: Decodable, Sendable, Equatable {
+    var id: String
+    var displayName: String
+    var interface: String
+    var sourceAddress: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case displayName = "display_name"
+        case interface
+        case sourceAddress = "source_address"
+    }
+}
+
+nonisolated struct BenchmarkTopology: Decodable, Sendable, Equatable {
+    var protocolVersion: UInt32
+    var serverVersion: String
+    var underlayTarget: String
+    var tunnelIPv4Target: String?
+    var tunnelIPv6Target: String?
+    var listenerBasePort: UInt16
+    var listenerCount: UInt16
+    var paths: [BenchmarkPath]
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case serverVersion = "server_version"
+        case underlayTarget = "underlay_target"
+        case tunnelIPv4Target = "tunnel_ipv4_target"
+        case tunnelIPv6Target = "tunnel_ipv6_target"
+        case listenerBasePort = "listener_base_port"
+        case listenerCount = "listener_count"
+        case paths
+    }
+}
+
 /// One response line from the daemon, discriminated by its `type` field.
 nonisolated enum DaemonReply: Decodable, Sendable {
     case status(StatusSnapshot)
+    case benchmarkTopology(BenchmarkTopology)
     case ok
     case error(String)
 
@@ -80,6 +119,8 @@ nonisolated enum DaemonReply: Decodable, Sendable {
         switch type {
         case "status":
             self = .status(try StatusSnapshot(from: decoder))
+        case "benchmark_topology":
+            self = .benchmarkTopology(try BenchmarkTopology(from: decoder))
         case "ok":
             self = .ok
         case "error":
