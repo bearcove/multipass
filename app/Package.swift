@@ -19,6 +19,10 @@ let package = Package(
                 .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
                 .defaultIsolation(MainActor.self),
             ]
+        ),
+        .testTarget(
+            name: "MultipassTests",
+            dependencies: ["Multipass"]
         )
     ],
     swiftLanguageModes: [.v6]
