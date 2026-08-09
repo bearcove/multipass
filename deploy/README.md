@@ -57,6 +57,24 @@ ICMPv6 must pass (PMTU, errors). The existing `meta l4proto ipv6-icmp accept`
 in the input chain covers jax-local; ensure forward also permits ICMPv6 if a
 drop would blackhole tunnel PMTU. Verify with `nft list chain inet filter forward`.
 
+## Benchmark listeners
+
+The in-app benchmark uses sixteen systemd-managed iperf3 listeners on jax,
+TCP ports 5210–5225. The canonical unit and firewall rules live in
+`vixen-central/infra/host/jax/`; `/etc` on jax is the etckeeper-tracked live
+copy. Ports are allocated per simultaneous path so aggregate tests never share
+an iperf server process.
+
+```bash
+ssh jax.vxn.rs 'systemctl is-active iperf3-benchmark@{5210..5225}.service'
+ssh jax.vxn.rs 'sudo systemd-analyze verify /etc/systemd/system/iperf3-benchmark@.service'
+ssh jax.vxn.rs 'sudo nft -c -f /etc/nftables.conf'
+```
+
+Firewall admission is limited to `10.10.10.0/24` on `br10`,
+`10.10.99.0/24` on `tun0`, and `fd00:99::/64` on `tun0`. WAN, CI, and guest
+interfaces do not gain access to the listener range.
+
 ## Native routed mode (after Freebox PD)
 
 When the `/60` delegation arrives, replace NAT66:
