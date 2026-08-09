@@ -10,13 +10,43 @@ struct BenchmarkControllerTests {
         let daemon = FakeDaemon(connected: false)
         let runner = FakeBenchmarkRunner(recorder: daemon)
         let tunnel = TunnelController(client: daemon)
-        let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: tunnel,
+            runner: runner,
+            appBuild: "app-build",
+            clientBuild: "client-build",
+            iperfVersion: "iperf 3.21"
+        )
 
         controller.startFullSuite()
         try await waitUntil { !controller.isRunning }
 
         #expect(controller.state == .completed)
-        #expect(controller.completedRun?.results.count == allInvocations.count)
+        #expect(controller.completedRun?.results.count == allInvocations.count + 2)
+        #expect(controller.completedRun?.identities == BenchmarkRunIdentities(
+            appBuild: "app-build",
+            clientBuild: "client-build",
+            serverBuild: "server-build",
+            iperfVersion: "iperf 3.21"
+        ))
+        #expect(controller.completedRun?.startedAt != controller.completedRun?.completedAt)
+        let skippedIPv6Upload = BenchmarkTestID(
+            route: .tunnel,
+            direction: .upload,
+            addressFamily: .ipv6
+        )
+        let skippedIPv6Download = BenchmarkTestID(
+            route: .tunnel,
+            direction: .download,
+            addressFamily: .ipv6
+        )
+        #expect(controller.completedRun?.results[skippedIPv6Upload] == .failed(
+            "skipped: tunnel IPv6 target unavailable"
+        ))
+        #expect(controller.completedRun?.results[skippedIPv6Download] == .failed(
+            "skipped: tunnel IPv6 target unavailable"
+        ))
         #expect(await runner.invocationIDs == allInvocations.map(\.id))
         #expect(await daemon.events == [
             .request(.status),
@@ -36,6 +66,62 @@ struct BenchmarkControllerTests {
             .request(.status),
             .request(.status),
         ])
+        #expect(await daemon.connected == false)
+    }
+
+    @Test("an unavailable tunnel IPv4 target is skipped without a runner invocation")
+    func unavailableTunnelIPv4IsSkippedWithoutRunning() async throws {
+        let topology = BenchmarkTopology(
+            protocolVersion: 1,
+            serverVersion: "server-build",
+            underlayTarget: "10.10.10.1",
+            tunnelIPv4Target: nil,
+            tunnelIPv6Target: "fd00::1",
+            listenerBasePort: 5210,
+            listenerCount: 16,
+            paths: [
+                BenchmarkPath(
+                    id: "wired",
+                    displayName: "Wired",
+                    interface: "en17",
+                    sourceAddress: "10.10.10.171"
+                )
+            ]
+        )
+        let plannedInvocations = try BenchmarkPlanner.plan(
+            topology: topology,
+            parameters: .init()
+        ).invocations
+        let daemon = FakeDaemon(connected: false, topology: topology)
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let tunnel = TunnelController(client: daemon)
+        let controller = BenchmarkController(daemon: daemon, tunnel: tunnel, runner: runner)
+        let skippedIPv4Upload = BenchmarkTestID(
+            route: .tunnel,
+            direction: .upload,
+            addressFamily: .ipv4
+        )
+        let skippedIPv4Download = BenchmarkTestID(
+            route: .tunnel,
+            direction: .download,
+            addressFamily: .ipv4
+        )
+
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+
+        let invocationIDs = await runner.invocationIDs
+        #expect(controller.state == .completed)
+        #expect(controller.completedRun?.results.count == plannedInvocations.count + 2)
+        #expect(controller.completedRun?.results[skippedIPv4Upload] == .failed(
+            "skipped: tunnel IPv4 target unavailable"
+        ))
+        #expect(controller.completedRun?.results[skippedIPv4Download] == .failed(
+            "skipped: tunnel IPv4 target unavailable"
+        ))
+        #expect(invocationIDs == plannedInvocations.map(\.id))
+        #expect(invocationIDs.contains(skippedIPv4Upload) == false)
+        #expect(invocationIDs.contains(skippedIPv4Download) == false)
         #expect(await daemon.connected == false)
     }
 
@@ -336,7 +422,8 @@ struct BenchmarkControllerTests {
         try await waitUntil { !controller.isRunning }
 
         #expect(controller.state == .completed)
-        #expect(controller.completedRun?.results.values.allSatisfy { $0.measurement != nil } == true)
+        #expect(controller.completedRun?.results.values.filter { !$0.isFailure }
+            .allSatisfy { $0.measurement != nil } == true)
         #expect(controller.completedRun?.restorationError?.contains("restore") == true)
         #expect(controller.lastError == nil)
     }

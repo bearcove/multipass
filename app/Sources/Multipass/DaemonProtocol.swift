@@ -65,7 +65,7 @@ nonisolated struct StatusSnapshot: Decodable, Sendable {
     }
 }
 
-nonisolated struct BenchmarkPath: Decodable, Sendable, Equatable {
+nonisolated struct BenchmarkPath: Codable, Sendable, Equatable {
     var id: String
     var displayName: String
     var interface: String
@@ -79,7 +79,7 @@ nonisolated struct BenchmarkPath: Decodable, Sendable, Equatable {
     }
 }
 
-nonisolated struct BenchmarkTopology: Decodable, Sendable, Equatable {
+nonisolated struct BenchmarkTopology: Codable, Sendable, Equatable {
     var protocolVersion: UInt32
     var serverVersion: String
     var underlayTarget: String

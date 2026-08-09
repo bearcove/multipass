@@ -12,7 +12,7 @@ nonisolated enum BenchmarkControllerState: Sendable, Equatable {
     case failed
 }
 
-nonisolated enum BenchmarkResult: Sendable, Equatable {
+nonisolated enum BenchmarkResult: Codable, Sendable, Equatable {
     case measured(BenchmarkMeasurement)
     case failed(String)
 
@@ -27,12 +27,58 @@ nonisolated enum BenchmarkResult: Sendable, Equatable {
     }
 }
 
-nonisolated struct BenchmarkRun: Sendable, Equatable {
+nonisolated struct BenchmarkRunIdentities: Codable, Sendable, Equatable {
+    let appBuild: String
+    let clientBuild: String
+    let serverBuild: String
+    let iperfVersion: String
+}
+
+nonisolated struct BenchmarkRun: Codable, Sendable, Equatable {
+    static let currentSchemaVersion = 1
+
+    let schemaVersion: Int
+    let id: UUID
+    let startedAt: Date
+    let completedAt: Date
+    var userLabel: String?
+    let identities: BenchmarkRunIdentities
     let topology: BenchmarkTopology
     let parameters: BenchmarkParameters
     let initiallyConnected: Bool
     var results: [BenchmarkTestID: BenchmarkResult]
     var restorationError: String?
+
+    init(
+        schemaVersion: Int = BenchmarkRun.currentSchemaVersion,
+        id: UUID = UUID(),
+        startedAt: Date = Date(),
+        completedAt: Date = Date(),
+        userLabel: String? = nil,
+        identities: BenchmarkRunIdentities = .init(
+            appBuild: "unknown",
+            clientBuild: "unknown",
+            serverBuild: "unknown",
+            iperfVersion: "unknown"
+        ),
+        topology: BenchmarkTopology,
+        parameters: BenchmarkParameters,
+        initiallyConnected: Bool,
+        results: [BenchmarkTestID: BenchmarkResult],
+        restorationError: String?
+    ) {
+        self.schemaVersion = schemaVersion
+        self.id = id
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+        self.userLabel = userLabel
+        self.identities = identities
+        self.topology = topology
+        self.parameters = parameters
+        self.initiallyConnected = initiallyConnected
+        self.results = results
+        self.restorationError = restorationError
+    }
 }
 
 nonisolated enum BenchmarkControllerError: Error, Sendable, Equatable {
@@ -69,24 +115,35 @@ final class BenchmarkController {
     private let tunnel: TunnelController
     private let runner: any BenchmarkRunning
     private let parameters: BenchmarkParameters
+    private let appBuild: String
+    private let clientBuild: String
+    private let iperfVersion: String
     private var suiteTask: Task<Void, Never>?
     private var cancellationRequested = false
+    private var activeRunStartedAt: Date?
 
     init(
         daemon: any DaemonRequesting,
         tunnel: TunnelController,
         runner: any BenchmarkRunning,
-        parameters: BenchmarkParameters = .init()
+        parameters: BenchmarkParameters = .init(),
+        appBuild: String = "unknown",
+        clientBuild: String = "unknown",
+        iperfVersion: String = "unknown"
     ) {
         self.daemon = daemon
         self.tunnel = tunnel
         self.runner = runner
         self.parameters = parameters
+        self.appBuild = appBuild
+        self.clientBuild = clientBuild
+        self.iperfVersion = iperfVersion
     }
 
     func startFullSuite() {
         guard suiteTask == nil else { return }
         cancellationRequested = false
+        activeRunStartedAt = Date()
         let owner = UUID()
         let priorMeasurements = measurements
         let priorSamples = liveSamples
@@ -149,6 +206,8 @@ final class BenchmarkController {
 
             let raw = plan.invocations.filter { $0.id.route != .tunnel }
             let tunnelInvocations = plan.invocations.filter { $0.id.route == .tunnel }
+            addUnavailableTunnelResults(topology: loadedTopology, to: &results)
+            measurements = results
 
             for invocation in raw {
                 try checkCancellation()
@@ -212,6 +271,14 @@ final class BenchmarkController {
         }
         if terminalState == .completed, let topology, let initiallyConnected {
             completedRun = BenchmarkRun(
+                startedAt: activeRunStartedAt ?? Date(),
+                completedAt: Date(),
+                identities: BenchmarkRunIdentities(
+                    appBuild: appBuild,
+                    clientBuild: clientBuild,
+                    serverBuild: topology.serverVersion,
+                    iperfVersion: iperfVersion
+                ),
                 topology: topology,
                 parameters: parameters,
                 initiallyConnected: initiallyConnected,
@@ -219,6 +286,7 @@ final class BenchmarkController {
                 restorationError: restorationError
             )
         }
+        activeRunStartedAt = nil
         lastError = terminalError ?? (terminalState == .cancelled ? restorationError : nil)
         state = terminalState
     }
@@ -321,6 +389,27 @@ final class BenchmarkController {
                 return .failed(CancellationError().localizedDescription)
             }
             return .failed(error.localizedDescription)
+        }
+    }
+
+    private func addUnavailableTunnelResults(
+        topology: BenchmarkTopology,
+        to results: inout [BenchmarkTestID: BenchmarkResult]
+    ) {
+        for (family, target) in [
+            (BenchmarkAddressFamily.ipv4, topology.tunnelIPv4Target),
+            (.ipv6, topology.tunnelIPv6Target),
+        ] where target == nil {
+            for direction in [BenchmarkDirection.upload, .download] {
+                let id = BenchmarkTestID(
+                    route: .tunnel,
+                    direction: direction,
+                    addressFamily: family
+                )
+                results[id] = .failed(
+                    "skipped: tunnel \(family == .ipv4 ? "IPv4" : "IPv6") target unavailable"
+                )
+            }
         }
     }
 
