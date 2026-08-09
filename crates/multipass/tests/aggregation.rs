@@ -68,17 +68,12 @@ async fn spawn_sack_server() -> (SocketAddr, Arc<AtomicUsize>) {
             let scoreboard = scoreboard.clone();
             let accepted = accepted_task.clone();
             tokio::spawn(async move {
-                loop {
-                    match conn.read_datagram().await {
-                        Ok(d) => {
-                            if let Some(Frame::Data { seq, .. }) = multipass_proto::decode(&d) {
-                                scoreboard.lock().unwrap().insert(seq);
-                                if dedup.lock().unwrap().insert(seq) {
-                                    accepted.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
+                while let Ok(d) = conn.read_datagram().await {
+                    if let Some(Frame::Data { seq, .. }) = multipass_proto::decode(&d) {
+                        scoreboard.lock().unwrap().insert(seq);
+                        if dedup.lock().unwrap().insert(seq) {
+                            accepted.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(_) => break,
                     }
                 }
             });

@@ -851,20 +851,12 @@ mod tests {
                         Ok(c) => c,
                         Err(_) => return,
                     };
-                    loop {
-                        match conn.read_datagram().await {
-                            Ok(d) => {
-                                if let Some(Frame::Data { seq, packet }) =
-                                    multipass_proto::decode(&d)
-                                {
-                                    let _ =
-                                        conn.send_datagram(multipass_proto::encode(&Frame::Data {
-                                            seq,
-                                            packet,
-                                        }));
-                                }
-                            }
-                            Err(_) => break,
+                    while let Ok(d) = conn.read_datagram().await {
+                        if let Some(Frame::Data { seq, packet }) = multipass_proto::decode(&d) {
+                            let _ = conn.send_datagram(multipass_proto::encode(&Frame::Data {
+                                seq,
+                                packet,
+                            }));
                         }
                     }
                 });

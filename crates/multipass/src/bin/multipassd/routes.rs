@@ -335,8 +335,8 @@ mod tests {
             "utun16",
             IpAddr::V4(Ipv4Addr::new(10, 10, 10, 1)),
             &[
-                (&"en17", Ipv4Addr::new(10, 10, 10, 171)),
-                (&"en0", Ipv4Addr::new(10, 10, 10, 169)),
+                ("en17", Ipv4Addr::new(10, 10, 10, 171)),
+                ("en0", Ipv4Addr::new(10, 10, 10, 169)),
             ],
             |prog, args| {
                 calls.push((
@@ -376,8 +376,8 @@ mod tests {
             "utun16",
             IpAddr::V4(Ipv4Addr::new(10, 10, 10, 1)),
             &[
-                (&"en17", Ipv4Addr::new(10, 10, 10, 171)),
-                (&"en0", Ipv4Addr::new(10, 10, 10, 169)),
+                ("en17", Ipv4Addr::new(10, 10, 10, 171)),
+                ("en0", Ipv4Addr::new(10, 10, 10, 169)),
             ],
             |prog, args| {
                 calls.push((
@@ -406,8 +406,8 @@ mod tests {
             "utun16",
             IpAddr::V4(Ipv4Addr::new(10, 10, 10, 1)),
             &[
-                (&"en17", Ipv4Addr::new(10, 10, 10, 171)),
-                (&"en0", Ipv4Addr::new(10, 10, 10, 169)),
+                ("en17", Ipv4Addr::new(10, 10, 10, 171)),
+                ("en0", Ipv4Addr::new(10, 10, 10, 169)),
             ],
             |prog, args| {
                 calls.push((
