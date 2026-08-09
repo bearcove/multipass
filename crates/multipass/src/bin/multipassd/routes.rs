@@ -215,7 +215,15 @@ fn default_route_args(utun: &str) -> [[&str; 6]; 2] {
 fn v6_default_route_args(utun: &str) -> [[&str; 7]; 2] {
     [
         ["-n", "add", "-inet6", "-net", "::/1", "-interface", utun],
-        ["-n", "add", "-inet6", "-net", "8000::/1", "-interface", utun],
+        [
+            "-n",
+            "add",
+            "-inet6",
+            "-net",
+            "8000::/1",
+            "-interface",
+            utun,
+        ],
     ]
 }
 
@@ -298,8 +306,24 @@ mod tests {
         assert_eq!(
             v6_default_route_args("utun16"),
             [
-                ["-n", "add", "-inet6", "-net", "::/1", "-interface", "utun16"],
-                ["-n", "add", "-inet6", "-net", "8000::/1", "-interface", "utun16"],
+                [
+                    "-n",
+                    "add",
+                    "-inet6",
+                    "-net",
+                    "::/1",
+                    "-interface",
+                    "utun16"
+                ],
+                [
+                    "-n",
+                    "add",
+                    "-inet6",
+                    "-net",
+                    "8000::/1",
+                    "-interface",
+                    "utun16"
+                ],
             ]
         );
     }

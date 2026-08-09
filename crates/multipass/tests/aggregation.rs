@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 /// receive state. Returns the server address and a count of unique packets
 /// the server accepted.
 async fn spawn_sack_server() -> (SocketAddr, Arc<AtomicUsize>) {
-    let server = Endpoint::server(multipass::server_config(), "127.0.0.1:0".parse().unwrap())
-        .unwrap();
+    let server =
+        Endpoint::server(multipass::server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = server.local_addr().unwrap();
     let accepted = Arc::new(AtomicUsize::new(0));
     let accepted_task = accepted.clone();
@@ -108,20 +108,12 @@ async fn aggregation_delivers_all_and_retires_window() {
         // Drain pending SACKs (drives window retirement) without blocking.
         // The daemon's pump selects over recv_control continuously; we mirror
         // it by racing a short timeout against the control channel each iter.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(2),
-            t.recv_control(),
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(2), t.recv_control()).await;
     }
 
     // Let SACKs flush and the window retire, draining any stragglers.
     for _ in 0..50 {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            t.recv_control(),
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(10), t.recv_control()).await;
         if t.send_window_len() == 0 {
             break;
         }

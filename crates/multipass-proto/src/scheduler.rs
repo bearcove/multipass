@@ -122,7 +122,11 @@ impl Scheduler {
         let wired = self.cost(PathKind::Wired);
         let wifi = self.cost(PathKind::Wifi);
         match (wired, wifi) {
-            (Some(w), Some(f)) => Some(if w <= f { PathKind::Wired } else { PathKind::Wifi }),
+            (Some(w), Some(f)) => Some(if w <= f {
+                PathKind::Wired
+            } else {
+                PathKind::Wifi
+            }),
             (Some(_), None) => Some(PathKind::Wired),
             (None, Some(_)) => Some(PathKind::Wifi),
             (None, None) => None,

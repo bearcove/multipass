@@ -126,7 +126,11 @@ mod imp {
     /// Assign the IPv6 tunnel address via `ip -6 addr add`. Returns Ok if the
     /// address is added (or already present).
     fn configure_v6(name: &str) -> io::Result<()> {
-        let arg = format!("{}/{}", multipass_proto::TUNNEL_V6_SERVER, multipass_proto::TUNNEL_V6_PREFIX);
+        let arg = format!(
+            "{}/{}",
+            multipass_proto::TUNNEL_V6_SERVER,
+            multipass_proto::TUNNEL_V6_PREFIX
+        );
         let out = std::process::Command::new("ip")
             .args(["-6", "addr", "add", &arg, "dev", name])
             .output()?;

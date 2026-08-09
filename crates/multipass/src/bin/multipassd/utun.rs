@@ -277,8 +277,14 @@ mod tests {
 
     #[test]
     fn address_family_tag_roundtrip() {
-        assert_eq!(AddressFamily::from_tag(AF_INET_TAG), Some(AddressFamily::Inet));
-        assert_eq!(AddressFamily::from_tag(AF_INET6_TAG), Some(AddressFamily::Inet6));
+        assert_eq!(
+            AddressFamily::from_tag(AF_INET_TAG),
+            Some(AddressFamily::Inet)
+        );
+        assert_eq!(
+            AddressFamily::from_tag(AF_INET6_TAG),
+            Some(AddressFamily::Inet6)
+        );
         assert_eq!(AddressFamily::from_tag(999), None);
         assert_eq!(AddressFamily::Inet.tag(), AF_INET_TAG);
         assert_eq!(AddressFamily::Inet6.tag(), AF_INET6_TAG);

@@ -38,6 +38,11 @@ const TUN_CHANNEL: usize = 1024;
 fn transport() -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
     tc.max_concurrent_multipath_paths(2);
+    tc.max_idle_timeout(Some(
+        Duration::from_secs(2)
+            .try_into()
+            .expect("valid idle timeout"),
+    ));
     tc.keep_alive_interval(Some(Duration::from_millis(200)));
     Arc::new(tc)
 }
@@ -694,10 +699,7 @@ mod tests {
         let decoded = multipass_proto::decode(&encoded).unwrap();
         match decoded {
             Frame::Assign {
-                ipv4,
-                ipv6,
-                mtu,
-                ..
+                ipv4, ipv6, mtu, ..
             } => {
                 assert_eq!(ipv4, Some((TUNNEL_CLIENT, TUNNEL_PREFIX)));
                 assert_eq!(ipv6, Some((TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX)));

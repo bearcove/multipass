@@ -88,6 +88,7 @@ impl std::error::Error for TransportError {
 pub fn transport_config() -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
     tc.max_concurrent_multipath_paths(2);
+    tc.max_idle_timeout(Some(PROBE_TIMEOUT.try_into().expect("valid idle timeout")));
     tc.keep_alive_interval(Some(Duration::from_millis(200)));
     Arc::new(tc)
 }
@@ -201,10 +202,13 @@ struct Path {
     last_recv: Arc<AtomicU64>,
     /// Last measured RTT in microseconds (0 = none).
     rtt: Arc<AtomicU64>,
-    /// In-flight Ping probe: (nonce, sent-at), if any.
-    probe: Arc<Mutex<Option<(u64, Instant)>>>,
+    /// In-flight Ping probe: (connection generation, nonce, sent-at), if any.
+    probe: Arc<Mutex<Option<(u64, u64, Instant)>>>,
     /// Monotonic nonce source for Ping probes.
     probe_nonce: Arc<AtomicU64>,
+    /// Incremented whenever a connection is replaced. Reader failures from an
+    /// older generation must not kill the newly installed path.
+    generation: Arc<AtomicU64>,
     started: Instant,
     /// Datagrams received / transmitted on this path.
     received: Arc<AtomicU64>,
@@ -222,6 +226,7 @@ impl Path {
             rtt: Arc::new(AtomicU64::new(0)),
             probe: Arc::new(Mutex::new(None)),
             probe_nonce: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(0)),
             started: Instant::now(),
             received: Arc::new(AtomicU64::new(0)),
             transmitted: Arc::new(AtomicU64::new(0)),
@@ -251,6 +256,26 @@ impl Path {
 
     fn set_rtt(&self, rtt: Duration) {
         self.rtt.store(rtt.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    fn mark_dead(&self, generation: u64) -> bool {
+        {
+            let connection = self.conn.lock().unwrap();
+            if self.generation.load(Ordering::Acquire) != generation {
+                return false;
+            }
+            if self
+                .alive
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return false;
+            }
+            self.ready.store(false, Ordering::Release);
+            connection.close(0u32.into(), b"path liveness timeout");
+        }
+        *self.probe.lock().unwrap() = None;
+        true
     }
 }
 
@@ -349,7 +374,7 @@ impl Transport {
         for p in [&wired, &wifi] {
             spawn_reader(p, &data_tx, &control_tx, &dead_tx);
         }
-        let probe_task = spawn_probe(&wired, &wifi);
+        let probe_task = spawn_probe(&wired, &wifi, &dead_tx);
 
         Self {
             wired,
@@ -367,26 +392,23 @@ impl Transport {
             scheduler: Mutex::new(Scheduler::new()),
         }
     }
-
-    /// Re-dial one dead path and swap it in, respawning its reader task. The
-    /// daemon calls this on [`Transport::recv_dead`]. Returns the dial error if
-    /// the interface is still down; callers retry with backoff.
-    pub async fn reconnect_path(
-        &self,
-        kind: PathKind,
-        server: SocketAddr,
-        src_ip: IpAddr,
-    ) -> Result<(), TransportError> {
-        let new_conn = dial(server, src_ip, kind.label()).await?;
+    /// Install a newly dialed connection for one dead path and respawn its
+    /// reader. Dialing itself stays outside the packet pump so a failed
+    /// handshake cannot block traffic on the surviving path.
+    pub fn install_reconnected_path(&self, kind: PathKind, new_conn: Connection) {
         let p = self.path(kind);
-        *p.conn.lock().unwrap() = new_conn;
-        p.alive.store(true, Ordering::Relaxed);
-        p.ready.store(false, Ordering::Relaxed);
-        p.rtt.store(0, Ordering::Relaxed);
+        {
+            let mut connection = p.conn.lock().unwrap();
+            p.alive.store(false, Ordering::Release);
+            p.generation.fetch_add(1, Ordering::AcqRel);
+            *connection = new_conn;
+            p.ready.store(false, Ordering::Relaxed);
+            p.rtt.store(0, Ordering::Relaxed);
+            p.alive.store(true, Ordering::Release);
+        }
         *p.probe.lock().unwrap() = None;
         spawn_reader(p, &self.data_tx, &self.control_tx, &self.dead_tx);
         tracing::info!(path = %kind.label(), "path reconnected");
-        Ok(())
     }
 
     /// Send a raw IP packet on the best available path, retaining it for
@@ -425,7 +447,12 @@ impl Transport {
                 if rtt > 0 {
                     sched.note_rtt(kind, Duration::from_micros(rtt));
                 }
-                let space = self.path(kind).conn.lock().unwrap().datagram_send_buffer_space();
+                let space = self
+                    .path(kind)
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .datagram_send_buffer_space();
                 sched.note_queue_space(kind, space);
             }
         }
@@ -683,8 +710,8 @@ fn spawn_reader(
 ) {
     let path = Arc::clone(path);
     let kind = path.kind;
+    let generation = path.generation.load(Ordering::Acquire);
     let conn = Arc::clone(&path.conn);
-    let alive = Arc::clone(&path.alive);
     let mark_recv = {
         let p = Arc::clone(&path);
         move || p.mark_recv()
@@ -723,10 +750,10 @@ fn spawn_reader(
                                 conn.send_datagram(multipass_proto::encode(&Frame::Pong { nonce }));
                         }
                         Some(Frame::Pong { nonce }) => {
-                            // RTT from the matching in-flight probe, if any.
                             let mut inflight = probe.lock().unwrap();
-                            if let Some((n, sent)) = *inflight
-                                && n == nonce
+                            if let Some((probe_generation, probe_nonce, sent)) = *inflight
+                                && probe_generation == generation
+                                && probe_nonce == nonce
                             {
                                 let rtt = sent.elapsed();
                                 *inflight = None;
@@ -745,8 +772,9 @@ fn spawn_reader(
                 }
                 Err(e) => {
                     tracing::warn!(path = %kind.label(), %e, "path read ended");
-                    alive.store(false, Ordering::Relaxed);
-                    let _ = dead_tx.send(kind).await;
+                    if path.mark_dead(generation) {
+                        let _ = dead_tx.send(kind).await;
+                    }
                     break;
                 }
             }
@@ -756,28 +784,51 @@ fn spawn_reader(
 
 /// Spawn a periodic probe task on each live path. Matching Pongs update the
 /// per-path RTT exposed through status.
-fn spawn_probe(wired: &Arc<Path>, wifi: &Arc<Path>) -> tokio::task::JoinHandle<()> {
+fn spawn_probe(
+    wired: &Arc<Path>,
+    wifi: &Arc<Path>,
+    dead_tx: &mpsc::Sender<PathKind>,
+) -> tokio::task::JoinHandle<()> {
     let paths = [Arc::clone(wired), Arc::clone(wifi)];
+    let dead_tx = dead_tx.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(RTT_PROBE_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             for p in &paths {
-                if !p.alive.load(Ordering::Relaxed) {
+                if !p.alive.load(Ordering::Acquire) {
                     continue;
                 }
-                // Skip if a probe is still in flight (not yet timed out).
-                let mut inflight = p.probe.lock().unwrap();
-                if let Some((_, sent)) = *inflight
-                    && sent.elapsed() < PROBE_TIMEOUT
-                {
+                let probe_state = *p.probe.lock().unwrap();
+                if let Some((probe_generation, _, sent)) = probe_state {
+                    if sent.elapsed() < PROBE_TIMEOUT {
+                        continue;
+                    }
+                    if p.mark_dead(probe_generation) {
+                        tracing::warn!(path = %p.kind.label(), "path liveness probe timed out");
+                        let _ = dead_tx.send(p.kind).await;
+                    }
                     continue;
                 }
+
                 let nonce = p.probe_nonce.fetch_add(1, Ordering::Relaxed);
-                let d = multipass_proto::encode(&Frame::Ping { nonce });
-                if p.conn.lock().unwrap().send_datagram(d).is_ok() {
-                    *inflight = Some((nonce, Instant::now()));
+                let datagram = multipass_proto::encode(&Frame::Ping { nonce });
+                let sent_generation = {
+                    let connection = p.conn.lock().unwrap();
+                    let generation = p.generation.load(Ordering::Acquire);
+                    connection
+                        .send_datagram(datagram)
+                        .is_ok()
+                        .then_some(generation)
+                };
+                if let Some(generation) = sent_generation {
+                    let mut inflight = p.probe.lock().unwrap();
+                    if p.alive.load(Ordering::Acquire)
+                        && p.generation.load(Ordering::Acquire) == generation
+                    {
+                        *inflight = Some((generation, nonce, Instant::now()));
+                    }
                 }
             }
         }
@@ -836,6 +887,128 @@ mod tests {
             }
         });
         (addr, closed_rx)
+    }
+    async fn spawn_blackhole_proxy(server: SocketAddr) -> (SocketAddr, Arc<AtomicBool>) {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = socket.local_addr().unwrap();
+        let forwarding = Arc::new(AtomicBool::new(true));
+        let task_socket = socket.clone();
+        let task_forwarding = forwarding.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut client = None;
+            loop {
+                let Ok((len, source)) = task_socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                if !task_forwarding.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let destination = if source == server {
+                    let Some(client) = client else { continue };
+                    client
+                } else {
+                    client = Some(source);
+                    server
+                };
+                let _ = task_socket.send_to(&buf[..len], destination).await;
+            }
+        });
+        (addr, forwarding)
+    }
+    async fn spawn_client_to_server_blackhole_proxy(
+        server: SocketAddr,
+    ) -> (SocketAddr, Arc<AtomicBool>) {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = socket.local_addr().unwrap();
+        let forward_client = Arc::new(AtomicBool::new(true));
+        let task_socket = socket.clone();
+        let task_forward_client = forward_client.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut client = None;
+            loop {
+                let Ok((len, source)) = task_socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                let destination = if source == server {
+                    let Some(client) = client else { continue };
+                    client
+                } else {
+                    client = Some(source);
+                    if !task_forward_client.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    server
+                };
+                let _ = task_socket.send_to(&buf[..len], destination).await;
+            }
+        });
+        (addr, forward_client)
+    }
+
+    #[tokio::test]
+    async fn silent_network_blackhole_closes_path_within_failover_bound() {
+        let server = Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Some(incoming) = server.accept().await else {
+                return;
+            };
+            let Ok(conn) = incoming.await else { return };
+            let _ = conn.closed().await;
+        });
+        let (proxy, forwarding) = spawn_blackhole_proxy(server_addr).await;
+        let conn = dial(proxy, "127.0.0.1".parse().unwrap(), "blackhole-test")
+            .await
+            .unwrap();
+
+        forwarding.store(false, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(4), conn.closed())
+            .await
+            .expect("silent path loss must close QUIC within the failover bound");
+    }
+
+    #[tokio::test]
+    async fn unanswered_probe_surfaces_path_death_once() {
+        let server = Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok(datagram) = conn.read_datagram().await {
+                        if let Some(Frame::Ping { nonce }) = multipass_proto::decode(&datagram) {
+                            let _ =
+                                conn.send_datagram(multipass_proto::encode(&Frame::Pong { nonce }));
+                        }
+                    }
+                });
+            }
+        });
+        let (wired_proxy, wired_forwarding) =
+            spawn_client_to_server_blackhole_proxy(server_addr).await;
+        let wired = dial(wired_proxy, "127.0.0.1".parse().unwrap(), "wired-test")
+            .await
+            .unwrap();
+        let wifi = dial(server_addr, "127.0.0.1".parse().unwrap(), "wifi-test")
+            .await
+            .unwrap();
+        let transport = Transport::from_connections(wired, wifi);
+
+        wired_forwarding.store(false, Ordering::Relaxed);
+        let dead = tokio::time::timeout(Duration::from_secs(3), transport.recv_dead())
+            .await
+            .expect(
+                "application probe must detect a silent path before asymmetric QUIC idle timeout",
+            );
+        assert_eq!(dead, PathKind::Wired);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), transport.recv_dead())
+                .await
+                .is_err(),
+            "one failed path must emit one death notification"
+        );
     }
 
     #[tokio::test]

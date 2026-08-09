@@ -50,7 +50,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use multipass::{PathKind, Transport};
+use multipass::{PathKind, Transport, dial};
 use multipass_proto::{
     Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_SERVER, TUNNEL_V6_CLIENT, TUNNEL_V6_SERVER,
 };
@@ -364,7 +364,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn handshake(
     transport: &mut Transport,
     client_nonce: u64,
-) -> Result<(Option<(Ipv4Addr, u8)>, Option<(std::net::Ipv6Addr, u8)>, u16), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Option<(Ipv4Addr, u8)>,
+        Option<(std::net::Ipv6Addr, u8)>,
+        u16,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let mut assignment = None;
     while PathKind::ALL.iter().any(|&kind| !transport.is_ready(kind)) {
@@ -384,7 +391,12 @@ async fn handshake(
         )
         .await
         {
-            Ok(Some((path, Frame::Assign { ipv4, ipv6, mtu, .. }))) => {
+            Ok(Some((
+                path,
+                Frame::Assign {
+                    ipv4, ipv6, mtu, ..
+                },
+            ))) => {
                 transport.mark_ready(path);
                 assignment.get_or_insert((ipv4, ipv6, mtu));
             }
@@ -426,6 +438,63 @@ impl From<io::Error> for PumpEnd {
 const RECONNECT_TICK: Duration = Duration::from_millis(500);
 /// Minimum spacing between re-dial attempts for an already-failed path.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+const REDIAL_TIMEOUT: Duration = Duration::from_secs(3);
+
+struct Redials {
+    tasks: tokio::task::JoinSet<(PathKind, Result<noq::Connection, String>)>,
+    in_flight: [bool; 2],
+}
+
+impl Redials {
+    fn new() -> Self {
+        Self {
+            tasks: tokio::task::JoinSet::new(),
+            in_flight: [false; 2],
+        }
+    }
+
+    fn start(&mut self, kind: PathKind, server: SocketAddr, source: IpAddr) -> bool {
+        let index = path_index(kind);
+        if self.in_flight[index] {
+            return false;
+        }
+        self.in_flight[index] = true;
+        self.tasks.spawn(async move {
+            let result = match tokio::time::timeout(
+                REDIAL_TIMEOUT,
+                dial(server, source, kind.label()),
+            )
+            .await
+            {
+                Ok(Ok(connection)) => Ok(connection),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err(format!("timed out after {REDIAL_TIMEOUT:?}")),
+            };
+            (kind, result)
+        });
+        true
+    }
+
+    async fn next(&mut self) -> (PathKind, Result<noq::Connection, String>) {
+        if self.tasks.is_empty() {
+            std::future::pending().await
+        }
+        let joined = self.tasks.join_next().await.expect("redial task exists");
+        let (kind, result) = match joined {
+            Ok(result) => result,
+            Err(error) => (PathKind::Wired, Err(error.to_string())),
+        };
+        self.in_flight[path_index(kind)] = false;
+        (kind, result)
+    }
+}
+
+fn path_index(kind: PathKind) -> usize {
+    match kind {
+        PathKind::Wired => 0,
+        PathKind::Wifi => 1,
+    }
+}
 
 /// Prove the authenticated QUIC/server/TUN return path before installing routes.
 async fn run_canary_pump(transport: &mut Transport, shared: &Shared, seq: &mut u64) -> bool {
@@ -658,6 +727,7 @@ async fn pump(
 ) -> PumpEnd {
     let mut wbuf = vec![0u8; TUNNEL_MTU as usize + 4];
     let mut backoff = [Instant::now(); 2];
+    let mut redials = Redials::new();
     let mut tick = tokio::time::interval(RECONNECT_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // SACKs must flow back to the server fast enough that its retention window
@@ -700,7 +770,6 @@ async fn pump(
                 let Some(d) = d else { return PumpEnd::Reconnect };
                 update_active(&shared, d.path);
                 shared.rx_bytes.fetch_add(d.packet.len() as u64, Ordering::Relaxed);
-                // Derive the utun family from the packet's IP version nibble.
                 let family = match d.packet.first().map(|b| b >> 4) {
                     Some(4) => utun::AddressFamily::Inet,
                     Some(6) => utun::AddressFamily::Inet6,
@@ -715,12 +784,27 @@ async fn pump(
                     warn!(%e, "utun write error");
                 }
             }
+            dead = transport.recv_dead() => {
+                warn!(path = %dead.label(), "path declared dead; retransmitted retained packets on survivor");
+                publish_status(transport, &shared);
+                start_redial(&mut redials, &shared, &mut backoff, dead);
+            }
+            (kind, result) = redials.next() => {
+                match result {
+                    Ok(connection) => {
+                        transport.install_reconnected_path(kind, connection);
+                        transport.send_frame_on(kind, &Frame::Hello { client_nonce });
+                        info!(path = %kind.label(), "path re-dialed; awaiting epoch acknowledgement");
+                    }
+                    Err(error) => warn!(path = %kind.label(), %error, "path re-dial failed; will retry"),
+                }
+            }
             _ = tick.tick() => {
                 if !shared.enabled.load(Ordering::Relaxed) {
                     return PumpEnd::Reconnect;
                 }
                 publish_status(transport, &shared);
-                reconnect_dead(transport, &shared, &mut backoff, client_nonce).await;
+                maintain_paths(transport, &shared, &mut redials, &mut backoff, client_nonce);
             }
         }
     }
@@ -742,41 +826,41 @@ fn update_active(shared: &Shared, kind: PathKind) {
     shared.paths.write().unwrap().active = Some(kind);
 }
 
-async fn reconnect_dead(
+fn maintain_paths(
     transport: &Transport,
     shared: &Shared,
+    redials: &mut Redials,
     backoff: &mut [Instant; 2],
     client_nonce: u64,
 ) {
     for kind in PathKind::ALL {
-        let idx = match kind {
-            PathKind::Wired => 0,
-            PathKind::Wifi => 1,
-        };
-        if backoff[idx].elapsed() < RECONNECT_BACKOFF {
-            continue;
-        }
-
         if transport.is_alive(kind) {
-            if !transport.is_ready(kind) {
-                backoff[idx] = Instant::now();
+            if !transport.is_ready(kind) && backoff[path_index(kind)].elapsed() >= RECONNECT_BACKOFF
+            {
+                backoff[path_index(kind)] = Instant::now();
                 transport.send_frame_on(kind, &Frame::Hello { client_nonce });
             }
             continue;
         }
-
-        backoff[idx] = Instant::now();
-        let src = match kind {
-            PathKind::Wired => shared.wired_src,
-            PathKind::Wifi => shared.wifi_src,
-        };
-        match transport.reconnect_path(kind, shared.server, src).await {
-            Ok(()) => {
-                transport.send_frame_on(kind, &Frame::Hello { client_nonce });
-                info!(path = %kind.label(), "path re-dialed; awaiting epoch acknowledgement");
-            }
-            Err(e) => warn!(path = %kind.label(), %e, "path re-dial failed; will retry"),
+        if backoff[path_index(kind)].elapsed() >= RECONNECT_BACKOFF {
+            start_redial(redials, shared, backoff, kind);
         }
+    }
+}
+
+fn start_redial(
+    redials: &mut Redials,
+    shared: &Shared,
+    backoff: &mut [Instant; 2],
+    kind: PathKind,
+) {
+    let index = path_index(kind);
+    let source = match kind {
+        PathKind::Wired => shared.wired_src,
+        PathKind::Wifi => shared.wifi_src,
+    };
+    if redials.start(kind, shared.server, source) {
+        backoff[index] = Instant::now();
     }
 }
 
@@ -826,11 +910,30 @@ fn source_ipv4(ip: &IpAddr) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CanaryReject, build_canary_request, build_canary_request_v6, canary_identity,
+        CanaryReject, Redials, build_canary_request, build_canary_request_v6, canary_identity,
         icmpv6_checksum, internet_checksum, validate_canary_reply, validate_canary_reply_v6,
     };
+    use multipass::PathKind;
     use multipass_proto::{TUNNEL_V6_CLIENT, TUNNEL_V6_SERVER};
+    use std::time::{Duration, Instant};
 
+    #[tokio::test]
+    async fn redial_start_does_not_block_the_pump() {
+        let mut redials = Redials::new();
+        let server = "127.0.0.1:9".parse().unwrap();
+        let source = "127.0.0.1".parse().unwrap();
+
+        let started = Instant::now();
+        assert!(redials.start(PathKind::Wired, server, source));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "starting a failed dial must not block the packet pump"
+        );
+        assert!(
+            !redials.start(PathKind::Wired, server, source),
+            "only one dial per path may be in flight"
+        );
+    }
     #[test]
     fn raw_canary_request_is_valid_ipv4_icmp() {
         let packet = build_canary_request(0x1234, 7);

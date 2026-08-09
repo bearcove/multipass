@@ -45,7 +45,10 @@ impl SendWindow {
             self.entries.push_back(Some(packet));
             return;
         }
-        debug_assert!(seq > self.max_seq, "sequences must be monotonically increasing");
+        debug_assert!(
+            seq > self.max_seq,
+            "sequences must be monotonically increasing"
+        );
         // Extend the ring with None for any gap (shouldn't happen, but be safe)
         while self.max_seq + 1 < seq {
             self.entries.push_back(None);

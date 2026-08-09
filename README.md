@@ -1,12 +1,13 @@
 # multipass
 
-Seamless network failover for a Mac with two connections at once. Unplug the
-Ethernet cable mid-SSH-session and nothing drops — the tunnel just keeps
-flowing over Wi-Fi. Plug it back in, it comes back. Pull Wi-Fi instead, same
-thing. No reconnect, no re-handshake, no "your session has been terminated."
+Experimental dual-link packet tunnel for a Mac connected over Ethernet and
+Wi-Fi at the same time. The target is to aggregate both links for throughput
+while preserving ordinary TCP, UDP, ICMP, IPv4, and IPv6 sessions when either
+physical path disappears.
 
-macOS 27+ client, Linux server (runs on the router). All our own Rust + a
-SwiftUI menubar app.
+The macOS 27+ client and Linux router server work end to end today, including
+dual-stack forwarding. Seamless failover and full aggregate throughput are not
+yet proven; see [Status](#status) for measured results and the current blocker.
 
 ## Why this exists
 
@@ -33,45 +34,83 @@ don't), and WireGuard roaming still stalls sessions for seconds on a path
 drop. The seamless property needs multipath at the *packet* layer, not the
 transport layer — which is the whole trick.
 
+## Current scope
+
+- One macOS client (`scooter`) and one Linux router/server (`jax`).
+- Two simultaneously active underlay paths: wired Ethernet and Wi-Fi.
+- Raw IPv4 and IPv6 packets through one stable dual-stack tunnel interface.
+- Bidirectional bandwidth aggregation: client→server and server→client.
+- Sequence-numbered packets, selective acknowledgements, retransmission, and
+  receive-side deduplication.
+- IPv4 masquerading and IPv6 NAT66 at the router. Native routed IPv6 can replace
+  NAT66 once ISP prefix delegation is available.
+
+Multi-client operation and non-macOS clients are outside the current scope.
+
 ## How it works
 
-Two ideas: aggregation for throughput, and a reliability layer for seamlessness.
-
-- The client opens **two independent QUIC connections** to the router — one
-  pinned to the wired interface, one to Wi-Fi.
-- Outgoing packets are **striped across both** connections by a
-  congestion-aware scheduler (lowest RTT + queue cost). A single flow can use
-  both links at once — ~2.4 Gbps wired + ~0.9 Gbps Wi-Fi ≈ 3.3 Gbps.
-- Every packet carries a **sequence number** and is retained in a send window
-  until the peer's **selective ACK** confirms it. On a gap or path failure the
-  same sequence is retransmitted on the surviving path; the receiver dedups by
-  sequence, so nothing is lost or duplicated.
-- Unplugging either link retransmits that path's in-flight packets onto the
-  survivor. No reconnect or re-handshake — sessions stay up.
+- The client opens **two independent QUIC connections** to the router: one
+  bound to the wired interface and one bound to Wi-Fi.
+- A congestion-aware scheduler sends each tunnel packet on one path according
+  to measured RTT and outgoing queue pressure. The intended result is striping
+  traffic across both links rather than duplicating every packet.
+- Every packet carries a **sequence number** and remains in a bounded send
+  window until the peer's **selective ACK** confirms receipt. Missing sequences
+  can be retransmitted on a surviving path; the receiver deduplicates by
+  sequence number.
+- The tunnel carries both IPv4 and IPv6 at MTU 1280. Applications continue to
+  use ordinary sockets and see only the stable tunnel addresses.
 
 ```
    your apps (ssh, browser, git — anything)
-        │  plain IP, unchanged
+        │  IPv4 + IPv6, unchanged
         ▼
-   ┌─────────────┐      ┌── conn A (en17, wired) ──┐
-   │  utun dev   │─────►│  striped by RTT/queue     │──► router ──► internet
-   │ (tun IP)    │      └── conn B (en0,  wifi)  ──┘
-   └─────────────┘   seq-tagged, SACK-acked, deduped
-     stable tunnel IP — apps never see the path change
+   ┌─────────────┐      ┌── QUIC A (en17, wired) ──┐
+   │  utun dev   │─────►│  scheduler + send window  │──► router ──► internet
+   │ dual-stack  │      └── QUIC B (en0, Wi-Fi)  ──┘
+   └─────────────┘       sequence + SACK + dedup
+       stable tunnel addresses across physical paths
 ```
-
-Measured on the real desk (unplug eth, replug, unplug wifi, replug): **0.1%
-packet loss, worst gap 184 ms**, and that spike is the interface coming *back*,
-not the failure. The failure direction is effectively zero-gap.
-
-Dual-stack: the tunnel carries IPv4 and IPv6 (MTU 1280). IPv6 uses NAT66 at the
-router until the ISP prefix delegation arrives, then switches to native routed.
 
 ## Status
 
-**Early.** The transport (the hard part, the seamless-failover property) is
-proven and working. The rest — the TUN device, routing, the menubar app, the
-server-side forwarding — is being built. See `docs/ARCHITECTURE.md`.
+**Experimental. The dual-stack tunnel works; the seamless-failover contract
+does not yet. Do not rely on the current build to preserve sessions during a
+path failure.**
+
+Verified on the real `scooter` ↔ `jax` deployment:
+
+- Both wired and Wi-Fi QUIC connections authenticate concurrently.
+- IPv4 tunnel reachability: 5/5 pings, 0% loss, 1.30 ms average.
+- IPv6 tunnel reachability: 5/5 pings, 0% loss, 3.28 ms average.
+- Public IPv6 through NAT66: 5/5 pings, 0% loss, 1.31 ms average.
+- IPv4 and IPv6 HTTPS both complete through the tunnel.
+- The router has `10.10.99.1/24` and `fd00:99::1/64`; the client has
+  `10.10.99.2/24` and `fd00:99::2/64`.
+
+Current throughput measurements (`iperf3`, four streams):
+
+| Path | Throughput |
+| --- | ---: |
+| Raw wired | 2.35 Gbit/s |
+| Raw Wi-Fi | 0.68 Gbit/s |
+| Raw combined capacity | 3.03 Gbit/s |
+| Tunnel upload | 0.66 Gbit/s |
+| Tunnel download | 1.38 Gbit/s |
+
+Aggregation machinery exists in both directions, but the tunnel is not yet
+reaching the sum of the physical links.
+
+The critical correctness defect is silent path loss. In a production test that
+blackholed only wired QUIC traffic for eight seconds, concurrent IPv4 and IPv6
+tunnel pings each delivered 173/250 packets: **30.8% loss**, covering nearly the
+entire blackhole interval. The failed connection remained locally "alive", so
+the scheduler continued choosing it instead of moving traffic to Wi-Fi. Path
+death consumption, bounded liveness detection, non-blocking redial, and the
+resulting retransmission path must be fixed and re-verified before the project
+can claim seamless failover.
+
+See `docs/ARCHITECTURE.md` for the protocol and component design.
 
 ## Layout
 
