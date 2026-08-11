@@ -216,7 +216,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(iface = %utun_name, "utun open");
     let (tx_q, mut rx_q) = mpsc::channel::<Bytes>(256);
     spawn_utun_reader(utun.clone(), tx_q);
-    let mut seq = 0u64;
 
     let shared = Shared::new(&opts, wired_iface, wifi_iface, utun_name);
     let ipc_shared = shared.clone();
@@ -243,6 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 continue;
             }
 
+            let mut seq = new_epoch_sequence();
             let client_nonce = new_client_nonce();
             let mut transport = match Transport::connect(opts.server, opts.wired, opts.wifi).await {
                 Ok(t) => t,
@@ -466,6 +466,10 @@ async fn handshake(
         }
     }
     assignment.ok_or_else(|| "no assignment received".into())
+}
+
+fn new_epoch_sequence() -> u64 {
+    0
 }
 
 fn new_client_nonce() -> u64 {
@@ -995,8 +999,8 @@ fn source_ipv4(ip: &IpAddr) -> Option<Ipv4Addr> {
 mod tests {
     use super::{
         CanaryReject, Redials, Shared, build_canary_request, build_canary_request_v6,
-        canary_identity, icmpv6_checksum, internet_checksum, validate_canary_reply,
-        validate_canary_reply_v6,
+        canary_identity, icmpv6_checksum, internet_checksum, new_epoch_sequence,
+        validate_canary_reply, validate_canary_reply_v6,
     };
     use multipass::PathKind;
     use std::sync::RwLock;
@@ -1088,6 +1092,14 @@ mod tests {
         assert_eq!(&packet[12..16], &[10, 10, 99, 2]);
         assert_eq!(&packet[16..20], &[10, 10, 99, 1]);
         assert_eq!(packet[20], 8);
+    }
+
+    #[test]
+    fn each_transport_epoch_starts_with_sequence_zero() {
+        let mut first_epoch = new_epoch_sequence();
+        first_epoch += 42;
+        assert_eq!(first_epoch, 42);
+        assert_eq!(new_epoch_sequence(), 0);
     }
 
     #[test]

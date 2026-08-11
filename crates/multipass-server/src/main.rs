@@ -236,6 +236,7 @@ impl Session {
             state.reorder_activity = Instant::now();
             state.send_window = SendWindow::new(4096);
             state.scheduler = Scheduler::new();
+            self.seq.store(1, Ordering::Relaxed);
         }
 
         // Assign this connection the next free scheduling slot in the epoch.
@@ -747,6 +748,19 @@ mod tests {
         assert!(!session.authenticate(old_a, 10).await);
         assert!(!session.accept_data(old_b, 2).await);
         assert!(session.accept_data(new_conn, 1).await);
+    }
+
+    #[tokio::test]
+    async fn new_client_epoch_restarts_server_data_sequence() {
+        let session = Session::new();
+        let old = session.add_test_conn().await;
+        assert!(session.authenticate(old, 10).await);
+        assert_eq!(session.next_seq(), 1);
+        assert_eq!(session.next_seq(), 2);
+
+        let new = session.add_test_conn().await;
+        assert!(session.authenticate(new, 20).await);
+        assert_eq!(session.next_seq(), 1);
     }
 
     #[tokio::test]
