@@ -65,6 +65,10 @@ final class TunnelController {
     /// Bytes/second, derived from consecutive status polls.
     private(set) var txRate: Double = 0
     private(set) var rxRate: Double = 0
+    private(set) var wiredTxRate: Double = 0
+    private(set) var wiredRxRate: Double = 0
+    private(set) var wifiTxRate: Double = 0
+    private(set) var wifiRxRate: Double = 0
     /// Non-nil while the failover flash is showing; carries the path we
     /// failed over *to*. The view animates on insertion/removal.
     private(set) var failoverTo: ActivePath?
@@ -79,7 +83,15 @@ final class TunnelController {
     private let client: any DaemonRequesting
     private var pollTask: Task<Void, Never>?
     private var transition: (id: UUID, task: Task<Void, Error>)?
-    private var previousSample: (tx: UInt64, rx: UInt64, at: ContinuousClock.Instant)?
+    private var previousSample: (
+        tx: UInt64,
+        rx: UInt64,
+        wiredTx: UInt64,
+        wiredRx: UInt64,
+        wifiTx: UInt64,
+        wifiRx: UInt64,
+        at: ContinuousClock.Instant
+    )?
 
     init(
         client: any DaemonRequesting = DaemonClient(),
@@ -246,6 +258,10 @@ final class TunnelController {
             rttMs = nil
             txRate = 0
             rxRate = 0
+            wiredTxRate = 0
+            wiredRxRate = 0
+            wifiTxRate = 0
+            wifiRxRate = 0
             previousSample = nil
             lastError = error.localizedDescription
         }
@@ -258,12 +274,25 @@ final class TunnelController {
             let elapsed = now - previous.at
             let seconds = Double(elapsed.components.seconds)
                 + Double(elapsed.components.attoseconds) / 1e18
-            if seconds > 0, snapshot.tx >= previous.tx, snapshot.rx >= previous.rx {
-                txRate = Double(snapshot.tx - previous.tx) / seconds
-                rxRate = Double(snapshot.rx - previous.rx) / seconds
+            if seconds > 0 {
+                txRate = rate(current: snapshot.tx, previous: previous.tx, seconds: seconds)
+                rxRate = rate(current: snapshot.rx, previous: previous.rx, seconds: seconds)
+                wiredTxRate = rate(current: snapshot.wiredTx, previous: previous.wiredTx, seconds: seconds)
+                wiredRxRate = rate(current: snapshot.wiredRx, previous: previous.wiredRx, seconds: seconds)
+                wifiTxRate = rate(current: snapshot.wifiTx, previous: previous.wifiTx, seconds: seconds)
+                wifiRxRate = rate(current: snapshot.wifiRx, previous: previous.wifiRx, seconds: seconds)
             }
         }
-        previousSample = (snapshot.tx, snapshot.rx, now)
+        previousSample = (
+            snapshot.tx,
+            snapshot.rx,
+            snapshot.wiredTx,
+            snapshot.wiredRx,
+            snapshot.wifiTx,
+            snapshot.wifiRx,
+            now
+        )
+
 
         let wasConnected = state.isConnected
         state = snapshot.connected ? .connected : .disconnected
@@ -280,6 +309,10 @@ final class TunnelController {
             }
             activePath = snapshot.activePath
         }
+    }
+    private func rate(current: UInt64, previous: UInt64, seconds: Double) -> Double {
+        guard current >= previous else { return 0 }
+        return Double(current - previous) / seconds
     }
 
     private func flashFailover(to path: ActivePath) {

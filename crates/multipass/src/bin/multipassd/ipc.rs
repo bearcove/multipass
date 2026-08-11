@@ -25,7 +25,7 @@
 //! bytes up/down.
 
 use facet::Facet;
-use multipass_proto::{TUNNEL_SERVER, TUNNEL_V6_SERVER};
+use multipass_proto::TUNNEL_SERVER;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -78,6 +78,10 @@ enum Reply {
         rtt_ms: Option<f64>,
         tx: u64,
         rx: u64,
+        wired_tx: u64,
+        wired_rx: u64,
+        wifi_tx: u64,
+        wifi_rx: u64,
     },
     BenchmarkTopology {
         protocol_version: u32,
@@ -219,6 +223,10 @@ fn status_reply(shared: &Shared) -> Reply {
         rtt_ms,
         tx: shared.tx_bytes.load(Ordering::Relaxed),
         rx: shared.rx_bytes.load(Ordering::Relaxed),
+        wired_tx: paths.wired_tx,
+        wired_rx: paths.wired_rx,
+        wifi_tx: paths.wifi_tx,
+        wifi_rx: paths.wifi_rx,
     }
 }
 
@@ -229,7 +237,11 @@ fn benchmark_topology_reply(shared: &Shared) -> Reply {
         server_version: shared.authenticated_server_version(),
         underlay_target: shared.server.ip().to_string(),
         tunnel_ipv4_target: Some(TUNNEL_SERVER.to_string()),
-        tunnel_ipv6_target: Some(TUNNEL_V6_SERVER.to_string()),
+        tunnel_ipv6_target: shared
+            .tunnel_ipv6_server
+            .read()
+            .unwrap()
+            .map(|address| address.to_string()),
         listener_base_port: 5210,
         listener_count: 16,
         paths: vec![
@@ -266,6 +278,10 @@ mod tests {
                 wired_rtt_ms: Some(5.0),
                 wifi_rtt_ms: None,
                 active: Some(PathKind::Wired),
+                wired_tx: 11_000,
+                wired_rx: 12_000,
+                wifi_tx: 21_000,
+                wifi_rx: 22_000,
             }),
             server: "10.0.0.5:51823".parse().unwrap(),
             wired_src: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
@@ -274,6 +290,7 @@ mod tests {
             wifi_iface: "en0".into(),
             utun_name: "utun3".into(),
             server_version: std::sync::RwLock::new(Some("test-server".into())),
+            tunnel_ipv6_server: std::sync::RwLock::new(Some("2001:db8::1".parse().unwrap())),
         })
     }
 
@@ -300,6 +317,10 @@ mod tests {
                 rtt_ms,
                 tx,
                 rx,
+                wired_tx,
+                wired_rx,
+                wifi_tx,
+                wifi_rx,
             } => {
                 assert!(connected);
                 assert!(wired);
@@ -308,6 +329,10 @@ mod tests {
                 assert_eq!(rtt_ms, Some(5.0));
                 assert_eq!(tx, 100);
                 assert_eq!(rx, 200);
+                assert_eq!(wired_tx, 11_000);
+                assert_eq!(wired_rx, 12_000);
+                assert_eq!(wifi_tx, 21_000);
+                assert_eq!(wifi_rx, 22_000);
             }
             other => panic!("expected status reply, got {other:?}"),
         }
@@ -321,6 +346,10 @@ mod tests {
             wifi_alive: false,
             wired_rtt_ms: None,
             wifi_rtt_ms: None,
+            wired_tx: 0,
+            wired_rx: 0,
+            wifi_tx: 0,
+            wifi_rx: 0,
             active: Some(PathKind::Wired),
         };
         let json = handle_request("{\"cmd\":\"status\"}", &sh);
@@ -349,7 +378,7 @@ mod tests {
                 assert_eq!(server_version, "unknown");
                 assert_eq!(underlay_target, "10.0.0.5");
                 assert_eq!(tunnel_ipv4_target.as_deref(), Some("10.10.99.1"));
-                assert_eq!(tunnel_ipv6_target.as_deref(), Some("fd00:99::1"));
+                assert_eq!(tunnel_ipv6_target, None);
                 assert_eq!(listener_base_port, 5210);
                 assert_eq!(listener_count, 16);
                 assert_eq!(paths.len(), 2);
@@ -369,13 +398,17 @@ mod tests {
     #[test]
     fn benchmark_topology_reports_learned_server_version() {
         let sh = shared();
-        sh.transport_active("server-commit-456".into());
+        sh.transport_active(
+            "server-commit-456".into(),
+            Some("2001:db8::1".parse().unwrap()),
+        );
 
         let json = handle_request("{\"cmd\":\"benchmark_topology\"}", &sh);
         let reply: Reply = facet_json::from_str(&json).unwrap();
         let Reply::BenchmarkTopology {
             daemon_version,
             server_version,
+            tunnel_ipv6_target,
             ..
         } = reply
         else {
@@ -383,12 +416,16 @@ mod tests {
         };
         assert_eq!(daemon_version, env!("MULTIPASS_BUILD_COMMIT"));
         assert_eq!(server_version, "server-commit-456");
+        assert_eq!(tunnel_ipv6_target.as_deref(), Some("2001:db8::1"));
     }
 
     #[test]
     fn benchmark_topology_hides_identity_when_transport_is_inactive() {
         let sh = shared();
-        sh.transport_active("server-commit-456".into());
+        sh.transport_active(
+            "server-commit-456".into(),
+            Some("2001:db8::1".parse().unwrap()),
+        );
         sh.transport_inactive();
 
         let json = handle_request("{\"cmd\":\"benchmark_topology\"}", &sh);

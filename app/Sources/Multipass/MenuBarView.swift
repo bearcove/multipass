@@ -71,13 +71,17 @@ struct MenuBarView: View {
                 name: "Wired",
                 symbol: "cable.connector",
                 live: controller.wiredLive,
-                active: controller.activePath == .wired
+                active: controller.activePath == .wired,
+                txRate: controller.wiredTxRate,
+                rxRate: controller.wiredRxRate,
             )
             pathRow(
                 name: "Wi-Fi",
                 symbol: "wifi",
                 live: controller.wifiLive,
-                active: controller.activePath == .wifi
+                active: controller.activePath == .wifi,
+                txRate: controller.wifiTxRate,
+                rxRate: controller.wifiRxRate,
             )
             Divider()
             statsGrid
@@ -101,7 +105,14 @@ struct MenuBarView: View {
         }
     }
 
-    private func pathRow(name: String, symbol: String, live: Bool, active: Bool) -> some View {
+    private func pathRow(
+        name: String,
+        symbol: String,
+        live: Bool,
+        active: Bool,
+        txRate: Double,
+        rxRate: Double
+    ) -> some View {
         HStack(spacing: 10) {
             Image(systemName: symbol)
                 .frame(width: 20)
@@ -117,6 +128,12 @@ struct MenuBarView: View {
                     .background(Color.accentColor.opacity(0.15), in: .capsule)
             }
             Spacer()
+            if controller.state.isConnected {
+                Text("↑ \(rateText(txRate))  ↓ \(rateText(rxRate))")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .contentTransition(.numericText())
+            }
             Circle()
                 .fill(live ? Color.green : Color.red)
                 .frame(width: 8, height: 8)
@@ -127,7 +144,12 @@ struct MenuBarView: View {
                 .frame(width: 34, alignment: .trailing)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(name) path \(live ? "live" : "down")\(active ? ", active" : "")")
+        .accessibilityLabel(
+            "\(name) path \(live ? "live" : "down")\(active ? ", active" : "")"
+                + (controller.state.isConnected
+                    ? ", upload \(rateText(txRate)), download \(rateText(rxRate))"
+                    : "")
+        )
     }
 
     private var statsGrid: some View {

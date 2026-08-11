@@ -78,6 +78,37 @@ struct InstalledIdentityTests {
         #expect(topology.serverVersion == "server-789abcd")
     }
 
+    @Test("daemon status decodes per-path payload counters")
+    func daemonStatusDecodesPerPathPayloadCounters() throws {
+        let data = Data(#"""
+        {
+          "type": "status",
+          "connected": true,
+          "wired": true,
+          "wifi": true,
+          "active_path": "wired",
+          "rtt_ms": 4.2,
+          "tx": 1000,
+          "rx": 2000,
+          "wired_tx": 300,
+          "wired_rx": 400,
+          "wifi_tx": 700,
+          "wifi_rx": 1600
+        }
+        """#.utf8)
+
+        let reply = try JSONDecoder().decode(DaemonReply.self, from: data)
+        guard case .status(let snapshot) = reply else {
+            Issue.record("expected status reply")
+            return
+        }
+
+        #expect(snapshot.wiredTx == 300)
+        #expect(snapshot.wiredRx == 400)
+        #expect(snapshot.wifiTx == 700)
+        #expect(snapshot.wifiRx == 1600)
+    }
+
     @Test("daemon topology requires daemon identity metadata")
     func daemonTopologyRequiresDaemonIdentityMetadata() {
         let data = Data(#"""

@@ -11,6 +11,7 @@
 mod imp {
     use std::io;
     use std::mem;
+    use std::net::Ipv6Addr;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     use libc::{
@@ -36,8 +37,9 @@ mod imp {
         pub name: String,
     }
 
-    /// Create the device, assign `10.10.99.1/24`, set MTU, bring it up.
-    pub fn open() -> io::Result<Tun> {
+    /// Create the device, assign `10.10.99.1/24` and the configured IPv6
+    /// server address, set MTU, and bring it up.
+    pub fn open(ipv6_server: Ipv6Addr) -> io::Result<Tun> {
         let fd = open_dev_net_tun()?;
         let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
         // Empty name => kernel picks a free `tunN` and reports it back into ifr_name.
@@ -54,7 +56,7 @@ mod imp {
                 "TUNSETIFF returned an empty interface name",
             ));
         }
-        configure(&name)?;
+        configure(&name, ipv6_server)?;
         Ok(Tun { fd, name })
     }
 
@@ -67,7 +69,7 @@ mod imp {
     }
 
     /// Assign address, netmask, MTU and bring the link up.
-    fn configure(name: &str) -> io::Result<()> {
+    fn configure(name: &str, ipv6_server: Ipv6Addr) -> io::Result<()> {
         let sock = unsafe { libc::socket(AF_INET, SOCK_DGRAM, 0) };
         if sock < 0 {
             return Err(io::Error::last_os_error());
@@ -118,19 +120,15 @@ mod imp {
 
         // IPv6 address. ifreq ioctls are IPv4-only; use `ip` for the v6 address.
         // The link is up and MTU set, so this is a pure address add.
-        configure_v6(name)?;
+        configure_v6(name, ipv6_server)?;
 
         Ok(())
     }
 
     /// Assign the IPv6 tunnel address via `ip -6 addr add`. Returns Ok if the
     /// address is added (or already present).
-    fn configure_v6(name: &str) -> io::Result<()> {
-        let arg = format!(
-            "{}/{}",
-            multipass_proto::TUNNEL_V6_SERVER,
-            multipass_proto::TUNNEL_V6_PREFIX
-        );
+    fn configure_v6(name: &str, ipv6_server: Ipv6Addr) -> io::Result<()> {
+        let arg = format!("{ipv6_server}/64");
         let out = std::process::Command::new("ip")
             .args(["-6", "addr", "add", &arg, "dev", name])
             .output()?;
@@ -198,11 +196,12 @@ pub use imp::*;
 #[cfg(not(target_os = "linux"))]
 pub mod imp {
     use std::io;
+    use std::net::Ipv6Addr;
     pub struct Tun {
         pub fd: std::os::fd::OwnedFd,
         pub name: String,
     }
-    pub fn open() -> io::Result<Tun> {
+    pub fn open(_ipv6_server: Ipv6Addr) -> io::Result<Tun> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "multipass-server is linux only",

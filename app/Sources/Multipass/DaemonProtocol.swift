@@ -53,6 +53,10 @@ nonisolated struct StatusSnapshot: Decodable, Sendable {
     var rttMs: Double?
     var tx: UInt64
     var rx: UInt64
+    var wiredTx: UInt64
+    var wiredRx: UInt64
+    var wifiTx: UInt64
+    var wifiRx: UInt64
 
     private enum CodingKeys: String, CodingKey {
         case connected
@@ -62,6 +66,10 @@ nonisolated struct StatusSnapshot: Decodable, Sendable {
         case rttMs = "rtt_ms"
         case tx
         case rx
+        case wiredTx = "wired_tx"
+        case wiredRx = "wired_rx"
+        case wifiTx = "wifi_tx"
+        case wifiRx = "wifi_rx"
     }
 }
 

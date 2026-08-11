@@ -42,8 +42,8 @@ transport layer — which is the whole trick.
 - Bidirectional bandwidth aggregation: client→server and server→client.
 - Sequence-numbered packets, selective acknowledgements, retransmission, and
   receive-side deduplication.
-- IPv4 masquerading and IPv6 NAT66 at the router. Native routed IPv6 can replace
-  NAT66 once ISP prefix delegation is available.
+- IPv4 masquerading at the router. IPv6 uses a native routed `/64` supplied to
+  `multipass-server` at runtime; deployment-specific prefixes never belong in this repository.
 
 Multi-client operation and non-macOS clients are outside the current scope.
 
@@ -84,10 +84,10 @@ Verified on the real `scooter` ↔ `jax` deployment:
 - Both wired and Wi-Fi QUIC connections authenticate concurrently.
 - IPv4 tunnel reachability: 20/20 pings, 0% loss, 1.16 ms average.
 - IPv6 tunnel reachability: 20/20 pings, 0% loss, 3.71 ms average.
-- Public IPv6 through persistent NAT66: 20/20 pings, 0% loss.
+- Native routed public IPv6 configuration is implemented but not yet production-verified.
 - IPv4 and IPv6 HTTPS both complete through the tunnel.
-- The router has `10.10.99.1/24` and `fd00:99::1/64`; the client has
-  `10.10.99.2/24` and `fd00:99::2/64`.
+- The router and client receive stable tunnel addresses from the deployment's
+  runtime-configured IPv6 `/64`; the server assigns `::1` and the client `::2`.
 
 Current throughput measurements (`iperf3`, four streams):
 

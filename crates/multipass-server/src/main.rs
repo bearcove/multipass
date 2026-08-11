@@ -14,7 +14,7 @@
 mod tun;
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -22,7 +22,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use multipass_proto::{
     Dedup, Frame, PathKind, SackScoreboard, Scheduler, SendWindow, TUNNEL_CLIENT, TUNNEL_MTU,
-    TUNNEL_PREFIX, TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX, encode,
+    TUNNEL_PREFIX, encode,
 };
 use noq::{Connection, Endpoint, ServerConfig, TransportConfig};
 use noq_proto::crypto::rustls::QuicServerConfig;
@@ -34,6 +34,60 @@ const BIND_DEFAULT: &str = "0.0.0.0:51823";
 
 /// Outbound/inbound channel capacity to/from the TUN reader/writer threads.
 const TUN_CHANNEL: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServerOptions {
+    bind: SocketAddr,
+    ipv6_server: Ipv6Addr,
+    ipv6_client: Ipv6Addr,
+}
+
+impl ServerOptions {
+    fn new(bind: SocketAddr, prefix: Ipv6Addr) -> Self {
+        let base = u128::from(prefix);
+        Self {
+            bind,
+            ipv6_server: Ipv6Addr::from(base | 1),
+            ipv6_client: Ipv6Addr::from(base | 2),
+        }
+    }
+
+    fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Self, String> {
+        let mut args = args.into_iter();
+        let program = args
+            .next()
+            .map(|value| value.as_ref().to_owned())
+            .unwrap_or_else(|| "multipass-server".into());
+        let values = args
+            .map(|value| value.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        let (bind, prefix) = match values.as_slice() {
+            [prefix] => (
+                BIND_DEFAULT.parse().expect("valid default bind"),
+                prefix.as_str(),
+            ),
+            [bind, prefix] => (
+                bind.parse::<SocketAddr>()
+                    .map_err(|error| format!("invalid bind address: {error}"))?,
+                prefix.as_str(),
+            ),
+            _ => return Err(format!("usage: {program} [bind] <ipv6-prefix/64>")),
+        };
+        let (address, length) = prefix
+            .split_once('/')
+            .ok_or_else(|| "IPv6 prefix must include /64".to_owned())?;
+        if length != "64" {
+            return Err("IPv6 tunnel prefix must be /64".into());
+        }
+        let address = address
+            .parse::<Ipv6Addr>()
+            .map_err(|error| format!("invalid IPv6 tunnel prefix: {error}"))?;
+        if u128::from(address) & u64::MAX as u128 != 0 {
+            return Err("IPv6 tunnel prefix must not contain host bits".into());
+        }
+        Ok(Self::new(bind, address))
+    }
+}
 
 fn transport() -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
@@ -343,10 +397,10 @@ impl Session {
     }
 }
 
-fn server_assignment() -> Frame {
+fn server_assignment(ipv6_client: Ipv6Addr) -> Frame {
     Frame::Assign {
         ipv4: Some((TUNNEL_CLIENT, TUNNEL_PREFIX)),
-        ipv6: Some((TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX)),
+        ipv6: Some((ipv6_client, 64)),
         mtu: TUNNEL_MTU,
         dns: vec![],
         server_version: env!("MULTIPASS_BUILD_COMMIT").into(),
@@ -359,6 +413,7 @@ async fn conn_handler(
     id: u64,
     session: Arc<Session>,
     to_tun: mpsc::Sender<Bytes>,
+    ipv6_client: Ipv6Addr,
 ) {
     loop {
         match conn.read_datagram().await {
@@ -372,7 +427,7 @@ async fn conn_handler(
                         if !session.authenticate(id, client_nonce).await {
                             break;
                         }
-                        let assign = server_assignment();
+                        let assign = server_assignment(ipv6_client);
                         if conn.send_datagram(encode(&assign)).is_err() {
                             break;
                         }
@@ -407,9 +462,9 @@ async fn conn_handler(
     }
 }
 
-async fn run(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tun = tun::open()?;
-    info!(name = %tun.name, "TUN device up");
+async fn run(options: ServerOptions) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let tun = tun::open(options.ipv6_server)?;
+    info!(name = %tun.name, ipv6 = %options.ipv6_server, "TUN device up");
 
     // Spawn a reader thread (blocking read => packets as Bytes) and a writer
     // thread (Bytes => blocking write). Channels bridge them to the async
@@ -478,7 +533,7 @@ async fn run(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + 
         });
     }
 
-    let server = Endpoint::server(server_config(), bind)?;
+    let server = Endpoint::server(server_config(), options.bind)?;
     info!(addr = %server.local_addr()?, "listening for client connections");
 
     let session = Arc::new(Session::new());
@@ -512,7 +567,7 @@ async fn run(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + 
                         .and_then(|p| p.remote_address().ok());
                     info!(remote = ?remote, "client connection established");
                     let id = session.add_conn(conn.clone()).await;
-                    conn_handler(conn, id, session.clone(), to_tun).await;
+                    conn_handler(conn, id, session.clone(), to_tun, options.ipv6_client).await;
                     session.remove_conn(id).await;
                     info!(id, remote = ?remote, "client connection closed");
                 });
@@ -549,27 +604,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    let bind: SocketAddr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| BIND_DEFAULT.to_string())
-        .parse()?;
+    let options = ServerOptions::parse(std::env::args())?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(bind))
+    rt.block_on(run(options))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use noq::Endpoint;
 
-    use super::{Frame, Session, server_assignment, server_config};
-    use multipass_proto::{
-        TUNNEL_CLIENT, TUNNEL_PREFIX, TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX, encode,
-    };
+    use super::{Frame, ServerOptions, Session, server_assignment, server_config};
+    use multipass_proto::{TUNNEL_CLIENT, TUNNEL_PREFIX, encode};
 
     #[tokio::test]
     async fn new_client_epoch_evicts_old_connections_and_rejects_rollback() {
@@ -692,11 +742,12 @@ mod tests {
         assert_eq!(gaps, vec![2]);
     }
 
-    #[tokio::test]
-    async fn server_assigns_both_families() {
-        // The Assign the server sends on Hello must carry both an IPv4 and an
-        // IPv6 tunnel address, and the shared MTU 1280.
-        let assign = server_assignment();
+    #[test]
+    fn configured_prefix_drives_server_and_client_addresses() {
+        let prefix = Ipv6Addr::new(0x2001, 0xdb8, 0x1234, 0x5678, 0, 0, 0, 0);
+        let options = ServerOptions::new("127.0.0.1:51823".parse().unwrap(), prefix);
+
+        let assign = server_assignment(options.ipv6_client);
         let encoded = encode(&assign);
         let decoded = multipass_proto::decode(&encoded).unwrap();
         match decoded {
@@ -704,7 +755,11 @@ mod tests {
                 ipv4, ipv6, mtu, ..
             } => {
                 assert_eq!(ipv4, Some((TUNNEL_CLIENT, TUNNEL_PREFIX)));
-                assert_eq!(ipv6, Some((TUNNEL_V6_CLIENT, TUNNEL_V6_PREFIX)));
+                assert_eq!(ipv6, Some(("2001:db8:1234:5678::2".parse().unwrap(), 64)));
+                assert_eq!(
+                    options.ipv6_server,
+                    "2001:db8:1234:5678::1".parse::<Ipv6Addr>().unwrap()
+                );
                 assert_eq!(mtu, 1280);
             }
             _ => panic!("expected Assign"),
@@ -712,8 +767,38 @@ mod tests {
     }
 
     #[test]
+    fn runtime_prefix_accepts_default_and_explicit_bind_forms() {
+        let default = ServerOptions::parse(["multipass-server", "2001:db8::/64"]).unwrap();
+        assert_eq!(default.bind, "0.0.0.0:51823".parse().unwrap());
+        assert_eq!(
+            default.ipv6_client,
+            "2001:db8::2".parse::<Ipv6Addr>().unwrap()
+        );
+
+        let explicit =
+            ServerOptions::parse(["multipass-server", "127.0.0.1:51999", "2001:db8:1234::/64"])
+                .unwrap();
+        assert_eq!(explicit.bind, "127.0.0.1:51999".parse().unwrap());
+        assert_eq!(
+            explicit.ipv6_client,
+            "2001:db8:1234::2".parse::<Ipv6Addr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_prefix_rejects_non_64_and_host_bits() {
+        assert!(
+            ServerOptions::parse(["multipass-server", "127.0.0.1:51823", "2001:db8::/56"]).is_err()
+        );
+        assert!(
+            ServerOptions::parse(["multipass-server", "127.0.0.1:51823", "2001:db8::1/64"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn server_assign_carries_compile_time_build_identity() {
-        match server_assignment() {
+        match server_assignment("2001:db8::2".parse().unwrap()) {
             Frame::Assign { server_version, .. } => {
                 assert_eq!(server_version, env!("MULTIPASS_BUILD_COMMIT"));
                 assert!(!server_version.is_empty());

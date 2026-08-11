@@ -44,6 +44,48 @@ struct BenchmarkControllerTests {
         await tunnel.stop()
     }
 
+    @Test("per-path rates derive independently from consecutive daemon samples")
+    func perPathRatesDeriveIndependently() async throws {
+        let daemon = FakeDaemon(
+            connected: true,
+            statuses: [
+                statusSnapshot(connected: true, wiredTx: 100, wiredRx: 200, wifiTx: 300, wifiRx: 400),
+                statusSnapshot(connected: true, wiredTx: 1_100, wiredRx: 2_200, wifiTx: 3_300, wifiRx: 4_400),
+            ]
+        )
+        let tunnel = testTunnel(client: daemon)
+
+        _ = try await tunnel.observedStatus()
+        try await Task.sleep(for: .milliseconds(10))
+        _ = try await tunnel.observedStatus()
+
+        #expect(tunnel.wiredTxRate > 0)
+        #expect(tunnel.wiredRxRate > tunnel.wiredTxRate)
+        #expect(tunnel.wifiTxRate > tunnel.wiredRxRate)
+        #expect(tunnel.wifiRxRate > tunnel.wifiTxRate)
+    }
+
+    @Test("one reset path does not suppress rates on the other path")
+    func pathCounterResetIsIndependent() async throws {
+        let daemon = FakeDaemon(
+            connected: true,
+            statuses: [
+                statusSnapshot(connected: true, wiredTx: 10_000, wiredRx: 20_000, wifiTx: 30_000, wifiRx: 40_000),
+                statusSnapshot(connected: true, wiredTx: 100, wiredRx: 200, wifiTx: 31_000, wifiRx: 42_000),
+            ]
+        )
+        let tunnel = testTunnel(client: daemon)
+
+        _ = try await tunnel.observedStatus()
+        try await Task.sleep(for: .milliseconds(10))
+        _ = try await tunnel.observedStatus()
+
+        #expect(tunnel.wiredTxRate == 0)
+        #expect(tunnel.wiredRxRate == 0)
+        #expect(tunnel.wifiTxRate > 0)
+        #expect(tunnel.wifiRxRate > tunnel.wifiTxRate)
+    }
+
 
     @Test("a suite cannot start before daemon availability is confirmed")
     func suiteCannotStartBeforeDaemonObservation() {
@@ -1347,6 +1389,7 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
     private(set) var requests: [DaemonRequest] = []
     private(set) var events: [Event] = []
     private(set) var waitingRequest: DaemonRequest?
+    private var statuses: [StatusSnapshot]
     private var topology: BenchmarkTopology
     private let connectedTopology: BenchmarkTopology?
     private let connectError: (any Error & Sendable)?
@@ -1360,6 +1403,7 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
 
     init(
         connected: Bool,
+        statuses: [StatusSnapshot] = [],
         topology: BenchmarkTopology = testTopology,
         connectedTopology: BenchmarkTopology? = nil,
         connectError: (any Error & Sendable)? = nil,
@@ -1369,6 +1413,7 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
         rejectConcurrentRequestsWhileSuspended: Bool = false
     ) {
         self.connected = connected
+        self.statuses = statuses
         self.topology = topology
         self.connectedTopology = connectedTopology
         self.connectError = connectError
@@ -1394,6 +1439,9 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
 
         switch request {
         case .status:
+            if !statuses.isEmpty {
+                return .status(statuses.removeFirst())
+            }
             if staleStatusRepliesRemaining > 0 {
                 staleStatusRepliesRemaining -= 1
             } else if let pendingConnected {
@@ -1626,15 +1674,25 @@ private let allInvocations = try! BenchmarkPlanner.plan(
 private let rawInvocations = allInvocations.filter { $0.id.route != .tunnel }
 private let tunnelInvocations = allInvocations.filter { $0.id.route == .tunnel }
 
-private func statusSnapshot(connected: Bool) -> StatusSnapshot {
+private func statusSnapshot(
+    connected: Bool,
+    wiredTx: UInt64 = 0,
+    wiredRx: UInt64 = 0,
+    wifiTx: UInt64 = 0,
+    wifiRx: UInt64 = 0
+) -> StatusSnapshot {
     StatusSnapshot(
         connected: connected,
         wired: connected,
         wifi: false,
         activePath: connected ? .wired : nil,
         rttMs: connected ? 10 : nil,
-        tx: 0,
-        rx: 0
+        tx: wiredTx + wifiTx,
+        rx: wiredRx + wifiRx,
+        wiredTx: wiredTx,
+        wiredRx: wiredRx,
+        wifiTx: wifiTx,
+        wifiRx: wifiRx
     )
 }
 

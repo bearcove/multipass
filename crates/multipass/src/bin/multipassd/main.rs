@@ -51,9 +51,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use multipass::{PathKind, Transport, dial};
-use multipass_proto::{
-    Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_SERVER, TUNNEL_V6_CLIENT, TUNNEL_V6_SERVER,
-};
+use multipass_proto::{Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_SERVER};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
@@ -66,6 +64,10 @@ pub struct PathSnapshot {
     pub wifi_alive: bool,
     pub wired_rtt_ms: Option<f64>,
     pub wifi_rtt_ms: Option<f64>,
+    pub wired_tx: u64,
+    pub wired_rx: u64,
+    pub wifi_tx: u64,
+    pub wifi_rx: u64,
     pub active: Option<PathKind>,
 }
 
@@ -82,6 +84,7 @@ pub struct Shared {
     pub wifi_iface: String,
     pub utun_name: String,
     pub server_version: RwLock<Option<String>>,
+    pub tunnel_ipv6_server: RwLock<Option<std::net::Ipv6Addr>>,
 }
 
 impl Shared {
@@ -95,6 +98,10 @@ impl Shared {
                 wifi_alive: false,
                 wired_rtt_ms: None,
                 wifi_rtt_ms: None,
+                wired_tx: 0,
+                wired_rx: 0,
+                wifi_tx: 0,
+                wifi_rx: 0,
                 active: None,
             }),
             server: opts.server,
@@ -104,6 +111,7 @@ impl Shared {
             wifi_iface,
             utun_name,
             server_version: RwLock::new(None),
+            tunnel_ipv6_server: RwLock::new(None),
         })
     }
 
@@ -112,12 +120,18 @@ impl Shared {
         self.transport_inactive();
     }
 
-    fn transport_active(&self, server_version: String) {
+    fn transport_active(
+        &self,
+        server_version: String,
+        tunnel_ipv6_server: Option<std::net::Ipv6Addr>,
+    ) {
         *self.server_version.write().unwrap() = Some(server_version);
+        *self.tunnel_ipv6_server.write().unwrap() = tunnel_ipv6_server;
     }
 
     fn transport_inactive(&self) {
         *self.server_version.write().unwrap() = None;
+        *self.tunnel_ipv6_server.write().unwrap() = None;
     }
 
     fn is_transport_active(&self) -> bool {
@@ -268,15 +282,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     // Configure IPv6 if assigned. v6 is optional-but-atomic: if a
                     // v6 assignment is present, its configuration must succeed or
                     // the whole activation fails (no partial-tunnel leak).
-                    let v6_active = if let Some((v6_addr, v6_prefix)) = ipv6 {
+                    let v6_assignment = if let Some((v6_addr, v6_prefix)) = ipv6 {
                         if !routes::configure_v6(&utun_name, v6_addr, v6_prefix) {
                             error!("tunnel IPv6 configuration failed; disabling tunnel");
                             shared.enabled.store(false, Ordering::Relaxed);
                             continue;
                         }
-                        true
+                        Some((v6_addr, ipv6_server_address(v6_addr)))
                     } else {
-                        false
+                        None
                     };
                     if !shared.enabled.load(Ordering::Relaxed) {
                         continue;
@@ -288,9 +302,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         shared.enabled.store(false, Ordering::Relaxed);
                         continue;
                     }
-                    if v6_active {
-                        let v6_canary_ok =
-                            run_canary_pump_v6(&mut transport, &shared, &mut seq).await;
+                    if let Some((v6_client, v6_server)) = v6_assignment {
+                        let v6_canary_ok = run_canary_pump_v6(
+                            &mut transport,
+                            &shared,
+                            &mut seq,
+                            v6_client,
+                            v6_server,
+                        )
+                        .await;
                         if !v6_canary_ok {
                             error!("IPv6 dataplane canary failed; disabling tunnel");
                             shared.enabled.store(false, Ordering::Relaxed);
@@ -310,7 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         shared.enabled.store(false, Ordering::Relaxed);
                         continue;
                     }
-                    if v6_active && !routes::setup_v6(&utun_name) {
+                    if v6_assignment.is_some() && !routes::setup_v6(&utun_name) {
                         error!("IPv6 route activation failed; rolling back v4; disabling tunnel");
                         routes::teardown(
                             &shared.utun_name,
@@ -322,7 +342,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         continue;
                     }
                     if !shared.enabled.load(Ordering::Relaxed) {
-                        if v6_active {
+                        if v6_assignment.is_some() {
                             routes::teardown_v6(&shared.utun_name);
                         }
                         routes::teardown(
@@ -333,7 +353,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         );
                         continue;
                     }
-                    shared.transport_active(server_version);
+                    shared
+                        .transport_active(server_version, v6_assignment.map(|(_, server)| server));
                     let pump_end = pump(
                         utun.clone(),
                         &mut transport,
@@ -347,7 +368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                     shared.transport_inactive();
                     info!("transport inactive; restoring routes");
-                    if v6_active {
+                    if v6_assignment.is_some() {
                         routes::teardown_v6(&shared.utun_name);
                     }
                     routes::teardown(
@@ -544,11 +565,22 @@ async fn run_canary_pump(transport: &mut Transport, shared: &Shared, seq: &mut u
 }
 
 /// Prove the IPv6 return path. Same shape as the v4 canary but ICMPv6.
-async fn run_canary_pump_v6(transport: &mut Transport, shared: &Shared, seq: &mut u64) -> bool {
+async fn run_canary_pump_v6(
+    transport: &mut Transport,
+    shared: &Shared,
+    seq: &mut u64,
+    client: std::net::Ipv6Addr,
+    server: std::net::Ipv6Addr,
+) -> bool {
     let (identifier, echo_sequence) = canary_identity(*seq);
-    let packet = Bytes::copy_from_slice(&build_canary_request_v6(identifier, echo_sequence));
+    let packet = Bytes::copy_from_slice(&build_canary_request_v6(
+        client,
+        server,
+        identifier,
+        echo_sequence,
+    ));
     run_canary_with(transport, shared, seq, packet, move |p| {
-        validate_canary_reply_v6(p, identifier, echo_sequence)
+        validate_canary_reply_v6(p, client, server, identifier, echo_sequence)
     })
     .await
 }
@@ -676,28 +708,31 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// Build an ICMPv6 Echo Request canary from the tunnel client to the server.
-/// 40-byte IPv6 header + 8-byte ICMPv6 Echo header. The ICMPv6 checksum covers
-/// the IPv6 pseudo-header (src, dst, length, next-header).
-fn build_canary_request_v6(identifier: u16, sequence: u16) -> [u8; 48] {
+fn ipv6_server_address(client: std::net::Ipv6Addr) -> std::net::Ipv6Addr {
+    std::net::Ipv6Addr::from((u128::from(client) & !(u64::MAX as u128)) | 1)
+}
+
+/// Build an ICMPv6 Echo Request from the assigned tunnel client to server.
+fn build_canary_request_v6(
+    client: std::net::Ipv6Addr,
+    server: std::net::Ipv6Addr,
+    identifier: u16,
+    sequence: u16,
+) -> [u8; 48] {
     let mut packet = [0u8; 48];
     // IPv6 header
     packet[0] = 0x60; // version 6, traffic class 0, flow label 0
     packet[4..6].copy_from_slice(&8u16.to_be_bytes()); // payload length = 8 (ICMPv6)
     packet[6] = 58; // next header = ICMPv6
     packet[7] = 64; // hop limit
-    packet[8..24].copy_from_slice(&TUNNEL_V6_CLIENT.octets());
-    packet[24..40].copy_from_slice(&TUNNEL_V6_SERVER.octets());
+    packet[8..24].copy_from_slice(&client.octets());
+    packet[24..40].copy_from_slice(&server.octets());
     // ICMPv6 Echo Request
     packet[40] = 128; // type = Echo Request
     packet[41] = 0; // code
     packet[44..46].copy_from_slice(&identifier.to_be_bytes());
     packet[46..48].copy_from_slice(&sequence.to_be_bytes());
-    let csum = icmpv6_checksum(
-        &TUNNEL_V6_CLIENT.octets(),
-        &TUNNEL_V6_SERVER.octets(),
-        &packet[40..],
-    );
+    let csum = icmpv6_checksum(&client.octets(), &server.octets(), &packet[40..]);
     packet[42..44].copy_from_slice(&csum.to_be_bytes());
     packet
 }
@@ -717,6 +752,8 @@ fn icmpv6_checksum(src: &[u8; 16], dst: &[u8; 16], msg: &[u8]) -> u16 {
 /// Validate an ICMPv6 Echo Reply canary from the server to the client.
 fn validate_canary_reply_v6(
     packet: &[u8],
+    client: std::net::Ipv6Addr,
+    server: std::net::Ipv6Addr,
     identifier: u16,
     sequence: u16,
 ) -> Result<(), CanaryReject> {
@@ -726,10 +763,10 @@ fn validate_canary_reply_v6(
     if packet[6] != 58 {
         return Err(CanaryReject::Protocol);
     }
-    if packet[8..24] != TUNNEL_V6_SERVER.octets() {
+    if packet[8..24] != server.octets() {
         return Err(CanaryReject::Source);
     }
-    if packet[24..40] != TUNNEL_V6_CLIENT.octets() {
+    if packet[24..40] != client.octets() {
         return Err(CanaryReject::Destination);
     }
     if packet[40] != 129 || packet[41] != 0 {
@@ -741,11 +778,7 @@ fn validate_canary_reply_v6(
     if packet[46..48] != sequence.to_be_bytes() {
         return Err(CanaryReject::Sequence);
     }
-    let csum = icmpv6_checksum(
-        &TUNNEL_V6_SERVER.octets(),
-        &TUNNEL_V6_CLIENT.octets(),
-        &packet[40..],
-    );
+    let csum = icmpv6_checksum(&server.octets(), &client.octets(), &packet[40..]);
     if csum != 0 {
         return Err(CanaryReject::IcmpChecksum);
     }
@@ -865,6 +898,10 @@ fn publish_status(transport: &Transport, shared: &Shared) {
         wifi_alive: st.wifi.alive,
         wired_rtt_ms: st.wired.rtt.map(|d| d.as_secs_f64() * 1000.0),
         wifi_rtt_ms: st.wifi.rtt.map(|d| d.as_secs_f64() * 1000.0),
+        wired_tx: st.wired.transmitted_bytes,
+        wired_rx: st.wired.received_bytes,
+        wifi_tx: st.wifi.transmitted_bytes,
+        wifi_rx: st.wifi.received_bytes,
         active,
     };
 }
@@ -962,7 +999,6 @@ mod tests {
         validate_canary_reply_v6,
     };
     use multipass::PathKind;
-    use multipass_proto::{TUNNEL_V6_CLIENT, TUNNEL_V6_SERVER};
     use std::sync::RwLock;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -990,7 +1026,7 @@ mod tests {
         let shared = shared_with_server_version(None);
 
         assert_eq!(shared.authenticated_server_version(), "unknown");
-        shared.transport_active("server-commit-456".into());
+        shared.transport_active("server-commit-456".into(), None);
         assert!(shared.is_transport_active());
         assert_eq!(shared.authenticated_server_version(), "server-commit-456");
     }
@@ -1027,6 +1063,10 @@ mod tests {
                 wifi_alive: true,
                 wired_rtt_ms: None,
                 wifi_rtt_ms: None,
+                wired_tx: 0,
+                wired_rx: 0,
+                wifi_tx: 0,
+                wifi_rx: 0,
                 active: Some(PathKind::Wired),
             }),
             server: "127.0.0.1:51823".parse().unwrap(),
@@ -1036,6 +1076,7 @@ mod tests {
             wifi_iface: "en0".into(),
             utun_name: "utun3".into(),
             server_version: RwLock::new(server_version.map(str::to_string)),
+            tunnel_ipv6_server: RwLock::new(None),
         }
     }
     #[test]
@@ -1103,42 +1144,36 @@ mod tests {
     }
 
     #[test]
-    fn v6_canary_request_is_valid_icmpv6() {
-        let packet = build_canary_request_v6(0x1234, 7);
+    fn v6_canary_uses_assigned_tunnel_addresses() {
+        let client: std::net::Ipv6Addr = "2001:db8:1234:5678::2".parse().unwrap();
+        let server: std::net::Ipv6Addr = "2001:db8:1234:5678::1".parse().unwrap();
+        let packet = build_canary_request_v6(client, server, 0x1234, 7);
         assert_eq!(packet.len(), 48);
         assert_eq!(packet[0] >> 4, 6, "IPv6 version nibble");
         assert_eq!(packet[6], 58, "next header ICMPv6");
-        assert_eq!(&packet[8..24], &TUNNEL_V6_CLIENT.octets());
-        assert_eq!(&packet[24..40], &TUNNEL_V6_SERVER.octets());
+        assert_eq!(&packet[8..24], &client.octets());
+        assert_eq!(&packet[24..40], &server.octets());
         assert_eq!(packet[40], 128, "Echo Request");
-        // Request checksum must be valid over pseudo-header + message.
-        let csum = icmpv6_checksum(
-            &TUNNEL_V6_CLIENT.octets(),
-            &TUNNEL_V6_SERVER.octets(),
-            &packet[40..],
+        assert_eq!(
+            icmpv6_checksum(&client.octets(), &server.octets(), &packet[40..]),
+            0
         );
-        assert_eq!(csum, 0, "ICMPv6 checksum valid");
-    }
 
-    #[test]
-    fn v6_canary_reply_validates() {
-        // Build a reply: swap src/dst, set type 129, recompute checksum.
-        let mut reply = build_canary_request_v6(0x1234, 7).to_vec();
-        reply[8..24].copy_from_slice(&TUNNEL_V6_SERVER.octets());
-        reply[24..40].copy_from_slice(&TUNNEL_V6_CLIENT.octets());
-        reply[40] = 129; // Echo Reply
+        let mut reply = packet.to_vec();
+        reply[8..24].copy_from_slice(&server.octets());
+        reply[24..40].copy_from_slice(&client.octets());
+        reply[40] = 129;
         reply[42..44].fill(0);
-        let csum = icmpv6_checksum(
-            &TUNNEL_V6_SERVER.octets(),
-            &TUNNEL_V6_CLIENT.octets(),
-            &reply[40..],
-        );
+        let csum = icmpv6_checksum(&server.octets(), &client.octets(), &reply[40..]);
         reply[42..44].copy_from_slice(&csum.to_be_bytes());
 
-        assert_eq!(validate_canary_reply_v6(&reply, 0x1234, 7), Ok(()));
+        assert_eq!(
+            validate_canary_reply_v6(&reply, client, server, 0x1234, 7),
+            Ok(())
+        );
         reply[42] ^= 1;
         assert_eq!(
-            validate_canary_reply_v6(&reply, 0x1234, 7),
+            validate_canary_reply_v6(&reply, client, server, 0x1234, 7),
             Err(CanaryReject::IcmpChecksum)
         );
     }

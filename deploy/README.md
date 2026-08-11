@@ -17,6 +17,11 @@ ssh jax.vxn.rs 'sudo install -m 0755 /tmp/multipass-server /usr/local/bin/multip
 ssh jax.vxn.rs 'sudo systemctl restart multipass-server'
 ```
 
+`multipass-server` requires the deployment's routed IPv6 `/64` as its second
+argument: `multipass-server 0.0.0.0:51823 <ipv6-prefix>/64`. Keep the real prefix
+in the private router configuration; use documentation prefixes in this public
+repository.
+
 Build `multipassd` and the app from the same exact commit. After installing both
 ends, query `benchmark_topology`: `daemon_version` must match the installed
 client artifact and `server_version` must match `COMMIT`. The server identity is

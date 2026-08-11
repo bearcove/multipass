@@ -210,9 +210,12 @@ struct Path {
     /// older generation must not kill the newly installed path.
     generation: Arc<AtomicU64>,
     started: Instant,
-    /// Datagrams received / transmitted on this path.
+    /// Datagram counts, retained for transport diagnostics and tests.
     received: Arc<AtomicU64>,
     transmitted: Arc<AtomicU64>,
+    /// Tunnel payload bytes received / transmitted on this path.
+    received_bytes: Arc<AtomicU64>,
+    transmitted_bytes: Arc<AtomicU64>,
 }
 
 impl Path {
@@ -230,6 +233,8 @@ impl Path {
             started: Instant::now(),
             received: Arc::new(AtomicU64::new(0)),
             transmitted: Arc::new(AtomicU64::new(0)),
+            received_bytes: Arc::new(AtomicU64::new(0)),
+            transmitted_bytes: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -245,6 +250,8 @@ impl Path {
             rtt,
             received: self.received.load(Ordering::Relaxed),
             transmitted: self.transmitted.load(Ordering::Relaxed),
+            received_bytes: self.received_bytes.load(Ordering::Relaxed),
+            transmitted_bytes: self.transmitted_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -296,6 +303,10 @@ pub struct PathStatus {
     pub received: u64,
     /// Datagrams transmitted on this path.
     pub transmitted: u64,
+    /// Tunnel payload bytes received on this path.
+    pub received_bytes: u64,
+    /// Tunnel payload bytes transmitted on this path.
+    pub transmitted_bytes: u64,
 }
 
 /// Snapshot of both paths.
@@ -422,6 +433,7 @@ impl Transport {
     /// Returns `true` if the packet was queued on a path (retained regardless
     /// of the local send outcome). Returns `false` only if no path is ready.
     pub fn send_data(&self, seq: u64, packet: Bytes) -> bool {
+        let packet_len = packet.len() as u64;
         // A packet that can never fit a datagram is rejected outright; no path
         // could ever carry it, so retaining it would wedge the window.
         let encoded = multipass_proto::encode(&Frame::Data {
@@ -471,6 +483,8 @@ impl Transport {
         match path.conn.lock().unwrap().send_datagram(encoded) {
             Ok(()) => {
                 path.transmitted.fetch_add(1, Ordering::Relaxed);
+                path.transmitted_bytes
+                    .fetch_add(packet_len, Ordering::Relaxed);
                 true
             }
             Err(e) => {
@@ -511,10 +525,13 @@ impl Transport {
         let Some(kind) = kind else {
             return;
         };
+        let packet_len = packet.len() as u64;
         let encoded = multipass_proto::encode(&Frame::Data { seq, packet });
         let path = self.path(kind);
         if path.conn.lock().unwrap().send_datagram(encoded).is_ok() {
             path.transmitted.fetch_add(1, Ordering::Relaxed);
+            path.transmitted_bytes
+                .fetch_add(packet_len, Ordering::Relaxed);
             tracing::debug!(seq, path = %kind.label(), "retransmitted packet");
         }
     }
@@ -733,6 +750,8 @@ fn spawn_reader(
                     mark_recv();
                     match multipass_proto::decode(&d) {
                         Some(Frame::Data { seq, packet }) => {
+                            path.received_bytes
+                                .fetch_add(packet.len() as u64, Ordering::Relaxed);
                             if data_tx
                                 .send(Data {
                                     seq,
@@ -1058,6 +1077,18 @@ mod tests {
         // sent once, on one path), not 2N as in replication. Every packet is
         // retained in the send window for possible retransmission.
         let st = t.status();
+        let total_tx_bytes = st.wired.transmitted_bytes + st.wifi.transmitted_bytes;
+        let total_rx_bytes = st.wired.received_bytes + st.wifi.received_bytes;
+        assert_eq!(
+            total_tx_bytes,
+            N * 5,
+            "path counters track sent payload bytes"
+        );
+        assert_eq!(
+            total_rx_bytes,
+            N * 5,
+            "path counters track received payload bytes"
+        );
         let total_tx = st.wired.transmitted + st.wifi.transmitted;
         assert_eq!(total_tx, N, "each packet striped onto exactly one path");
     }

@@ -14,8 +14,8 @@ swift build        # produces .build/debug/Multipass
 | File | Role |
 | --- | --- |
 | `MultipassApp.swift` | `@main` App, single `MenuBarExtra` (`.window` style). Menubar icon is a state-reflecting SF Symbol: filled multipath glyph when connected, outline when disconnected, `network.slash` when the daemon is unreachable, animated arrows during a failover flash. |
-| `MenuBarView.swift` | The panel: header with state, per-path rows (Wired / Wi-Fi, green = live / red = down, ACTIVE badge on the current path), failover banner, RTT / sent / received / up / down rates, prominent Connect/Disconnect toggle (`d` shortcut), Launch-at-Login toggle, Quit (`q`). |
-| `TunnelController.swift` | `@Observable` model. Polls status once per second, serializes connect/disconnect commands, derives throughput rates from cumulative counters, and raises the failover flash when `active_path` changes while connected. |
+| `MenuBarView.swift` | The panel: header with state, per-path rows (Wired / Wi-Fi, inline ↑ upload and ↓ download rates, green = live / red = down, ACTIVE badge on the current path), failover banner, aggregate RTT / sent / received / up / down rates, prominent Connect/Disconnect toggle (`d` shortcut), Launch-at-Login toggle, Quit (`q`). |
+| `TunnelController.swift` | `@Observable` model. Polls status once per second, serializes connect/disconnect commands, derives aggregate and per-path throughput rates from cumulative counters, and raises the failover flash when `active_path` changes while connected. |
 | `DaemonClient.swift` | POSIX unix-socket client (actor). Lazy connect, one retry on a stale connection, 2s send/recv timeouts, `SO_NOSIGPIPE`. |
 | `DaemonProtocol.swift` | Codable encoding of the IPC schema below. |
 | `LaunchAtLogin.swift` | `SMAppService.mainApp` wrapper (same pattern as baratheon). |
@@ -49,7 +49,7 @@ Unknown `cmd` values MUST be answered with a `type:"error"` reply.
 **Status** — the only reply to `{"cmd":"status"}`:
 
 ```json
-{"type":"status","connected":true,"wired":true,"wifi":true,"active_path":"wired","rtt_ms":12.4,"tx":123456,"rx":789012}
+{"type":"status","connected":true,"wired":true,"wifi":true,"active_path":"wired","rtt_ms":12.4,"tx":123456,"rx":789012,"wired_tx":90000,"wired_rx":500000,"wifi_tx":33456,"wifi_rx":289012}
 ```
 
 | Field | Type | Meaning |
@@ -62,6 +62,8 @@ Unknown `cmd` values MUST be answered with a `type:"error"` reply.
 | `rtt_ms` | number \| null | Smoothed RTT of the active path in milliseconds. null when unknown/disconnected. |
 | `tx` | u64 | Cumulative tunnel payload bytes sent (into the tunnel) since the session started. MUST be monotonically non-decreasing across polls (the app derives rates from deltas); reset only on daemon restart / tunnel re-establishment. |
 | `rx` | u64 | Cumulative tunnel payload bytes received. Same monotonicity rule. |
+| `wired_tx` / `wired_rx` | u64 | Cumulative tunnel payload bytes transmitted/received through the wired QUIC path. The app derives the wired row's directional rates from consecutive samples. |
+| `wifi_tx` / `wifi_rx` | u64 | Equivalent cumulative counters for the Wi-Fi QUIC path. Retransmitted payload bytes count on the path that carries the retransmission; received bytes count before tunnel dedup so the rows describe physical-path traffic. |
 
 **Benchmark topology** — reply to `{"cmd":"benchmark_topology"}`:
 
