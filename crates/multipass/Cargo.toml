@@ -22,3 +22,11 @@ libc.workspace = true
 n0-error.workspace = true
 facet.workspace = true
 facet-json.workspace = true
+
+[[bin]]
+name = "multipass-linux-client"
+path = "src/bin/multipass-linux-client/main.rs"
+required-features = ["linux-client"]
+
+[features]
+linux-client = []

@@ -17,12 +17,12 @@ use std::collections::HashSet;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use multipass_proto::{
-    Dedup, Frame, PathKind, SackScoreboard, Scheduler, SendWindow, TUNNEL_CLIENT, TUNNEL_MTU,
-    TUNNEL_PREFIX, encode,
+    Frame, PathKind, ReorderBuffer, ReorderInsert, SackScoreboard, Scheduler, SendWindow,
+    TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, encode,
 };
 use noq::{Connection, Endpoint, ServerConfig, TransportConfig};
 use noq_proto::crypto::rustls::QuicServerConfig;
@@ -34,6 +34,7 @@ const BIND_DEFAULT: &str = "0.0.0.0:51823";
 
 /// Outbound/inbound channel capacity to/from the TUN reader/writer threads.
 const TUN_CHANNEL: usize = 1024;
+const REORDER_GAP_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ServerOptions {
@@ -92,6 +93,8 @@ impl ServerOptions {
 fn transport() -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
     tc.max_concurrent_multipath_paths(2);
+    tc.initial_mtu(1_400);
+    tc.min_mtu(1_400);
     tc.max_idle_timeout(Some(
         Duration::from_secs(2)
             .try_into()
@@ -137,9 +140,12 @@ struct SessionState {
     conns: Vec<LiveConn>,
     epoch: Option<u64>,
     retired_epochs: HashSet<u64>,
-    dedup: Dedup,
     /// Receive scoreboard for client→server packets; generates SACKs.
     scoreboard: SackScoreboard,
+    /// Admitted striped arrivals waiting for contiguous TUN delivery.
+    reorder: ReorderBuffer<Bytes>,
+    /// Last admitted arrival while a sequence gap may be pending.
+    reorder_activity: Instant,
     /// Retention window for server→client packets (aggregation retransmit).
     send_window: SendWindow,
     /// Path scheduler for server→client aggregation (the download direction).
@@ -161,13 +167,14 @@ impl Session {
                 conns: Vec::new(),
                 epoch: None,
                 retired_epochs: HashSet::new(),
-                dedup: Dedup::new(),
                 scoreboard: SackScoreboard::new(),
+                reorder: ReorderBuffer::new(4096),
+                reorder_activity: Instant::now(),
                 send_window: SendWindow::new(4096),
                 scheduler: Scheduler::new(),
             }),
             next_conn_id: AtomicU64::new(0),
-            seq: AtomicU64::new(0),
+            seq: AtomicU64::new(1),
         }
     }
 
@@ -224,8 +231,9 @@ impl Session {
                     }
                 });
             }
-            state.dedup = Dedup::new();
             state.scoreboard = SackScoreboard::new();
+            state.reorder = ReorderBuffer::new(4096);
+            state.reorder_activity = Instant::now();
             state.send_window = SendWindow::new(4096);
             state.scheduler = Scheduler::new();
         }
@@ -249,6 +257,7 @@ impl Session {
         true
     }
 
+    #[cfg(test)]
     async fn accept_data(&self, id: u64, seq: u64) -> bool {
         let mut state = self.state.lock().await;
         let Some(conn) = state.conns.iter().find(|conn| conn.id == id) else {
@@ -257,8 +266,87 @@ impl Session {
         if conn.epoch != state.epoch || conn.epoch.is_none() {
             return false;
         }
-        state.scoreboard.insert(seq);
-        state.dedup.insert(seq)
+        match state.reorder.insert(seq, Bytes::from_static(b"test")) {
+            ReorderInsert::Rejected => false,
+            ReorderInsert::Admitted => {
+                state.scoreboard.insert(seq);
+                true
+            }
+            ReorderInsert::AdmittedAfterSkipping { last, .. } => {
+                state.scoreboard.abandon_through(last);
+                state.scoreboard.insert(seq);
+                true
+            }
+        }
+    }
+
+    async fn accept_packet(&self, id: u64, seq: u64, packet: Bytes) -> Vec<Bytes> {
+        let mut state = self.state.lock().await;
+        let Some(conn) = state.conns.iter().find(|conn| conn.id == id) else {
+            return Vec::new();
+        };
+        if conn.epoch != state.epoch || conn.epoch.is_none() {
+            return Vec::new();
+        }
+        match state.reorder.insert(seq, packet) {
+            ReorderInsert::Rejected => {
+                debug!(
+                    seq,
+                    next_seq = state.reorder.next_seq(),
+                    occupancy = state.reorder.occupancy(),
+                    span = ?state.reorder.buffered_span(),
+                    "server reorder rejected arriving packet"
+                );
+                return Vec::new();
+            }
+            ReorderInsert::Admitted => {
+                state.scoreboard.insert(seq);
+            }
+            ReorderInsert::AdmittedAfterSkipping { first, last } => {
+                debug!(
+                    seq,
+                    first,
+                    last,
+                    next_seq = state.reorder.next_seq(),
+                    occupancy = state.reorder.occupancy(),
+                    span = ?state.reorder.buffered_span(),
+                    "server reorder window boundary skipped missing prefix"
+                );
+                state.scoreboard.abandon_through(last);
+                state.scoreboard.insert(seq);
+            }
+        }
+        state.reorder_activity = Instant::now();
+        let mut ready = Vec::new();
+        while let Some(packet) = state.reorder.pop_ready() {
+            ready.push(packet);
+        }
+        ready
+    }
+
+    async fn release_timed_out_gap(&self) -> Vec<Bytes> {
+        let mut state = self.state.lock().await;
+        if !state.reorder.has_gap() || state.reorder_activity.elapsed() < REORDER_GAP_TIMEOUT {
+            return Vec::new();
+        }
+        let Some((first, last)) = state.reorder.skip_missing_prefix() else {
+            return Vec::new();
+        };
+        debug!(
+            first,
+            last,
+            next_seq = state.reorder.next_seq(),
+            occupancy = state.reorder.occupancy(),
+            span = ?state.reorder.buffered_span(),
+            "server reorder gap timed out; releasing buffered suffix"
+        );
+        state.scoreboard.abandon_through(last);
+        state.reorder_activity = Instant::now();
+        let mut ready = Vec::new();
+        while let Some(packet) = state.reorder.pop_ready() {
+            ready.push(packet);
+        }
+        ready
     }
 
     /// Generate a SACK describing client→server receive state.
@@ -434,9 +522,10 @@ async fn conn_handler(
                         info!(id, client_nonce, "answered Hello: assigned");
                     }
                     Frame::Data { seq, packet } => {
-                        if session.accept_data(id, seq).await && to_tun.send(packet).await.is_err()
-                        {
-                            break;
+                        for packet in session.accept_packet(id, seq, packet).await {
+                            if to_tun.send(packet).await.is_err() {
+                                return;
+                            }
                         }
                     }
                     Frame::Ping { nonce } => {
@@ -527,6 +616,7 @@ async fn run(options: ServerOptions) -> Result<(), Box<dyn std::error::Error + S
                         warn!(%e, "TUN write error");
                         break;
                     }
+
                     p = &p[n as usize..];
                 }
             }
@@ -537,6 +627,23 @@ async fn run(options: ServerOptions) -> Result<(), Box<dyn std::error::Error + S
     info!(addr = %server.local_addr()?, "listening for client connections");
 
     let session = Arc::new(Session::new());
+    // A missing striped packet can stall inner TCP, so recovery must not wait
+    // for another arrival. Periodically abandon timed-out missing prefixes and
+    // release the already-admitted suffix to the TUN.
+    let reorder_session = session.clone();
+    let reorder_to_tun = to_tun_tx.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(10));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            for packet in reorder_session.release_timed_out_gap().await {
+                if reorder_to_tun.send(packet).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
 
     // Periodic SACK broadcast so the client can retire/retransmit its window.
     let sack_session = session.clone();
@@ -615,10 +722,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::time::Duration;
+
+    use bytes::Bytes;
 
     use noq::Endpoint;
 
-    use super::{Frame, ServerOptions, Session, server_assignment, server_config};
+    use super::{
+        Frame, REORDER_GAP_TIMEOUT, ServerOptions, Session, server_assignment, server_config,
+    };
     use multipass_proto::{TUNNEL_CLIENT, TUNNEL_PREFIX, encode};
 
     #[tokio::test]
@@ -662,6 +774,33 @@ mod tests {
         assert!(!session.authenticate(old, 10).await);
         assert!(session.accept_data(new_a, 1).await);
         assert!(session.accept_data(new_b, 2).await);
+    }
+
+    #[tokio::test]
+    async fn server_releases_buffered_suffix_after_gap_timeout_without_new_arrivals() {
+        let session = Session::new();
+        let conn = session.add_test_conn().await;
+        assert!(session.authenticate(conn, 10).await);
+
+        assert!(
+            session
+                .accept_packet(conn, 2, Bytes::from_static(b"two"))
+                .await
+                .is_empty()
+        );
+        assert!(
+            session
+                .accept_packet(conn, 3, Bytes::from_static(b"three"))
+                .await
+                .is_empty()
+        );
+        tokio::time::sleep(REORDER_GAP_TIMEOUT + Duration::from_millis(10)).await;
+
+        let ready = session.release_timed_out_gap().await;
+        assert_eq!(
+            ready,
+            vec![Bytes::from_static(b"two"), Bytes::from_static(b"three")]
+        );
     }
 
     #[tokio::test]
@@ -734,12 +873,11 @@ mod tests {
         session.send_data(2, bytes::Bytes::from_static(b"b")).await;
         session.send_data(3, bytes::Bytes::from_static(b"c")).await;
 
-        // Client SACKs 1 and 3, gap at 2 → seq 2 must be a retransmit candidate.
-        let gaps = {
-            let mut state = session.state.lock().await;
-            state.send_window.ack(1, &[(3, 3)])
-        };
-        assert_eq!(gaps, vec![2]);
+        // Reordering is not declared loss until three consecutive SACKs.
+        let mut state = session.state.lock().await;
+        assert!(state.send_window.ack(1, &[(3, 3)]).is_empty());
+        assert!(state.send_window.ack(1, &[(3, 3)]).is_empty());
+        assert_eq!(state.send_window.ack(1, &[(3, 3)]), vec![2]);
     }
 
     #[test]

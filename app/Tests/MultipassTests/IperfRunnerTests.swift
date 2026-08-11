@@ -36,7 +36,6 @@ struct IperfRunnerTests {
             "--omit", "0",
             "--interval", "1",
             "--connect-timeout", "1000",
-            "--json-stream-full-output",
             "--json-stream",
             "--forceflush",
             "--version4",

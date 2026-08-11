@@ -703,9 +703,9 @@ struct BenchmarkControllerTests {
         try await waitUntil { await runner.suspended }
 
         #expect(controller.totalMeasurementCount == allInvocations.count)
-        #expect(controller.completedMeasurementCount == 0)
+        #expect(controller.completedMeasurementCount == tunnelInvocations.count)
         #expect(controller.currentMeasurementID == rawInvocations[0].id)
-        #expect(controller.remainingMeasurementIDs == Array(allInvocations.dropFirst()).map(\.id))
+        #expect(controller.remainingMeasurementIDs == Array(rawInvocations.dropFirst()).map(\.id))
         #expect(controller.currentLiveSamples == [100])
 
         controller.cancel()
@@ -770,7 +770,7 @@ struct BenchmarkControllerTests {
         #expect(persisted.topology == run.topology)
         #expect(persisted.results == run.results)
         #expect(persisted.restorationError == run.restorationError)
-        #expect(await runner.invocationIDs == rawInvocations.map(\.id) + connectedTunnelInvocations.map(\.id))
+        #expect(await runner.invocationIDs == connectedTunnelInvocations.map(\.id) + rawInvocations.map(\.id))
         #expect(run.results.values.allSatisfy { !$0.isSkipped })
         #expect(await daemon.requests.filter { $0 == .benchmarkTopology }.count == 2)
         #expect(await daemon.connected == false)
@@ -806,7 +806,7 @@ struct BenchmarkControllerTests {
         #expect(controller.lastError?.contains("topology changed") == true)
         #expect(controller.completedRun == nil)
         #expect(try await store.loadRuns().runs.isEmpty)
-        #expect(await runner.invocationIDs == rawInvocations.map(\.id))
+        #expect(await runner.invocationIDs.isEmpty)
         #expect(await daemon.connected == false)
     }
 
@@ -834,11 +834,11 @@ struct BenchmarkControllerTests {
         #expect(controller.state == .failed)
         #expect(controller.lastError?.contains("authenticated server identity") == true)
         #expect(controller.completedRun == nil)
-        #expect(await runner.invocationIDs == rawInvocations.map(\.id))
+        #expect(await runner.invocationIDs.isEmpty)
         #expect(await daemon.connected == false)
     }
 
-    @Test("initially disconnected runs raw, connects, runs tunnel, then disconnects")
+    @Test("an initially disconnected suite connects, tests the tunnel first, disconnects for raw tests, then stays disconnected")
     func disconnectedFullSuiteRestoresDisconnected() async throws {
         let daemon = FakeDaemon(connected: false)
         let runner = FakeBenchmarkRunner(recorder: daemon)
@@ -880,25 +880,17 @@ struct BenchmarkControllerTests {
             "tunnel IPv6 target unavailable"
         ))
         #expect(await runner.invocationIDs == allInvocations.map(\.id))
-        #expect(await daemon.events == [
-            .request(.status),
-            .request(.benchmarkTopology),
-            .run(rawInvocations[0].id),
-            .run(rawInvocations[1].id),
-            .run(rawInvocations[2].id),
-            .run(rawInvocations[3].id),
-            .request(.status),
-            .request(.connect),
-            .request(.status),
-            .request(.status),
-            .request(.benchmarkTopology),
-            .run(tunnelInvocations[0].id),
-            .run(tunnelInvocations[1].id),
-            .request(.status),
-            .request(.disconnect),
-            .request(.status),
-            .request(.status),
-        ])
+        let events = await daemon.events
+        let runIDs = events.compactMap { event -> BenchmarkTestID? in
+            guard case .run(let id) = event else { return nil }
+            return id
+        }
+        #expect(runIDs == tunnelInvocations.map(\.id) + rawInvocations.map(\.id))
+        let firstRunIndex = try #require(events.firstIndex { if case .run = $0 { true } else { false } })
+        let disconnectIndex = try #require(events.firstIndex(of: .request(.disconnect)))
+        let firstRawIndex = try #require(events.firstIndex(of: .run(rawInvocations[0].id)))
+        #expect(firstRunIndex < disconnectIndex)
+        #expect(disconnectIndex < firstRawIndex)
         #expect(await daemon.connected == false)
     }
 
@@ -1042,7 +1034,7 @@ struct BenchmarkControllerTests {
         #expect(tunnel.state == .disconnected)
     }
 
-    @Test("initially connected uses its initial authenticated topology and never disconnects")
+    @Test("an initially connected suite tests the tunnel first, disconnects for raw tests, then restores connected")
     func connectedFullSuiteStaysConnected() async throws {
         let daemon = FakeDaemon(connected: true)
         let runner = FakeBenchmarkRunner(recorder: daemon)
@@ -1055,7 +1047,7 @@ struct BenchmarkControllerTests {
         #expect(controller.state == .completed)
         #expect(await daemon.connected)
         #expect(await daemon.requests.filter { $0 == .benchmarkTopology }.count == 1)
-        #expect(await daemon.requests.filter { $0 == .disconnect }.isEmpty)
+        #expect(await daemon.requests.filter { $0 == .disconnect }.count == 1)
         #expect(await runner.invocationIDs == allInvocations.map(\.id))
     }
 
@@ -1120,6 +1112,30 @@ struct BenchmarkControllerTests {
         #expect(await runner.suspended == false)
         #expect(await daemon.connected == false)
         #expect(await daemon.requests.contains(.disconnect))
+    }
+
+    @Test("cancelling after the first tunnel measurement restores the initial disconnected state")
+    func cancellationAfterFirstTunnelMeasurementRestoresDisconnected() async throws {
+        let daemon = FakeDaemon(connected: false)
+        let secondTunnel = try #require(tunnelInvocations.dropFirst().first)
+        let runner = FakeBenchmarkRunner(suspendOn: secondTunnel.id, recorder: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner
+        )
+
+        controller.startFullSuite()
+        try await waitUntil { await runner.suspended }
+        #expect(await runner.invocationIDs == [tunnelInvocations[0].id, secondTunnel.id])
+
+        controller.cancel()
+        try await waitUntil { !controller.isRunning }
+
+        #expect(controller.state == .cancelled)
+        #expect(await daemon.connected == false)
+        #expect(await daemon.requests.contains(.disconnect))
+        #expect(await runner.invocationIDs.allSatisfy { $0.route == .tunnel })
     }
 
     @Test("cancellation of the final measurement still marks the suite cancelled")
@@ -1195,7 +1211,7 @@ struct BenchmarkControllerTests {
 
         #expect(controller.state == .cancelled)
         #expect(controller.completedRun == nil)
-        #expect(controller.lastError?.contains("restore") == true)
+        #expect(controller.lastError?.contains("multipassd is not running") == true)
     }
 
     @Test("a cancelled second suite preserves the prior completed run")
@@ -1248,7 +1264,7 @@ struct BenchmarkControllerTests {
         #expect(controller.completedRun == prior)
     }
 
-    @Test("daemon loss during restoration is a distinct run-level error")
+    @Test("failure to disconnect before raw measurements fails the suite and restores disconnected")
     func restorationFailureIsDistinct() async throws {
         let daemon = FakeDaemon(connected: false, disconnectError: DaemonError.unavailable)
         let runner = FakeBenchmarkRunner(recorder: daemon)
@@ -1258,11 +1274,10 @@ struct BenchmarkControllerTests {
         controller.startFullSuite()
         try await waitUntil { !controller.isRunning }
 
-        #expect(controller.state == .completed)
-        #expect(controller.completedRun?.results.values.filter { !$0.isFailure && !$0.isSkipped }
-            .allSatisfy { $0.measurement != nil } == true)
-        #expect(controller.completedRun?.restorationError?.contains("restore") == true)
-        #expect(controller.lastError == nil)
+        #expect(controller.state == .failed)
+        #expect(controller.completedRun == nil)
+        #expect(controller.lastError?.contains("multipassd is not running") == true)
+        #expect(await daemon.connected == true)
     }
 
     @Test("menu toggle is disabled while a benchmark owns tunnel lifecycle")
@@ -1280,9 +1295,10 @@ struct BenchmarkControllerTests {
 
         #expect(tunnel.benchmarkOwnsLifecycle)
         #expect(tunnel.canToggle == false)
+        let transitionRequestCount = await daemon.requests.filter { $0 == .connect || $0 == .disconnect }.count
         tunnel.toggle()
         await Task.yield()
-        #expect(await daemon.requests.filter { $0 == .connect || $0 == .disconnect }.isEmpty)
+        #expect(await daemon.requests.filter { $0 == .connect || $0 == .disconnect }.count == transitionRequestCount)
 
         controller.cancel()
         try await waitUntil { !controller.isRunning }

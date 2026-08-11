@@ -102,6 +102,24 @@ impl SackScoreboard {
         }
     }
 
+    /// Resolve missing leading sequences that the bounded reorder buffer had
+    /// to abandon for liveness. Later received packets can then become the
+    /// contiguous prefix and retire the sender's retention window.
+    pub fn abandon_through(&mut self, seq: u64) {
+        if !self.started {
+            self.started = true;
+            self.max_seq = seq;
+        } else if seq > self.max_seq {
+            self.advance(seq - self.max_seq);
+            self.max_seq = seq;
+        }
+        let start = self.largest_contiguous.saturating_add(1);
+        for skipped in start..=seq {
+            self.set(skipped);
+        }
+        self.advance_contiguous_prefix();
+    }
+
     fn pos(seq: u64) -> (usize, u64) {
         let idx = (seq % Self::WINDOW) as usize;
         (idx / 64, 1u64 << (idx % 64))
@@ -158,6 +176,25 @@ mod tests {
         assert!(sb.insert(2));
         assert!(sb.insert(4)); // gap at 3
         assert!(!sb.insert(1)); // duplicate
+    }
+
+    #[test]
+    fn scoreboard_can_abandon_missing_prefix_for_receive_liveness() {
+        let mut sb = SackScoreboard::new();
+        assert!(sb.insert(2));
+        assert!(sb.insert(3));
+        sb.abandon_through(1);
+
+        match sb.generate_sack() {
+            crate::Frame::Sack {
+                largest_contiguous,
+                ranges,
+            } => {
+                assert_eq!(largest_contiguous, 3);
+                assert!(ranges.is_empty());
+            }
+            _ => panic!("expected Sack frame"),
+        }
     }
 
     #[test]

@@ -287,7 +287,6 @@ actor IperfRunner: BenchmarkRunning {
             "--omit", String(parameters.omittedSeconds),
             "--interval", String(parameters.intervalSeconds),
             "--connect-timeout", String(parameters.connectTimeoutSeconds * 1_000),
-            "--json-stream-full-output",
             "--json-stream",
             "--forceflush",
             id.addressFamily == .ipv4 ? "--version4" : "--version6",

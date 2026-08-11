@@ -98,7 +98,7 @@ async fn aggregation_delivers_all_and_retires_window() {
     }
 
     const N: u64 = 200;
-    for seq in 0..N {
+    for seq in 1..=N {
         assert!(t.send_data(seq, Bytes::from(vec![0u8; 100])));
         // Drain pending SACKs (drives window retirement) without blocking.
         // The daemon's pump selects over recv_control continuously; we mirror

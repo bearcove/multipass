@@ -14,6 +14,10 @@ struct BenchmarkPlannerTests {
         #expect(plan == BenchmarkSuitePlan(
             parameters: .init(),
             invocations: [
+                tunnel(addressFamily: .ipv4, direction: .upload, target: "10.10.99.1"),
+                tunnel(addressFamily: .ipv4, direction: .download, target: "10.10.99.1"),
+                tunnel(addressFamily: .ipv6, direction: .upload, target: "fd00:99::1"),
+                tunnel(addressFamily: .ipv6, direction: .download, target: "fd00:99::1"),
                 single(
                     id: .init(route: .physical(pathID: "wired"), direction: .upload, addressFamily: .ipv4),
                     target: "10.10.10.1",
@@ -30,20 +34,12 @@ struct BenchmarkPlannerTests {
                 ),
                 aggregate(
                     direction: .upload,
-                    members: [
-                        member(path: wired, direction: .upload, port: 5210),
-                    ]
+                    members: [member(path: wired, direction: .upload, port: 5210)]
                 ),
                 aggregate(
                     direction: .download,
-                    members: [
-                        member(path: wired, direction: .download, port: 5210),
-                    ]
+                    members: [member(path: wired, direction: .download, port: 5210)]
                 ),
-                tunnel(addressFamily: .ipv4, direction: .upload, target: "10.10.99.1"),
-                tunnel(addressFamily: .ipv4, direction: .download, target: "10.10.99.1"),
-                tunnel(addressFamily: .ipv6, direction: .upload, target: "fd00:99::1"),
-                tunnel(addressFamily: .ipv6, direction: .download, target: "fd00:99::1"),
             ]
         ))
     }
@@ -56,33 +52,25 @@ struct BenchmarkPlannerTests {
         )
 
         #expect(plan.invocations == [
+            tunnel(addressFamily: .ipv4, direction: .upload, target: "10.10.99.1"),
+            tunnel(addressFamily: .ipv4, direction: .download, target: "10.10.99.1"),
+            tunnel(addressFamily: .ipv6, direction: .upload, target: "fd00:99::1"),
+            tunnel(addressFamily: .ipv6, direction: .download, target: "fd00:99::1"),
             single(
                 id: .init(route: .physical(pathID: "wired"), direction: .upload, addressFamily: .ipv4),
-                target: "10.10.10.1",
-                port: 5210,
-                sourceAddress: "10.10.10.171",
-                interface: "en17"
-            ),
-            single(
-                id: .init(route: .physical(pathID: "wifi"), direction: .upload, addressFamily: .ipv4),
-                target: "10.10.10.1",
-                port: 5210,
-                sourceAddress: "10.10.10.169",
-                interface: "en0"
+                target: "10.10.10.1", port: 5210, sourceAddress: "10.10.10.171", interface: "en17"
             ),
             single(
                 id: .init(route: .physical(pathID: "wired"), direction: .download, addressFamily: .ipv4),
-                target: "10.10.10.1",
-                port: 5210,
-                sourceAddress: "10.10.10.171",
-                interface: "en17"
+                target: "10.10.10.1", port: 5210, sourceAddress: "10.10.10.171", interface: "en17"
+            ),
+            single(
+                id: .init(route: .physical(pathID: "wifi"), direction: .upload, addressFamily: .ipv4),
+                target: "10.10.10.1", port: 5210, sourceAddress: "10.10.10.169", interface: "en0"
             ),
             single(
                 id: .init(route: .physical(pathID: "wifi"), direction: .download, addressFamily: .ipv4),
-                target: "10.10.10.1",
-                port: 5210,
-                sourceAddress: "10.10.10.169",
-                interface: "en0"
+                target: "10.10.10.1", port: 5210, sourceAddress: "10.10.10.169", interface: "en0"
             ),
             aggregate(
                 direction: .upload,
@@ -98,10 +86,6 @@ struct BenchmarkPlannerTests {
                     member(path: wifi, direction: .download, port: 5211),
                 ]
             ),
-            tunnel(addressFamily: .ipv4, direction: .upload, target: "10.10.99.1"),
-            tunnel(addressFamily: .ipv4, direction: .download, target: "10.10.99.1"),
-            tunnel(addressFamily: .ipv6, direction: .upload, target: "fd00:99::1"),
-            tunnel(addressFamily: .ipv6, direction: .download, target: "fd00:99::1"),
         ])
     }
 
@@ -120,7 +104,7 @@ struct BenchmarkPlannerTests {
         )
 
         #expect(plan.invocations.count == 14)
-        #expect(plan.invocations[8] == aggregate(
+        #expect(plan.invocations[12] == aggregate(
             direction: .upload,
             members: [
                 member(path: paths[0], direction: .upload, port: 5210),
@@ -129,7 +113,7 @@ struct BenchmarkPlannerTests {
                 member(path: paths[3], direction: .upload, port: 5213),
             ]
         ))
-        #expect(plan.invocations[9] == aggregate(
+        #expect(plan.invocations[13] == aggregate(
             direction: .download,
             members: [
                 member(path: paths[0], direction: .download, port: 5210),
@@ -148,12 +132,12 @@ struct BenchmarkPlannerTests {
         )
 
         #expect(plan.invocations.map(\.id) == [
+            .init(route: .tunnel, direction: .upload, addressFamily: .ipv4),
+            .init(route: .tunnel, direction: .download, addressFamily: .ipv4),
             .init(route: .physical(pathID: "wired"), direction: .upload, addressFamily: .ipv4),
             .init(route: .physical(pathID: "wired"), direction: .download, addressFamily: .ipv4),
             .init(route: .physicalAggregate, direction: .upload, addressFamily: .ipv4),
             .init(route: .physicalAggregate, direction: .download, addressFamily: .ipv4),
-            .init(route: .tunnel, direction: .upload, addressFamily: .ipv4),
-            .init(route: .tunnel, direction: .download, addressFamily: .ipv4),
         ])
     }
 
@@ -165,12 +149,12 @@ struct BenchmarkPlannerTests {
         )
 
         #expect(plan.invocations.map(\.id) == [
+            .init(route: .tunnel, direction: .upload, addressFamily: .ipv6),
+            .init(route: .tunnel, direction: .download, addressFamily: .ipv6),
             .init(route: .physical(pathID: "wired"), direction: .upload, addressFamily: .ipv4),
             .init(route: .physical(pathID: "wired"), direction: .download, addressFamily: .ipv4),
             .init(route: .physicalAggregate, direction: .upload, addressFamily: .ipv4),
             .init(route: .physicalAggregate, direction: .download, addressFamily: .ipv4),
-            .init(route: .tunnel, direction: .upload, addressFamily: .ipv6),
-            .init(route: .tunnel, direction: .download, addressFamily: .ipv6),
         ])
     }
 

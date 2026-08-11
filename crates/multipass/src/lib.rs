@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use multipass_proto::{Dedup, Frame};
+use multipass_proto::{Frame, ReorderBuffer, ReorderInsert};
 use noq::{ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig};
 use noq_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -51,6 +51,10 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Strength of the internal channels carrying inbound frames from the reader
 /// tasks to the daemon's `recv_data` / `recv_control` consumers.
 const CHANNEL_CAPACITY: usize = 4096;
+/// Maximum wait for a missing striped packet after later packets arrive.
+/// This leaves multiple 10ms SACK cycles for retransmission, then releases
+/// the buffered suffix so one lost raw packet cannot wedge the tunnel.
+const REORDER_GAP_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Errors that can occur while establishing a path connection.
 #[derive(Debug)]
@@ -88,6 +92,8 @@ impl std::error::Error for TransportError {
 pub fn transport_config() -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
     tc.max_concurrent_multipath_paths(2);
+    tc.initial_mtu(1_400);
+    tc.min_mtu(1_400);
     tc.max_idle_timeout(Some(PROBE_TIMEOUT.try_into().expect("valid idle timeout")));
     tc.keep_alive_interval(Some(Duration::from_millis(200)));
     Arc::new(tc)
@@ -351,9 +357,12 @@ pub struct Transport {
     data_tx: mpsc::Sender<Data>,
     control_tx: mpsc::Sender<(PathKind, Frame)>,
     dead_tx: mpsc::Sender<PathKind>,
-    dedup: Mutex<Dedup>,
     /// Receive scoreboard for server→client packets; generates SACKs.
     recv_scoreboard: Mutex<multipass_proto::SackScoreboard>,
+    /// Last arrival while a logical sequence gap may be pending.
+    reorder_activity: Mutex<Instant>,
+    /// Admitted striped arrivals waiting for contiguous TUN delivery.
+    reorder: Mutex<ReorderBuffer<Data>>,
     probe_task: tokio::task::JoinHandle<()>,
     // Aggregation state: retained unacked packets + path scheduler.
     send_window: Mutex<SendWindow>,
@@ -396,8 +405,9 @@ impl Transport {
             data_tx,
             control_tx,
             dead_tx,
-            dedup: Mutex::new(Dedup::new()),
             recv_scoreboard: Mutex::new(multipass_proto::SackScoreboard::new()),
+            reorder_activity: Mutex::new(Instant::now()),
+            reorder: Mutex::new(ReorderBuffer::new(CHANNEL_CAPACITY)),
             probe_task,
             send_window: Mutex::new(SendWindow::new(CHANNEL_CAPACITY)),
             scheduler: Mutex::new(Scheduler::new()),
@@ -575,14 +585,74 @@ impl Transport {
         }
     }
 
-    /// Receive the next deduped data frame. Returns `None` once the transport
-    /// is fully closed (both paths dead / dropped).
+    /// Receive the next deduped data frame in logical sequence order. Arrival
+    /// is admitted to the bounded reorder window before being SACKed, so an
+    /// acknowledged packet is never subsequently dropped.
     pub async fn recv_data(&self) -> Option<Data> {
         loop {
-            let d = self.data_rx.lock().await.recv().await?;
-            self.recv_scoreboard.lock().unwrap().insert(d.seq);
-            if self.dedup.lock().unwrap().insert(d.seq) {
-                return Some(d);
+            if let Some(ready) = self.reorder.lock().unwrap().pop_ready() {
+                return Some(ready);
+            }
+            let gap_deadline = {
+                let has_gap = self.reorder.lock().unwrap().has_gap();
+                has_gap.then(|| *self.reorder_activity.lock().unwrap() + REORDER_GAP_TIMEOUT)
+            };
+            let mut data_rx = self.data_rx.lock().await;
+            let data = if let Some(deadline) = gap_deadline {
+                tokio::select! {
+                    data = data_rx.recv() => data?,
+                    _ = tokio::time::sleep_until(deadline.into()) => {
+                        drop(data_rx);
+                        let mut reorder = self.reorder.lock().unwrap();
+                        if let Some((first, last)) = reorder.skip_missing_prefix() {
+                            tracing::debug!(
+                                first,
+                                last,
+                                next_seq = reorder.next_seq(),
+                                occupancy = reorder.occupancy(),
+                                span = ?reorder.buffered_span(),
+                                "reorder gap timed out; releasing buffered suffix"
+                            );
+                            self.recv_scoreboard.lock().unwrap().abandon_through(last);
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                data_rx.recv().await?
+            };
+            drop(data_rx);
+            let seq = data.seq;
+            *self.reorder_activity.lock().unwrap() = Instant::now();
+            let mut reorder = self.reorder.lock().unwrap();
+            match reorder.insert(seq, data) {
+                ReorderInsert::Rejected => {
+                    tracing::debug!(
+                        seq,
+                        next_seq = reorder.next_seq(),
+                        occupancy = reorder.occupancy(),
+                        span = ?reorder.buffered_span(),
+                        "reorder rejected arriving packet"
+                    );
+                    continue;
+                }
+                ReorderInsert::Admitted => {
+                    self.recv_scoreboard.lock().unwrap().insert(seq);
+                }
+                ReorderInsert::AdmittedAfterSkipping { first, last } => {
+                    tracing::debug!(
+                        seq,
+                        first,
+                        last,
+                        next_seq = reorder.next_seq(),
+                        occupancy = reorder.occupancy(),
+                        span = ?reorder.buffered_span(),
+                        "reorder window boundary skipped missing prefix"
+                    );
+                    let mut scoreboard = self.recv_scoreboard.lock().unwrap();
+                    scoreboard.abandon_through(last);
+                    scoreboard.insert(seq);
+                }
             }
         }
     }
@@ -1044,6 +1114,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recv_data_reorders_striped_arrivals_before_delivery() {
+        let addr = spawn_echo_server().await;
+        let t = Transport::connect(
+            addr,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        for kind in PathKind::ALL {
+            t.mark_ready(kind);
+        }
+
+        for data in [
+            Data {
+                seq: 3,
+                packet: Bytes::from_static(b"three"),
+                path: PathKind::Wifi,
+            },
+            Data {
+                seq: 1,
+                packet: Bytes::from_static(b"one"),
+                path: PathKind::Wired,
+            },
+            Data {
+                seq: 2,
+                packet: Bytes::from_static(b"two"),
+                path: PathKind::Wired,
+            },
+        ] {
+            t.data_tx.send(data).await.unwrap();
+        }
+
+        assert_eq!(t.recv_data().await.unwrap().seq, 1);
+        assert_eq!(t.recv_data().await.unwrap().seq, 2);
+        assert_eq!(t.recv_data().await.unwrap().seq, 3);
+    }
+
+    #[tokio::test]
+    async fn recv_data_releases_suffix_after_gap_timeout_without_new_arrivals() {
+        let addr = spawn_echo_server().await;
+        let t = Transport::connect(
+            addr,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        for kind in PathKind::ALL {
+            t.mark_ready(kind);
+        }
+
+        for data in [
+            Data {
+                seq: 2,
+                packet: Bytes::from_static(b"two"),
+                path: PathKind::Wired,
+            },
+            Data {
+                seq: 3,
+                packet: Bytes::from_static(b"three"),
+                path: PathKind::Wifi,
+            },
+        ] {
+            t.data_tx.send(data).await.unwrap();
+        }
+
+        let started = Instant::now();
+        let packet = tokio::time::timeout(Duration::from_millis(200), t.recv_data())
+            .await
+            .expect("gap timer must fire without another arrival")
+            .unwrap();
+        assert_eq!(packet.seq, 2);
+        assert!(started.elapsed() >= REORDER_GAP_TIMEOUT);
+    }
+
+    #[tokio::test]
     async fn aggregated_send_stripes_and_delivers_once() {
         let addr = spawn_echo_server().await;
         let t = Transport::connect(
@@ -1058,7 +1205,7 @@ mod tests {
         }
 
         const N: u64 = 20;
-        for seq in 0..N {
+        for seq in 1..=N {
             assert!(t.send_data(seq, Bytes::from_static(b"hello")));
         }
 
@@ -1069,7 +1216,7 @@ mod tests {
             got.insert(d.seq);
         }
         assert_eq!(got.len(), N as usize, "dedup delivers each seq once");
-        for seq in 0..N {
+        for seq in 1..=N {
             assert!(got.contains(&seq), "seq {seq} delivered");
         }
 
@@ -1103,27 +1250,14 @@ mod tests {
         .await
         .unwrap();
 
-        // Required: MTU 1280 + 9 bytes framing = 1289 bytes
-        // PMTUD starts at 1200 and climbs; poll until convergence or timeout
-        const REQUIRED: usize = 1289;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        const REQUIRED: usize = multipass_proto::TUNNEL_MTU as usize + 9;
         for kind in PathKind::ALL {
-            loop {
-                let conn = t.connection(kind);
-                let max = conn.max_datagram_size().unwrap_or(0);
-                if max >= REQUIRED {
-                    break;
-                }
-                if std::time::Instant::now() > deadline {
-                    panic!(
-                        "path {} did not reach {REQUIRED}-byte capacity (final: {max})",
-                        kind.label(),
-                    );
-                }
-                // Trigger PMTUD by sending traffic
-                let _ = t.send_data(1, Bytes::from(vec![0u8; 100]));
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
+            let max = t.connection(kind).max_datagram_size().unwrap_or(0);
+            assert!(
+                max >= REQUIRED,
+                "path {} starts with {max}-byte datagram capacity, need {REQUIRED}",
+                kind.label(),
+            );
         }
     }
 
@@ -1163,7 +1297,7 @@ mod tests {
         // Send a few packets; they stripe across paths and stay unacked
         // (the echo server returns them as Data, not Sack, so nothing retires).
         const N: u64 = 6;
-        for seq in 0..N {
+        for seq in 1..=N {
             assert!(t.send_data(seq, Bytes::from_static(b"data")));
         }
         // Drain the echoes so they don't confuse the later count.

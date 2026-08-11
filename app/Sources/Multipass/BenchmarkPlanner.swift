@@ -12,9 +12,25 @@ nonisolated enum BenchmarkPlanner {
 
         var invocations: [BenchmarkInvocation] = []
         invocations.reserveCapacity(topology.paths.count * 2 + 6)
+        if let target = topology.tunnelIPv4Target {
+            appendTunnelInvocations(
+                to: &invocations,
+                target: target,
+                addressFamily: .ipv4,
+                port: topology.listenerBasePort
+            )
+        }
+        if let target = topology.tunnelIPv6Target {
+            appendTunnelInvocations(
+                to: &invocations,
+                target: target,
+                addressFamily: .ipv6,
+                port: topology.listenerBasePort
+            )
+        }
 
-        for direction in [BenchmarkDirection.upload, .download] {
-            for path in topology.paths {
+        for path in topology.paths {
+            for direction in [BenchmarkDirection.upload, .download] {
                 invocations.append(.single(
                     id: BenchmarkTestID(
                         route: .physical(pathID: path.id),
@@ -54,22 +70,6 @@ nonisolated enum BenchmarkPlanner {
             ))
         }
 
-        if let target = topology.tunnelIPv4Target {
-            appendTunnelInvocations(
-                to: &invocations,
-                target: target,
-                addressFamily: .ipv4,
-                port: topology.listenerBasePort
-            )
-        }
-        if let target = topology.tunnelIPv6Target {
-            appendTunnelInvocations(
-                to: &invocations,
-                target: target,
-                addressFamily: .ipv6,
-                port: topology.listenerBasePort
-            )
-        }
 
         return BenchmarkSuitePlan(parameters: parameters, invocations: invocations)
     }

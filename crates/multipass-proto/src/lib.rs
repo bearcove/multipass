@@ -402,6 +402,105 @@ impl Dedup {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorderInsert {
+    Rejected,
+    Admitted,
+    AdmittedAfterSkipping { first: u64, last: u64 },
+}
+
+/// Bounded receive-side buffer that converts path arrival order into logical
+/// packet order before packets reach the TUN. Sequence numbers start at one.
+pub struct ReorderBuffer<T> {
+    next_seq: u64,
+    slots: Vec<Option<T>>,
+}
+
+impl<T> ReorderBuffer<T> {
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "reorder capacity must be positive");
+        Self {
+            next_seq: 1,
+            slots: (0..capacity).map(|_| None).collect(),
+        }
+    }
+
+    /// Retain a packet without ever dropping admitted data. When a packet is
+    /// more than 75% of the window ahead, advance past only missing leading
+    /// sequences before the buffer can saturate, preserving its suffix.
+    pub fn insert(&mut self, seq: u64, value: T) -> ReorderInsert {
+        let Some(mut offset) = seq.checked_sub(self.next_seq) else {
+            return ReorderInsert::Rejected;
+        };
+        let mut skipped = None;
+        let recovery_threshold = (self.slots.len() * 3 / 4).max(1) as u64;
+        if offset >= recovery_threshold && self.slots[0].is_none() {
+            let first = self.next_seq;
+            while offset >= recovery_threshold && self.slots[0].is_none() {
+                self.advance_one();
+                offset -= 1;
+            }
+            skipped = Some((first, self.next_seq - 1));
+        }
+        if offset >= self.slots.len() as u64 {
+            return ReorderInsert::Rejected;
+        }
+        let slot = &mut self.slots[offset as usize];
+        if slot.is_some() {
+            return ReorderInsert::Rejected;
+        }
+        *slot = Some(value);
+        match skipped {
+            Some((first, last)) => ReorderInsert::AdmittedAfterSkipping { first, last },
+            None => ReorderInsert::Admitted,
+        }
+    }
+
+    fn advance_one(&mut self) {
+        self.slots.rotate_left(1);
+        *self.slots.last_mut().expect("positive capacity") = None;
+        self.next_seq += 1;
+    }
+
+    /// Release the next contiguous packet, if present.
+    pub fn pop_ready(&mut self) -> Option<T> {
+        let value = self.slots[0].take()?;
+        self.advance_one();
+        Some(value)
+    }
+
+    /// Abandon only the missing prefix before the first buffered packet. Used
+    /// by a receiver timer after retransmission has had time to arrive.
+    pub fn skip_missing_prefix(&mut self) -> Option<(u64, u64)> {
+        if self.slots[0].is_some() || self.slots.iter().all(Option::is_none) {
+            return None;
+        }
+        let first = self.next_seq;
+        while self.slots[0].is_none() && self.slots.iter().any(Option::is_some) {
+            self.advance_one();
+        }
+        Some((first, self.next_seq - 1))
+    }
+
+    pub fn has_gap(&self) -> bool {
+        self.slots[0].is_none() && self.slots.iter().any(Option::is_some)
+    }
+
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    pub fn occupancy(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    pub fn buffered_span(&self) -> Option<(u64, u64)> {
+        let first = self.slots.iter().position(Option::is_some)? as u64;
+        let last = self.slots.iter().rposition(Option::is_some)? as u64;
+        Some((self.next_seq + first, self.next_seq + last))
+    }
+}
+
 impl Default for Dedup {
     fn default() -> Self {
         Self::new()
@@ -411,6 +510,74 @@ impl Default for Dedup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reorder_buffer_releases_only_contiguous_packets() {
+        let mut reorder = ReorderBuffer::new(8);
+
+        assert_eq!(reorder.insert(1, "one"), ReorderInsert::Admitted);
+        assert_eq!(reorder.pop_ready(), Some("one"));
+        assert_eq!(reorder.insert(3, "three"), ReorderInsert::Admitted);
+        assert_eq!(reorder.pop_ready(), None);
+        assert_eq!(reorder.insert(2, "two"), ReorderInsert::Admitted);
+        assert_eq!(reorder.pop_ready(), Some("two"));
+        assert_eq!(reorder.pop_ready(), Some("three"));
+        assert_eq!(reorder.pop_ready(), None);
+    }
+
+    #[test]
+    fn reorder_buffer_skips_missing_prefix_before_capacity_is_exhausted() {
+        let mut reorder = ReorderBuffer::new(8);
+        for seq in 2..=6 {
+            assert_eq!(reorder.insert(seq, seq), ReorderInsert::Admitted);
+        }
+        assert_eq!(
+            reorder.insert(7, 7),
+            ReorderInsert::AdmittedAfterSkipping { first: 1, last: 1 }
+        );
+        assert_eq!(reorder.insert(8, 8), ReorderInsert::Admitted);
+        assert_eq!(reorder.pop_ready(), Some(2));
+    }
+
+    #[test]
+    fn reorder_buffer_advances_missing_prefix_at_window_boundary() {
+        let mut reorder = ReorderBuffer::new(4);
+
+        assert_eq!(reorder.insert(2, "two"), ReorderInsert::Admitted);
+        assert_eq!(reorder.insert(3, "three"), ReorderInsert::Admitted);
+        assert_eq!(
+            reorder.insert(4, "four"),
+            ReorderInsert::AdmittedAfterSkipping { first: 1, last: 1 }
+        );
+        assert_eq!(reorder.insert(5, "five"), ReorderInsert::Admitted);
+        assert_eq!(reorder.pop_ready(), Some("two"));
+        assert_eq!(reorder.pop_ready(), Some("three"));
+        assert_eq!(reorder.pop_ready(), Some("four"));
+        assert_eq!(reorder.pop_ready(), Some("five"));
+    }
+
+    #[test]
+    fn reorder_buffer_timer_can_release_buffered_suffix() {
+        let mut reorder = ReorderBuffer::new(8);
+        assert_eq!(reorder.insert(2, "two"), ReorderInsert::Admitted);
+        assert_eq!(reorder.insert(3, "three"), ReorderInsert::Admitted);
+
+        assert_eq!(reorder.skip_missing_prefix(), Some((1, 1)));
+        assert_eq!(reorder.pop_ready(), Some("two"));
+        assert_eq!(reorder.pop_ready(), Some("three"));
+        assert_eq!(reorder.skip_missing_prefix(), None);
+    }
+
+    #[test]
+    fn reorder_buffer_rejects_duplicates_and_old_packets() {
+        let mut reorder = ReorderBuffer::new(4);
+
+        assert_eq!(reorder.insert(2, "two"), ReorderInsert::Admitted);
+        assert_eq!(reorder.insert(2, "duplicate"), ReorderInsert::Rejected);
+        assert_eq!(reorder.insert(1, "one"), ReorderInsert::Admitted);
+        assert_eq!(reorder.pop_ready(), Some("one"));
+        assert_eq!(reorder.pop_ready(), Some("two"));
+        assert_eq!(reorder.insert(1, "old"), ReorderInsert::Rejected);
+    }
 
     #[test]
     fn alpn_identifies_assign_server_version_contract() {

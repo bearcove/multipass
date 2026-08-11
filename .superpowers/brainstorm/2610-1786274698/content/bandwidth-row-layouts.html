@@ -1,0 +1,57 @@
+<h2>Per-link bandwidth label</h2>
+<p class="subtitle">Same existing Wired / Wi-Fi rows. Compare how directional traffic reads when superimposed on the physical-link drawing.</p>
+
+<style>
+  .cards { grid-template-columns: repeat(3, minmax(250px, 1fr)); }
+  .panel { width: 100%; max-width: 320px; margin: 0 auto; padding: 16px; border-radius: 16px; background: color-mix(in srgb, var(--surface) 94%, #4f7cff 6%); border: 1px solid var(--border); box-shadow: 0 14px 34px rgba(0,0,0,.12); }
+  .path { display:grid; grid-template-columns: 24px 54px 1fr 10px; align-items:center; gap:9px; min-height:42px; color:var(--text); }
+  .icon { font-size:18px; text-align:center; }
+  .name { font-size:13px; font-weight:650; }
+  .link { height:22px; position:relative; display:flex; align-items:center; justify-content:center; }
+  .link::before { content:""; position:absolute; left:0; right:0; top:10px; height:2px; background:linear-gradient(90deg,#568cff,#6cd7c7); border-radius:2px; box-shadow:0 0 7px rgba(86,140,255,.45); }
+  .label { position:relative; z-index:1; border:1px solid color-mix(in srgb, var(--border) 65%, transparent); background:color-mix(in srgb, var(--surface) 92%, transparent); backdrop-filter:blur(7px); border-radius:6px; padding:2px 6px; font:600 10.5px ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap; }
+  .dot { width:7px; height:7px; border-radius:50%; background:#45d483; box-shadow:0 0 6px rgba(69,212,131,.7); }
+  .dim .link::before { background:var(--border); box-shadow:none; }
+  .dim .dot { background:#9ca3af; box-shadow:none; }
+  .dim { opacity:.62; }
+  .stack { line-height:1.25; text-align:center; padding:2px 8px; }
+  .splitlabel { display:flex; gap:7px; }
+  .up { color:#5ba1ff; } .down { color:#48c8a8; }
+  .legend { margin-top:11px; padding-top:10px; border-top:1px solid var(--border); font-size:10px; color:var(--muted); }
+  .card-image { min-height:215px; display:flex; align-items:center; }
+</style>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="panel">
+        <div class="path"><div class="icon">⌁</div><div class="name">Wired</div><div class="link"><div class="label splitlabel"><span class="up">↑ 84M</span><span class="down">↓ 620M</span></div></div><div class="dot"></div></div>
+        <div class="path"><div class="icon">⌁</div><div class="name">Wi-Fi</div><div class="link"><div class="label splitlabel"><span class="up">↑ 81M</span><span class="down">↓ 604M</span></div></div><div class="dot"></div></div>
+        <div class="legend">Two directions on one line. Most compact, fastest comparison.</div>
+      </div>
+    </div>
+    <div class="card-body"><h3>A · Inline arrows</h3><p>Both rates stay centered over the link. Compact, but numerically dense.</p></div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="panel">
+        <div class="path"><div class="icon">⌁</div><div class="name">Wired</div><div class="link"><div class="label stack"><div class="up">↑ 84 Mb/s</div><div class="down">↓ 620 Mb/s</div></div></div><div class="dot"></div></div>
+        <div class="path"><div class="icon">⌁</div><div class="name">Wi-Fi</div><div class="link"><div class="label stack"><div class="up">↑ 81 Mb/s</div><div class="down">↓ 604 Mb/s</div></div></div><div class="dot"></div></div>
+        <div class="legend">Direction is unmistakable. Rows become slightly taller.</div>
+      </div>
+    </div>
+    <div class="card-body"><h3>B · Stacked directions</h3><p>Best readability and accessible scanning; takes more vertical room.</p></div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="panel">
+        <div class="path"><div class="icon">⌁</div><div class="name">Wired</div><div class="link"><div class="label">704 Mb/s</div></div><div class="dot"></div></div>
+        <div class="path"><div class="icon">⌁</div><div class="name">Wi-Fi</div><div class="link"><div class="label">685 Mb/s</div></div><div class="dot"></div></div>
+        <div class="legend">Combined physical traffic. Cleanest distribution view; direction is hidden.</div>
+      </div>
+    </div>
+    <div class="card-body"><h3>C · Combined rate</h3><p>Quiet and immediately comparative, but loses upload/download information.</p></div>
+  </div>
+</div>

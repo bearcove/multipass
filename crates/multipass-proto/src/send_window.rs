@@ -17,11 +17,17 @@ pub struct SendWindow {
     capacity: usize,
     /// Sequence number of `entries[0]`.
     base_seq: u64,
-    /// Ring of retained packets. `None` = acked/retired.
-    entries: VecDeque<Option<Bytes>>,
+    /// Ring of retained packets and consecutive SACK-gap reports.
+    /// `None` = acked/retired.
+    entries: VecDeque<Option<Retained>>,
     /// Highest sequence ever inserted.
     max_seq: u64,
     started: bool,
+}
+
+struct Retained {
+    packet: Bytes,
+    gap_reports: u8,
 }
 
 impl SendWindow {
@@ -42,7 +48,10 @@ impl SendWindow {
             self.started = true;
             self.base_seq = seq;
             self.max_seq = seq;
-            self.entries.push_back(Some(packet));
+            self.entries.push_back(Some(Retained {
+                packet,
+                gap_reports: 0,
+            }));
             return;
         }
         debug_assert!(
@@ -54,7 +63,10 @@ impl SendWindow {
             self.entries.push_back(None);
             self.max_seq += 1;
         }
-        self.entries.push_back(Some(packet));
+        self.entries.push_back(Some(Retained {
+            packet,
+            gap_reports: 0,
+        }));
         self.max_seq = seq;
         // Enforce capacity by dropping oldest unacked (this loses recoverability;
         // callers must apply backpressure before this happens)
@@ -64,9 +76,9 @@ impl SendWindow {
         }
     }
 
-    /// Process a SACK from the peer. Retires acked packets and returns the
-    /// sequence numbers that need retransmission (gaps below the highest
-    /// acked sequence that remain unacknowledged).
+    /// Process a SACK from the peer. Retires acked packets and returns gaps
+    /// only after three consecutive reports, avoiding false retransmission
+    /// when healthy paths reorder adjacent packets.
     pub fn ack(&mut self, largest_contiguous: u64, ranges: &[(u64, u64)]) -> Vec<u64> {
         // Retire everything <= largest_contiguous
         if self.started && largest_contiguous >= self.base_seq {
@@ -104,8 +116,13 @@ impl SendWindow {
         if self.started {
             for seq in self.base_seq..=highest_seen.min(self.max_seq) {
                 let idx = (seq - self.base_seq) as usize;
-                if idx < self.entries.len() && self.entries[idx].is_some() {
+                let Some(Some(retained)) = self.entries.get_mut(idx) else {
+                    continue;
+                };
+                retained.gap_reports = retained.gap_reports.saturating_add(1);
+                if retained.gap_reports >= 3 {
                     gaps.push(seq);
+                    retained.gap_reports = 0;
                 }
             }
         }
@@ -118,7 +135,9 @@ impl SendWindow {
             return None;
         }
         let idx = (seq - self.base_seq) as usize;
-        self.entries.get(idx).and_then(|e| e.clone())
+        self.entries
+            .get(idx)
+            .and_then(|entry| entry.as_ref().map(|retained| retained.packet.clone()))
     }
 
     /// All currently unacknowledged sequences (for path-death retransmission).
@@ -167,13 +186,38 @@ mod tests {
     }
 
     #[test]
+    fn send_window_requires_three_gap_reports_before_retransmit() {
+        let mut sw = SendWindow::new(4096);
+        sw.insert(1, Bytes::from_static(b"pkt1"));
+        sw.insert(2, Bytes::from_static(b"pkt2"));
+        sw.insert(3, Bytes::from_static(b"pkt3"));
+
+        // A faster path can make seq 3 arrive before seq 2 without loss. Match
+        // QUIC's packet-threshold loss detection: wait for three consecutive
+        // SACK reports before retransmitting the apparent gap.
+        assert!(sw.ack(1, &[(3, 3)]).is_empty());
+        assert!(sw.ack(1, &[(3, 3)]).is_empty());
+        assert_eq!(sw.ack(1, &[(3, 3)]), vec![2]);
+
+        // The retained packet remains recoverable, but another retransmission
+        // also requires three fresh reports if the first retry is lost.
+        assert_eq!(sw.get(2), Some(Bytes::from_static(b"pkt2")));
+        assert!(sw.ack(1, &[(3, 3)]).is_empty());
+        assert!(sw.ack(1, &[(3, 3)]).is_empty());
+        assert_eq!(sw.ack(1, &[(3, 3)]), vec![2]);
+        assert_eq!(sw.unacked(), vec![2]);
+    }
+
+    #[test]
     fn send_window_detects_gaps() {
         let mut sw = SendWindow::new(4096);
         sw.insert(1, Bytes::from_static(b"pkt1"));
         sw.insert(2, Bytes::from_static(b"pkt2"));
         sw.insert(3, Bytes::from_static(b"pkt3"));
 
-        // SACK says 1 and 3 received, gap at 2
+        // SACK says 1 and 3 received, repeatedly confirming the gap at 2.
+        assert!(sw.ack(1, &[(3, 3)]).is_empty());
+        assert!(sw.ack(1, &[(3, 3)]).is_empty());
         let gaps = sw.ack(1, &[(3, 3)]);
         assert_eq!(gaps, vec![2]);
         // seq 2 still retained for retransmission

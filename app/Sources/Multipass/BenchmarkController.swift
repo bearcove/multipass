@@ -241,6 +241,30 @@ final class BenchmarkController {
         self.iperfVersion = iperfVersion
     }
 
+    #if DEBUG
+    convenience init(
+        daemon: any DaemonRequesting,
+        tunnel: TunnelController,
+        runner: (any BenchmarkRunning)?,
+        parameters: BenchmarkParameters = .init(),
+        appBuild: String = "unknown",
+        iperfVersion: String? = "unknown"
+    ) {
+        self.init(
+            daemon: daemon,
+            tunnel: tunnel,
+            runner: runner,
+            store: BenchmarkStore(directory: FileManager.default.temporaryDirectory.appending(
+                path: "multipass-benchmark-controller-tests-\(UUID().uuidString)",
+                directoryHint: .isDirectory
+            )),
+            parameters: parameters,
+            appBuild: appBuild,
+            iperfVersion: iperfVersion
+        )
+    }
+    #endif
+
     func publishIperfVersion(_ version: String) {
         guard !isRunning else { return }
         iperfVersion = version
@@ -425,46 +449,33 @@ final class BenchmarkController {
             }
             topology = loadedTopology
             let plan = try BenchmarkPlanner.plan(topology: loadedTopology, parameters: parameters)
-            plannedMeasurementIDs = plan.invocations.map(\.id)
+            var tunnelInvocations = plan.invocations.filter { $0.id.route == .tunnel }
+            var rawInvocations = plan.invocations.filter { $0.id.route != .tunnel }
+            plannedMeasurementIDs = tunnelInvocations.map(\.id) + rawInvocations.map(\.id)
             measurements = [:]
             liveSamples = [:]
             lastError = nil
             runningTopology = loadedTopology
-
-            let raw = plan.invocations.filter { $0.id.route != .tunnel }
-            var tunnelInvocations = plan.invocations.filter { $0.id.route == .tunnel }
-            if initialStatus.connected {
-                addUnavailableTunnelResults(topology: loadedTopology, to: &results)
-            }
+            addUnavailableTunnelResults(topology: loadedTopology, to: &results)
             measurements = results
-
-            for invocation in raw {
-                try checkCancellation()
-                state = .measuringRaw(invocation.id)
-                let result = await runMeasurement(invocation)
-                results[invocation.id] = result
-                measurements[invocation.id] = result
-                try checkCancellation()
-            }
 
             if !tunnelInvocations.isEmpty {
                 do {
                     try checkCancellation()
                     if !initialStatus.connected {
                         state = .connecting
-                    }
-                    try await tunnel.setConnected(true, owner: .benchmark(owner))
-                    try checkCancellation()
-                    if !initialStatus.connected {
+                        try await tunnel.setConnected(true, owner: .benchmark(owner))
+                        try checkCancellation()
                         let refreshed = try await refreshedTopology(from: loadedTopology)
                         topology = refreshed
                         runningTopology = refreshed
                         let refreshedPlan = try BenchmarkPlanner.plan(topology: refreshed, parameters: parameters)
                         tunnelInvocations = refreshedPlan.invocations.filter { $0.id.route == .tunnel }
+                        rawInvocations = refreshedPlan.invocations.filter { $0.id.route != .tunnel }
                         results = results.filter { $0.key.route != .tunnel }
                         addUnavailableTunnelResults(topology: refreshed, to: &results)
                         measurements = results
-                        plannedMeasurementIDs = raw.map(\.id) + tunnelInvocations.map(\.id)
+                        plannedMeasurementIDs = tunnelInvocations.map(\.id) + rawInvocations.map(\.id)
                     }
                     for invocation in tunnelInvocations {
                         try checkCancellation()
@@ -487,6 +498,24 @@ final class BenchmarkController {
                         results[invocation.id] = failure
                         measurements[invocation.id] = failure
                     }
+                }
+            }
+
+            if !rawInvocations.isEmpty {
+                try checkCancellation()
+                let currentStatus = try await tunnel.observedStatus()
+                if currentStatus.connected {
+                    state = .restoring
+                    try await tunnel.setConnected(false, owner: .benchmark(owner))
+                    try checkCancellation()
+                }
+                for invocation in rawInvocations {
+                    try checkCancellation()
+                    state = .measuringRaw(invocation.id)
+                    let result = await runMeasurement(invocation)
+                    results[invocation.id] = result
+                    measurements[invocation.id] = result
+                    try checkCancellation()
                 }
             }
             try checkCancellation()
