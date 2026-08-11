@@ -432,8 +432,10 @@ final class BenchmarkController {
             runningTopology = loadedTopology
 
             let raw = plan.invocations.filter { $0.id.route != .tunnel }
-            let tunnelInvocations = plan.invocations.filter { $0.id.route == .tunnel }
-            addUnavailableTunnelResults(topology: loadedTopology, to: &results)
+            var tunnelInvocations = plan.invocations.filter { $0.id.route == .tunnel }
+            if initialStatus.connected {
+                addUnavailableTunnelResults(topology: loadedTopology, to: &results)
+            }
             measurements = results
 
             for invocation in raw {
@@ -454,8 +456,15 @@ final class BenchmarkController {
                     try await tunnel.setConnected(true, owner: .benchmark(owner))
                     try checkCancellation()
                     if !initialStatus.connected {
-                        topology = try await refreshedTopology(from: loadedTopology)
-                        runningTopology = topology
+                        let refreshed = try await refreshedTopology(from: loadedTopology)
+                        topology = refreshed
+                        runningTopology = refreshed
+                        let refreshedPlan = try BenchmarkPlanner.plan(topology: refreshed, parameters: parameters)
+                        tunnelInvocations = refreshedPlan.invocations.filter { $0.id.route == .tunnel }
+                        results = results.filter { $0.key.route != .tunnel }
+                        addUnavailableTunnelResults(topology: refreshed, to: &results)
+                        measurements = results
+                        plannedMeasurementIDs = raw.map(\.id) + tunnelInvocations.map(\.id)
                     }
                     for invocation in tunnelInvocations {
                         try checkCancellation()
@@ -650,9 +659,7 @@ final class BenchmarkController {
         guard !serverVersion.isEmpty, serverVersion.lowercased() != "unknown" else {
             throw BenchmarkControllerError.refreshedServerIdentityUnavailable
         }
-        var topology = captured
-        topology.serverVersion = refreshed.serverVersion
-        return topology
+        return refreshed
     }
 
     private nonisolated static func matchesPlanningTopology(
@@ -662,8 +669,6 @@ final class BenchmarkController {
         refreshed.protocolVersion == captured.protocolVersion
             && refreshed.daemonVersion == captured.daemonVersion
             && refreshed.underlayTarget == captured.underlayTarget
-            && refreshed.tunnelIPv4Target == captured.tunnelIPv4Target
-            && refreshed.tunnelIPv6Target == captured.tunnelIPv6Target
             && refreshed.listenerBasePort == captured.listenerBasePort
             && refreshed.listenerCount == captured.listenerCount
             && refreshed.paths == captured.paths

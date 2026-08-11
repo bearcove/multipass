@@ -732,12 +732,18 @@ struct BenchmarkControllerTests {
         #expect(controller.liveSamples.values.allSatisfy { $0.count <= 10 })
     }
 
-    @Test("a disconnected suite captures the authenticated server identity after connecting")
-    func disconnectedSuiteRefreshesServerIdentity() async throws {
+    @Test("a disconnected suite replans assigned tunnel targets after connecting")
+    func disconnectedSuiteReplansAssignedTunnelTargets() async throws {
+        let directory = try temporaryControllerStoreDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = BenchmarkStore(directory: directory)
         var disconnectedTopology = testTopology
         disconnectedTopology.serverVersion = "unknown"
         var connectedTopology = disconnectedTopology
         connectedTopology.serverVersion = "authenticated-server-build"
+        connectedTopology.tunnelIPv6Target = "2001:db8::1"
+        let connectedPlan = try BenchmarkPlanner.plan(topology: connectedTopology, parameters: .init())
+        let connectedTunnelInvocations = connectedPlan.invocations.filter { $0.id.route == .tunnel }
         let daemon = FakeDaemon(
             connected: false,
             topology: disconnectedTopology,
@@ -747,17 +753,25 @@ struct BenchmarkControllerTests {
         let controller = BenchmarkController(
             daemon: daemon,
             tunnel: testTunnel(client: daemon),
-            runner: runner
+            runner: runner,
+            store: store
         )
 
         controller.startFullSuite()
         try await waitUntil { !controller.isRunning }
 
         let run = try #require(controller.completedRun)
+        let persisted = try #require(try await store.loadRuns().runs.first)
         #expect(controller.state == .completed)
-        #expect(run.topology.serverVersion == "authenticated-server-build")
+        #expect(run.topology == connectedTopology)
         #expect(run.identities.serverBuild == "authenticated-server-build")
-        #expect(run.identities.serverBuild == run.topology.serverVersion)
+        #expect(persisted.id == run.id)
+        #expect(persisted.identities == run.identities)
+        #expect(persisted.topology == run.topology)
+        #expect(persisted.results == run.results)
+        #expect(persisted.restorationError == run.restorationError)
+        #expect(await runner.invocationIDs == rawInvocations.map(\.id) + connectedTunnelInvocations.map(\.id))
+        #expect(run.results.values.allSatisfy { !$0.isSkipped })
         #expect(await daemon.requests.filter { $0 == .benchmarkTopology }.count == 2)
         #expect(await daemon.connected == false)
     }
