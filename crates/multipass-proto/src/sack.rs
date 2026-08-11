@@ -11,6 +11,7 @@
 /// Out-of-window (very old) seqs are dropped as duplicates.
 pub struct SackScoreboard {
     max_seq: u64,
+    largest_contiguous: u64,
     started: bool,
     bits: [u64; Self::WORDS],
 }
@@ -22,6 +23,7 @@ impl SackScoreboard {
     pub fn new() -> Self {
         Self {
             max_seq: 0,
+            largest_contiguous: 0,
             started: false,
             bits: [0; Self::WORDS],
         }
@@ -30,25 +32,26 @@ impl SackScoreboard {
     /// Record a received sequence number. Returns true if this is a new
     /// (previously unseen) sequence, false if duplicate or too old.
     pub fn insert(&mut self, seq: u64) -> bool {
+        if seq <= self.largest_contiguous {
+            return false;
+        }
         if !self.started {
             self.started = true;
             self.max_seq = seq;
-            self.set(seq);
-            return true;
-        }
-        if seq > self.max_seq {
+        } else if seq > self.max_seq {
             self.advance(seq - self.max_seq);
             self.max_seq = seq;
         } else {
             let back = self.max_seq - seq;
             if back >= Self::WINDOW {
-                return false; // too old
+                return false;
             }
             if self.get(seq) {
-                return false; // duplicate
+                return false;
             }
         }
         self.set(seq);
+        self.advance_contiguous_prefix();
         true
     }
 
@@ -65,20 +68,15 @@ impl SackScoreboard {
             };
         }
 
-        // Find largest contiguous: scan from 1 upward until first gap
-        let mut largest_contiguous = 0;
-        for seq in 1..=self.max_seq {
-            if self.get(seq) {
-                largest_contiguous = seq;
-            } else {
-                break;
-            }
-        }
+        let largest_contiguous = self.largest_contiguous;
+        let live_start = self
+            .max_seq
+            .saturating_sub(Self::WINDOW - 1)
+            .max(largest_contiguous.saturating_add(1));
 
-        // Collect ranges above largest_contiguous
         let mut ranges = Vec::new();
         let mut range_start: Option<u64> = None;
-        for seq in (largest_contiguous + 1)..=self.max_seq {
+        for seq in live_start..=self.max_seq {
             let received = self.get(seq);
             match (range_start, received) {
                 (None, true) => range_start = Some(seq),
@@ -117,6 +115,16 @@ impl SackScoreboard {
     fn set(&mut self, seq: u64) {
         let (w, m) = Self::pos(seq);
         self.bits[w] |= m;
+    }
+
+    fn advance_contiguous_prefix(&mut self) {
+        while self.largest_contiguous < self.max_seq {
+            let next = self.largest_contiguous + 1;
+            if self.max_seq - next >= Self::WINDOW || !self.get(next) {
+                break;
+            }
+            self.largest_contiguous = next;
+        }
     }
 
     /// Advance the window by `shift`, clearing the slots being vacated so a
@@ -205,5 +213,47 @@ mod tests {
             }
             _ => panic!("expected Sack frame"),
         }
+    }
+
+    #[test]
+    fn scoreboard_contiguous_prefix_never_regresses_after_wrap() {
+        let mut sb = SackScoreboard::new();
+        for seq in 1..=SackScoreboard::WINDOW {
+            assert!(sb.insert(seq));
+        }
+        assert!(sb.insert(SackScoreboard::WINDOW * 2 + 1));
+
+        let crate::Frame::Sack {
+            largest_contiguous,
+            ranges,
+        } = sb.generate_sack()
+        else {
+            panic!("expected Sack frame");
+        };
+        assert_eq!(largest_contiguous, SackScoreboard::WINDOW);
+        assert_eq!(
+            ranges,
+            vec![(
+                SackScoreboard::WINDOW * 2 + 1,
+                SackScoreboard::WINDOW * 2 + 1
+            )]
+        );
+    }
+
+    #[test]
+    fn scoreboard_sack_scan_is_bounded_to_the_live_window() {
+        let mut sb = SackScoreboard::new();
+        assert!(sb.insert(1));
+        assert!(sb.insert(1_000_000_001));
+
+        let crate::Frame::Sack {
+            largest_contiguous,
+            ranges,
+        } = sb.generate_sack()
+        else {
+            panic!("expected Sack frame");
+        };
+        assert_eq!(largest_contiguous, 1);
+        assert_eq!(ranges, vec![(1_000_000_001, 1_000_000_001)]);
     }
 }
