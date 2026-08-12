@@ -164,7 +164,7 @@ Requirements:
 - The configuration file is owned by root and not writable by unprivileged users.
 - The private-key file is readable only by root.
 - The private key and raw key material are never returned over IPC or logged.
-- Duplicate gateway endpoints, duplicate `UplinkId` values, empty uplink sets, invalid interfaces, and malformed keys produce typed validation errors.
+- Duplicate gateway endpoints, duplicate `UplinkId` values, invalid interfaces, and malformed keys produce typed validation errors.
 - An empty uplink set is valid for persistent offline intent and configuration staging.
 - Disabled uplinks remain visible in status but do not resolve addresses, install routes, or dial.
 
