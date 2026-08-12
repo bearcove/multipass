@@ -20,6 +20,7 @@
 //! Hello/Assign handshake; it drives them through [`Transport::send_frame_on`]
 //! and [`Transport::recv_control`].
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,7 +36,7 @@ use tokio::sync::mpsc;
 
 /// Re-export the wire format so callers don't need a second `use` path.
 pub use multipass_proto;
-pub use multipass_proto::{PathKind, Scheduler, SendWindow};
+pub use multipass_proto::{PathId, Scheduler, SendWindow, UplinkId};
 
 /// ALPN for the multipass tunnel (from multipass-proto).
 pub const ALPN: &[u8] = multipass_proto::ALPN;
@@ -194,40 +195,45 @@ pub async fn dial(
     Ok(conn)
 }
 
-/// A single live QUIC connection on one interface, with its reader task's
-/// liveness/RTT bookkeeping. The connection is swappable so a dead path can be
-/// re-dialed in place without tearing down the [`Transport`].
+/// Configuration for dialing one logical uplink.
+#[derive(Debug, Clone)]
+pub struct UplinkDial {
+    pub path_id: PathId,
+    pub uplink_id: UplinkId,
+    pub source: IpAddr,
+}
+
+/// One established connection supplied to a transport registry.
+pub struct UplinkConnection {
+    pub path_id: PathId,
+    pub uplink_id: UplinkId,
+    pub connection: Connection,
+}
+
+/// A single live QUIC connection for one logical uplink.
 struct Path {
-    kind: PathKind,
+    path_id: PathId,
+    uplink_id: UplinkId,
     conn: Arc<Mutex<Connection>>,
-    /// Set false when the reader task hits an error / the conn closes.
     alive: Arc<AtomicBool>,
-    /// True after this connection acknowledges the current client epoch.
     ready: Arc<AtomicBool>,
-    /// Microseconds since `started` of the last datagram received (0 = none).
     last_recv: Arc<AtomicU64>,
-    /// Last measured RTT in microseconds (0 = none).
     rtt: Arc<AtomicU64>,
-    /// In-flight Ping probe: (connection generation, nonce, sent-at), if any.
     probe: Arc<Mutex<Option<(u64, u64, Instant)>>>,
-    /// Monotonic nonce source for Ping probes.
     probe_nonce: Arc<AtomicU64>,
-    /// Incremented whenever a connection is replaced. Reader failures from an
-    /// older generation must not kill the newly installed path.
     generation: Arc<AtomicU64>,
     started: Instant,
-    /// Datagram counts, retained for transport diagnostics and tests.
     received: Arc<AtomicU64>,
     transmitted: Arc<AtomicU64>,
-    /// Tunnel payload bytes received / transmitted on this path.
     received_bytes: Arc<AtomicU64>,
     transmitted_bytes: Arc<AtomicU64>,
 }
 
 impl Path {
-    fn new(kind: PathKind, conn: Connection) -> Self {
+    fn new(path_id: PathId, uplink_id: UplinkId, conn: Connection) -> Self {
         Self {
-            kind,
+            path_id,
+            uplink_id,
             conn: Arc::new(Mutex::new(conn)),
             alive: Arc::new(AtomicBool::new(true)),
             ready: Arc::new(AtomicBool::new(false)),
@@ -244,14 +250,17 @@ impl Path {
         }
     }
 
-    fn status(&self) -> PathStatus {
+    fn status(&self) -> UplinkStatus {
         let last_recv = micros_to_instant(self.started, self.last_recv.load(Ordering::Relaxed));
         let rtt = {
-            let m = self.rtt.load(Ordering::Relaxed);
-            (m != 0).then(|| Duration::from_micros(m))
+            let micros = self.rtt.load(Ordering::Relaxed);
+            (micros != 0).then(|| Duration::from_micros(micros))
         };
-        PathStatus {
+        UplinkStatus {
+            path_id: self.path_id,
+            uplink_id: self.uplink_id.clone(),
             alive: self.alive.load(Ordering::Relaxed),
+            ready: self.ready.load(Ordering::Relaxed),
             last_recv,
             rtt,
             received: self.received.load(Ordering::Relaxed),
@@ -272,21 +281,18 @@ impl Path {
     }
 
     fn mark_dead(&self, generation: u64) -> bool {
-        {
-            let connection = self.conn.lock().unwrap();
-            if self.generation.load(Ordering::Acquire) != generation {
-                return false;
-            }
-            if self
+        let connection = self.conn.lock().unwrap();
+        if self.generation.load(Ordering::Acquire) != generation
+            || self
                 .alive
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
-            {
-                return false;
-            }
-            self.ready.store(false, Ordering::Release);
-            connection.close(0u32.into(), b"path liveness timeout");
+        {
+            return false;
         }
+        self.ready.store(false, Ordering::Release);
+        connection.close(0u32.into(), b"path liveness timeout");
+        drop(connection);
         *self.probe.lock().unwrap() = None;
         true
     }
@@ -296,109 +302,107 @@ fn micros_to_instant(started: Instant, micros: u64) -> Option<Instant> {
     (micros != 0).then(|| started + Duration::from_micros(micros))
 }
 
-/// Per-path liveness snapshot, for the daemon's status surface.
-#[derive(Debug, Clone, Copy)]
-pub struct PathStatus {
-    /// True while the reader task is running (no read error / close yet).
+/// Per-uplink liveness and traffic snapshot.
+#[derive(Debug, Clone)]
+pub struct UplinkStatus {
+    pub path_id: PathId,
+    pub uplink_id: UplinkId,
     pub alive: bool,
-    /// When the last datagram arrived on this path, if any.
+    pub ready: bool,
     pub last_recv: Option<Instant>,
-    /// Last measured round-trip time on this path, if any.
     pub rtt: Option<Duration>,
-    /// Datagrams received on this path.
     pub received: u64,
-    /// Datagrams transmitted on this path.
     pub transmitted: u64,
-    /// Tunnel payload bytes received on this path.
     pub received_bytes: u64,
-    /// Tunnel payload bytes transmitted on this path.
     pub transmitted_bytes: u64,
 }
 
-/// Snapshot of both paths.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TransportStatus {
-    pub wired: PathStatus,
-    pub wifi: PathStatus,
+    pub uplinks: Vec<UplinkStatus>,
 }
 
 impl TransportStatus {
-    /// True if at least one path is alive.
     pub fn any_alive(&self) -> bool {
-        self.wired.alive || self.wifi.alive
+        self.uplinks.iter().any(|uplink| uplink.alive)
+    }
+
+    pub fn get(&self, path_id: PathId) -> Option<&UplinkStatus> {
+        self.uplinks.iter().find(|uplink| uplink.path_id == path_id)
     }
 }
 
-/// A deduped inbound data frame: the first copy of a sequence number to arrive
-/// (from either path), plus which path delivered it.
 #[derive(Debug, Clone)]
 pub struct Data {
     pub seq: u64,
     pub packet: Bytes,
-    pub path: PathKind,
+    pub path: PathId,
 }
 
-/// The client dual-connection transport.
-///
-/// Holds two [`Connection`]s (wired + wifi), each with a reader task that
-/// decodes inbound datagrams, auto-answers Pings, and feeds the daemon-facing
-/// channels. A probe loop measures per-path RTT for status. Outbound data is
-/// replicated across every authenticated live path; inbound data is deduped by
-/// [`multipass_proto::Dedup`].
+/// Dynamic N-uplink client transport. Reliability state belongs to the logical
+/// session; connections and their liveness state belong to registered uplinks.
 pub struct Transport {
-    wired: Arc<Path>,
-    wifi: Arc<Path>,
-    // Receivers are mutex-guarded so `recv_*` can take `&self` and be selected
-    // over alongside `send_data` in one tokio::select!.
+    paths: Vec<Arc<Path>>,
+    path_indices: HashMap<PathId, usize>,
     data_rx: tokio::sync::Mutex<mpsc::Receiver<Data>>,
-    control_rx: tokio::sync::Mutex<mpsc::Receiver<(PathKind, Frame)>>,
-    dead_rx: tokio::sync::Mutex<mpsc::Receiver<PathKind>>,
-    // Sender clones kept so a re-dialed path can respawn its reader task.
+    control_rx: tokio::sync::Mutex<mpsc::Receiver<(PathId, Frame)>>,
+    dead_rx: tokio::sync::Mutex<mpsc::Receiver<PathId>>,
     data_tx: mpsc::Sender<Data>,
-    control_tx: mpsc::Sender<(PathKind, Frame)>,
-    dead_tx: mpsc::Sender<PathKind>,
-    /// Receive scoreboard for server→client packets; generates SACKs.
+    control_tx: mpsc::Sender<(PathId, Frame)>,
+    dead_tx: mpsc::Sender<PathId>,
     recv_scoreboard: Mutex<multipass_proto::SackScoreboard>,
-    /// Last arrival while a logical sequence gap may be pending.
     reorder_activity: Mutex<Instant>,
-    /// Admitted striped arrivals waiting for contiguous TUN delivery.
     reorder: Mutex<ReorderBuffer<Data>>,
     probe_task: tokio::task::JoinHandle<()>,
-    // Aggregation state: retained unacked packets + path scheduler.
     send_window: Mutex<SendWindow>,
     scheduler: Mutex<Scheduler>,
 }
 
 impl Transport {
-    /// Dial both paths (wired then wifi) and start their reader + probe tasks.
-    pub async fn connect(
-        server: SocketAddr,
-        wired_ip: IpAddr,
-        wifi_ip: IpAddr,
-    ) -> Result<Self, TransportError> {
-        let wired_conn = dial(server, wired_ip, "wired").await?;
-        let wifi_conn = dial(server, wifi_ip, "wifi").await?;
-        Ok(Self::from_connections(wired_conn, wifi_conn))
+    pub async fn connect(server: SocketAddr, uplinks: Vec<UplinkDial>) -> Result<Self, TransportError> {
+        let mut connections = Vec::with_capacity(uplinks.len());
+        for uplink in uplinks {
+            let connection = dial(server, uplink.source, uplink.uplink_id.as_str()).await?;
+            connections.push(UplinkConnection {
+                path_id: uplink.path_id,
+                uplink_id: uplink.uplink_id,
+                connection,
+            });
+        }
+        Ok(Self::from_connections(connections))
     }
 
-    /// Wrap two already-established connections. Used by the failover test and
-    /// by the daemon when re-establishing a transport.
-    pub fn from_connections(wired: Connection, wifi: Connection) -> Self {
-        let wired = Arc::new(Path::new(PathKind::Wired, wired));
-        let wifi = Arc::new(Path::new(PathKind::Wifi, wifi));
-
+    pub fn from_connections(connections: Vec<UplinkConnection>) -> Self {
         let (data_tx, data_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (dead_tx, dead_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let mut paths = Vec::with_capacity(connections.len());
+        let mut path_indices = HashMap::with_capacity(connections.len());
+        let mut scheduler = Scheduler::new();
 
-        for p in [&wired, &wifi] {
-            spawn_reader(p, &data_tx, &control_tx, &dead_tx);
+        for uplink in connections {
+            assert!(
+                !path_indices.contains_key(&uplink.path_id),
+                "duplicate path ID {}",
+                uplink.path_id.get()
+            );
+            let index = paths.len();
+            path_indices.insert(uplink.path_id, index);
+            scheduler.insert(uplink.path_id);
+            paths.push(Arc::new(Path::new(
+                uplink.path_id,
+                uplink.uplink_id,
+                uplink.connection,
+            )));
         }
-        let probe_task = spawn_probe(&wired, &wifi, &dead_tx);
+        for path in &paths {
+            spawn_reader(path, &data_tx, &control_tx, &dead_tx);
+        }
+        let probe_task = spawn_probe(paths.clone(), &dead_tx);
 
         Self {
-            wired,
-            wifi,
+            paths,
+            path_indices,
             data_rx: tokio::sync::Mutex::new(data_rx),
             control_rx: tokio::sync::Mutex::new(control_rx),
             dead_rx: tokio::sync::Mutex::new(dead_rx),
@@ -410,193 +414,152 @@ impl Transport {
             reorder: Mutex::new(ReorderBuffer::new(CHANNEL_CAPACITY)),
             probe_task,
             send_window: Mutex::new(SendWindow::new(CHANNEL_CAPACITY)),
-            scheduler: Mutex::new(Scheduler::new()),
+            scheduler: Mutex::new(scheduler),
         }
-    }
-    /// Install a newly dialed connection for one dead path and respawn its
-    /// reader. Dialing itself stays outside the packet pump so a failed
-    /// handshake cannot block traffic on the surviving path.
-    pub fn install_reconnected_path(&self, kind: PathKind, new_conn: Connection) {
-        let p = self.path(kind);
-        {
-            let mut connection = p.conn.lock().unwrap();
-            p.alive.store(false, Ordering::Release);
-            p.generation.fetch_add(1, Ordering::AcqRel);
-            *connection = new_conn;
-            p.ready.store(false, Ordering::Relaxed);
-            p.rtt.store(0, Ordering::Relaxed);
-            p.alive.store(true, Ordering::Release);
-        }
-        *p.probe.lock().unwrap() = None;
-        spawn_reader(p, &self.data_tx, &self.control_tx, &self.dead_tx);
-        tracing::info!(path = %kind.label(), "path reconnected");
     }
 
-    /// Send a raw IP packet on the best available path, retaining it for
-    /// possible retransmission until the peer's SACK confirms receipt.
-    ///
-    /// Aggregation: the packet goes out on ONE path chosen by the scheduler.
-    /// The SendWindow keeps a copy; on SACK gap or path death the same `seq`
-    /// is retransmitted on a surviving path. The receiver dedups by `seq`, so
-    /// retransmission never produces a duplicate at the tunnel.
-    ///
-    /// Returns `true` if the packet was queued on a path (retained regardless
-    /// of the local send outcome). Returns `false` only if no path is ready.
+    pub fn path_ids(&self) -> impl ExactSizeIterator<Item = PathId> + '_ {
+        self.paths.iter().map(|path| path.path_id)
+    }
+
+    pub fn install_reconnected_path(&self, path_id: PathId, new_conn: Connection) -> bool {
+        let Some(path) = self.path(path_id) else {
+            return false;
+        };
+        {
+            let mut connection = path.conn.lock().unwrap();
+            path.alive.store(false, Ordering::Release);
+            path.generation.fetch_add(1, Ordering::AcqRel);
+            *connection = new_conn;
+            path.ready.store(false, Ordering::Relaxed);
+            path.rtt.store(0, Ordering::Relaxed);
+            path.alive.store(true, Ordering::Release);
+        }
+        *path.probe.lock().unwrap() = None;
+        spawn_reader(path, &self.data_tx, &self.control_tx, &self.dead_tx);
+        tracing::info!(path_id = path_id.get(), uplink = %path.uplink_id, "path reconnected");
+        true
+    }
+
+    fn refresh_scheduler(&self) {
+        let mut scheduler = self.scheduler.lock().unwrap();
+        for path in &self.paths {
+            scheduler.set_eligible(
+                path.path_id,
+                path.ready.load(Ordering::Relaxed) && path.alive.load(Ordering::Relaxed),
+            );
+            let connection = path.conn.lock().unwrap();
+            if let Some(stats) = connection.path_stats(noq_proto::PathId::ZERO) {
+                scheduler.note_path_stats(path.path_id, stats.rtt, stats.cwnd);
+            } else {
+                let rtt = path.rtt.load(Ordering::Relaxed);
+                if rtt > 0 {
+                    scheduler.note_rtt(path.path_id, Duration::from_micros(rtt));
+                }
+            }
+            scheduler.note_queue_space(path.path_id, connection.datagram_send_buffer_space());
+        }
+    }
+
     pub fn send_data(&self, seq: u64, packet: Bytes) -> bool {
         let packet_len = packet.len() as u64;
-        // A packet that can never fit a datagram is rejected outright; no path
-        // could ever carry it, so retaining it would wedge the window.
         let encoded = multipass_proto::encode(&Frame::Data {
             seq,
             packet: packet.clone(),
         });
-        let fits_any = PathKind::ALL.iter().any(|&kind| {
-            self.connection(kind)
+        if !self.paths.iter().any(|path| {
+            path.conn
+                .lock()
+                .unwrap()
                 .max_datagram_size()
-                .map(|max| encoded.len() <= max)
-                .unwrap_or(false)
-        });
-        if !fits_any {
+                .is_some_and(|max| encoded.len() <= max)
+        }) {
             return false;
         }
 
-        // Update scheduler eligibility from current path state.
-        {
-            let mut sched = self.scheduler.lock().unwrap();
-            for kind in PathKind::ALL {
-                sched.set_eligible(kind, self.is_ready(kind) && self.is_alive(kind));
-                let connection = self.path(kind).conn.lock().unwrap();
-                if let Some(stats) = connection.path_stats(noq_proto::PathId::ZERO) {
-                    sched.note_path_stats(kind, stats.rtt, stats.cwnd);
-                } else {
-                    let rtt = self.path(kind).rtt.load(Ordering::Relaxed);
-                    if rtt > 0 {
-                        sched.note_rtt(kind, Duration::from_micros(rtt));
-                    }
-                }
-                let space = connection.datagram_send_buffer_space();
-                sched.note_queue_space(kind, space);
-            }
-        }
-
-        // Retain before send so a path failure never loses the only copy.
+        self.refresh_scheduler();
+        let Some(path_id) = self.scheduler.lock().unwrap().pick() else {
+            return false;
+        };
         self.send_window.lock().unwrap().insert(seq, packet);
-
-        let kind = {
-            let mut sched = self.scheduler.lock().unwrap();
-            sched.pick()
-        };
-        let Some(kind) = kind else {
-            return false;
-        };
-        let path = self.path(kind);
+        let path = self.path(path_id).expect("scheduler returned registered path");
         match path.conn.lock().unwrap().send_datagram(encoded) {
             Ok(()) => {
                 path.transmitted.fetch_add(1, Ordering::Relaxed);
-                path.transmitted_bytes
-                    .fetch_add(packet_len, Ordering::Relaxed);
+                path.transmitted_bytes.fetch_add(packet_len, Ordering::Relaxed);
                 true
             }
-            Err(e) => {
-                tracing::warn!(path = %kind.label(), %e, "datagram send failed; retained for retransmit");
-                true // retained in window; will be retransmitted
+            Err(error) => {
+                tracing::warn!(path_id = path_id.get(), uplink = %path.uplink_id, %error, "datagram send failed; retained for retransmit");
+                true
             }
         }
     }
 
-    /// Process an inbound SACK: retire acked packets and retransmit gaps on a
-    /// surviving path.
     fn handle_sack(&self, largest_contiguous: u64, ranges: &[(u64, u64)]) {
-        let gaps = self
-            .send_window
-            .lock()
-            .unwrap()
-            .ack(largest_contiguous, ranges);
-        if gaps.is_empty() {
-            return;
-        }
+        let gaps = self.send_window.lock().unwrap().ack(largest_contiguous, ranges);
         for seq in gaps {
-            let packet = self.send_window.lock().unwrap().get(seq);
-            if let Some(packet) = packet {
+            if let Some(packet) = self.send_window.lock().unwrap().get(seq) {
                 self.retransmit(seq, packet);
             }
         }
     }
 
-    /// Retransmit a retained packet on the best surviving path.
     fn retransmit(&self, seq: u64, packet: Bytes) {
-        let kind = {
-            let mut sched = self.scheduler.lock().unwrap();
-            for k in PathKind::ALL {
-                sched.set_eligible(k, self.is_ready(k) && self.is_alive(k));
-            }
-            sched.pick()
-        };
-        let Some(kind) = kind else {
+        self.refresh_scheduler();
+        let Some(path_id) = self.scheduler.lock().unwrap().pick() else {
             return;
         };
         let packet_len = packet.len() as u64;
         let encoded = multipass_proto::encode(&Frame::Data { seq, packet });
-        let path = self.path(kind);
+        let path = self.path(path_id).expect("scheduler returned registered path");
         if path.conn.lock().unwrap().send_datagram(encoded).is_ok() {
             path.transmitted.fetch_add(1, Ordering::Relaxed);
-            path.transmitted_bytes
-                .fetch_add(packet_len, Ordering::Relaxed);
-            tracing::debug!(seq, path = %kind.label(), "retransmitted packet");
+            path.transmitted_bytes.fetch_add(packet_len, Ordering::Relaxed);
+            tracing::debug!(seq, path_id = path_id.get(), uplink = %path.uplink_id, "retransmitted packet");
         }
     }
 
-    /// Called when a path dies: retransmit all its unacked packets on the
-    /// surviving path so a path failure never strands an only copy.
-    pub fn on_path_dead(&self, dead: PathKind) {
-        {
-            let mut sched = self.scheduler.lock().unwrap();
-            sched.set_eligible(dead, false);
-        }
+    pub fn on_path_dead(&self, dead: PathId) {
+        self.scheduler.lock().unwrap().set_eligible(dead, false);
         let unacked = self.send_window.lock().unwrap().unacked();
         for seq in unacked {
-            let packet = self.send_window.lock().unwrap().get(seq);
-            if let Some(packet) = packet {
+            if let Some(packet) = self.send_window.lock().unwrap().get(seq) {
                 self.retransmit(seq, packet);
             }
         }
     }
 
-    /// Send a control frame on one specific live path.
-    pub fn send_frame_on(&self, kind: PathKind, frame: &Frame) -> bool {
-        if !self.is_alive(kind) {
+    pub fn send_frame_on(&self, path_id: PathId, frame: &Frame) -> bool {
+        let Some(path) = self.path(path_id) else {
+            return false;
+        };
+        if !path.alive.load(Ordering::Relaxed) {
             return false;
         }
-        let p = self.path(kind);
-        match p
-            .conn
-            .lock()
-            .unwrap()
-            .send_datagram(multipass_proto::encode(frame))
-        {
+        match path.conn.lock().unwrap().send_datagram(multipass_proto::encode(frame)) {
             Ok(()) => {
-                p.transmitted.fetch_add(1, Ordering::Relaxed);
+                path.transmitted.fetch_add(1, Ordering::Relaxed);
                 true
             }
-            Err(e) => {
-                tracing::warn!(path = %kind.label(), %e, "datagram send failed");
+            Err(error) => {
+                tracing::warn!(path_id = path_id.get(), uplink = %path.uplink_id, %error, "datagram send failed");
                 false
             }
         }
     }
 
-    /// Receive the next deduped data frame in logical sequence order. Arrival
-    /// is admitted to the bounded reorder window before being SACKed, so an
-    /// acknowledged packet is never subsequently dropped.
     pub async fn recv_data(&self) -> Option<Data> {
         loop {
             if let Some(ready) = self.reorder.lock().unwrap().pop_ready() {
                 return Some(ready);
             }
-            let gap_deadline = {
-                let has_gap = self.reorder.lock().unwrap().has_gap();
-                has_gap.then(|| *self.reorder_activity.lock().unwrap() + REORDER_GAP_TIMEOUT)
-            };
+            let gap_deadline = self
+                .reorder
+                .lock()
+                .unwrap()
+                .has_gap()
+                .then(|| *self.reorder_activity.lock().unwrap() + REORDER_GAP_TIMEOUT);
             let mut data_rx = self.data_rx.lock().await;
             let data = if let Some(deadline) = gap_deadline {
                 tokio::select! {
@@ -605,14 +568,7 @@ impl Transport {
                         drop(data_rx);
                         let mut reorder = self.reorder.lock().unwrap();
                         if let Some((first, last)) = reorder.skip_missing_prefix() {
-                            tracing::debug!(
-                                first,
-                                last,
-                                next_seq = reorder.next_seq(),
-                                occupancy = reorder.occupancy(),
-                                span = ?reorder.buffered_span(),
-                                "reorder gap timed out; releasing buffered suffix"
-                            );
+                            tracing::debug!(first, last, next_seq = reorder.next_seq(), occupancy = reorder.occupancy(), span = ?reorder.buffered_span(), "reorder gap timed out; releasing buffered suffix");
                             self.recv_scoreboard.lock().unwrap().abandon_through(last);
                         }
                         continue;
@@ -626,29 +582,11 @@ impl Transport {
             *self.reorder_activity.lock().unwrap() = Instant::now();
             let mut reorder = self.reorder.lock().unwrap();
             match reorder.insert(seq, data) {
-                ReorderInsert::Rejected => {
-                    tracing::debug!(
-                        seq,
-                        next_seq = reorder.next_seq(),
-                        occupancy = reorder.occupancy(),
-                        span = ?reorder.buffered_span(),
-                        "reorder rejected arriving packet"
-                    );
-                    continue;
-                }
+                ReorderInsert::Rejected => continue,
                 ReorderInsert::Admitted => {
                     self.recv_scoreboard.lock().unwrap().insert(seq);
                 }
-                ReorderInsert::AdmittedAfterSkipping { first, last } => {
-                    tracing::debug!(
-                        seq,
-                        first,
-                        last,
-                        next_seq = reorder.next_seq(),
-                        occupancy = reorder.occupancy(),
-                        span = ?reorder.buffered_span(),
-                        "reorder window boundary skipped missing prefix"
-                    );
+                ReorderInsert::AdmittedAfterSkipping { last, .. } => {
                     let mut scoreboard = self.recv_scoreboard.lock().unwrap();
                     scoreboard.abandon_through(last);
                     scoreboard.insert(seq);
@@ -657,121 +595,91 @@ impl Transport {
         }
     }
 
-    /// Broadcast a SACK describing server→client receive state on every ready
-    /// path. Called periodically by the daemon so the server can retire and
-    /// retransmit its retention window.
     pub fn broadcast_sack(&self) {
-        let sack = self.recv_scoreboard.lock().unwrap().generate_sack();
-        let encoded = multipass_proto::encode(&sack);
-        for kind in PathKind::ALL {
-            if !self.is_alive(kind) {
-                continue;
+        let encoded = multipass_proto::encode(&self.recv_scoreboard.lock().unwrap().generate_sack());
+        for path in &self.paths {
+            if path.alive.load(Ordering::Relaxed) {
+                let _ = path.conn.lock().unwrap().send_datagram(encoded.clone());
             }
-            let _ = self
-                .path(kind)
-                .conn
-                .lock()
-                .unwrap()
-                .send_datagram(encoded.clone());
         }
     }
 
-    /// Receive the next non-data frame (Hello, Assign, ...) for the daemon's
-    /// handshake. Pings are answered internally and never surface here. Sack
-    /// frames are consumed internally to drive the aggregation retransmission
-    /// window and never surface here.
-    pub async fn recv_control(&self) -> Option<(PathKind, Frame)> {
+    pub async fn recv_control(&self) -> Option<(PathId, Frame)> {
         loop {
             let (path, frame) = self.control_rx.lock().await.recv().await?;
             match frame {
                 Frame::Sack {
                     largest_contiguous,
                     ranges,
-                } => {
-                    self.handle_sack(largest_contiguous, &ranges);
-                }
+                } => self.handle_sack(largest_contiguous, &ranges),
                 other => return Some((path, other)),
             }
         }
     }
 
-    /// Wait until one path's reader task dies (read error / connection close),
-    /// returning which path. Retransmits that path's unacked packets on the
-    /// survivor before returning. The daemon re-dials the dead path.
-    pub async fn recv_dead(&self) -> PathKind {
-        let kind = self
+    pub async fn recv_dead(&self) -> PathId {
+        let path_id = self
             .dead_rx
             .lock()
             .await
             .recv()
             .await
-            .unwrap_or(PathKind::Wired);
-        self.on_path_dead(kind);
-        kind
+            .expect("transport retains dead sender while alive");
+        self.on_path_dead(path_id);
+        path_id
     }
 
-    /// Snapshot of both paths' liveness.
     pub fn status(&self) -> TransportStatus {
         TransportStatus {
-            wired: self.wired.status(),
-            wifi: self.wifi.status(),
+            uplinks: self.paths.iter().map(|path| path.status()).collect(),
         }
     }
 
-    /// Path status for one path.
-    pub fn path_status(&self, kind: PathKind) -> PathStatus {
-        self.path(kind).status()
+    pub fn path_status(&self, path_id: PathId) -> Option<UplinkStatus> {
+        self.path(path_id).map(|path| path.status())
     }
 
-    /// Whether the given path is currently alive.
-    pub fn is_alive(&self, kind: PathKind) -> bool {
-        self.path(kind).alive.load(Ordering::Relaxed)
+    pub fn is_alive(&self, path_id: PathId) -> bool {
+        self.path(path_id)
+            .is_some_and(|path| path.alive.load(Ordering::Relaxed))
     }
 
-    /// Mark a path eligible for replicated data after its Hello was acknowledged.
-    pub fn mark_ready(&self, kind: PathKind) {
-        self.path(kind).ready.store(true, Ordering::Relaxed);
+    pub fn mark_ready(&self, path_id: PathId) -> bool {
+        let Some(path) = self.path(path_id) else {
+            return false;
+        };
+        path.ready.store(true, Ordering::Relaxed);
+        true
     }
 
-    /// Whether the path acknowledged the current client epoch.
-    pub fn is_ready(&self, kind: PathKind) -> bool {
-        self.path(kind).ready.load(Ordering::Relaxed)
+    pub fn is_ready(&self, path_id: PathId) -> bool {
+        self.path(path_id)
+            .is_some_and(|path| path.ready.load(Ordering::Relaxed))
     }
 
-    /// Number of packets currently retained in the aggregation send window
-    /// (unacknowledged). Exposed for tests and status.
     pub fn send_window_len(&self) -> usize {
         self.send_window.lock().unwrap().len()
     }
-    /// Raw noq connection for a path (e.g. to await `closed()` or inspect).
-    pub fn connection(&self, kind: PathKind) -> Connection {
-        self.path(kind).conn.lock().unwrap().clone()
+
+    pub fn connection(&self, path_id: PathId) -> Option<Connection> {
+        self.path(path_id)
+            .map(|path| path.conn.lock().unwrap().clone())
     }
 
-    /// Verify that a path can carry datagrams of at least `required` bytes.
-    ///
-    /// The tunnel requires 1289 bytes (MTU 1280 + 9 bytes framing). A path
-    /// that cannot carry this is not dual-stack ready and must not be used
-    /// for IPv6 traffic.
-    pub fn verify_datagram_capacity(&self, kind: PathKind, required: usize) -> bool {
-        let conn = self.connection(kind);
-        match conn.max_datagram_size() {
-            Some(max) => max >= required,
-            None => false,
-        }
+    pub fn verify_datagram_capacity(&self, path_id: PathId, required: usize) -> bool {
+        self.connection(path_id)
+            .and_then(|connection| connection.max_datagram_size())
+            .is_some_and(|max| max >= required)
     }
 
-    fn path(&self, kind: PathKind) -> &Arc<Path> {
-        match kind {
-            PathKind::Wired => &self.wired,
-            PathKind::Wifi => &self.wifi,
-        }
+    fn path(&self, path_id: PathId) -> Option<&Arc<Path>> {
+        self.path_indices.get(&path_id).map(|index| &self.paths[*index])
     }
 }
 impl Drop for Transport {
     fn drop(&mut self) {
         self.probe_task.abort();
-        for path in [&self.wired, &self.wifi] {
+        for path in &self.paths {
             path.conn
                 .lock()
                 .unwrap()
@@ -792,11 +700,11 @@ impl Drop for Transport {
 fn spawn_reader(
     path: &Arc<Path>,
     data_tx: &mpsc::Sender<Data>,
-    control_tx: &mpsc::Sender<(PathKind, Frame)>,
-    dead_tx: &mpsc::Sender<PathKind>,
+    control_tx: &mpsc::Sender<(PathId, Frame)>,
+    dead_tx: &mpsc::Sender<PathId>,
 ) {
     let path = Arc::clone(path);
-    let kind = path.kind;
+    let path_id = path.path_id;
     let generation = path.generation.load(Ordering::Acquire);
     let conn = Arc::clone(&path.conn);
     let mark_recv = {
@@ -826,7 +734,7 @@ fn spawn_reader(
                                 .send(Data {
                                     seq,
                                     packet,
-                                    path: kind,
+                                    path: path_id,
                                 })
                                 .await
                                 .is_err()
@@ -850,7 +758,7 @@ fn spawn_reader(
                             }
                         }
                         Some(other) => {
-                            if control_tx.send((kind, other)).await.is_err() {
+                            if control_tx.send((path_id, other)).await.is_err() {
                                 break;
                             }
                         }
@@ -860,9 +768,9 @@ fn spawn_reader(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(path = %kind.label(), %e, "path read ended");
+                    tracing::warn!(path_id = path_id.get(), uplink = %path.uplink_id, %e, "path read ended");
                     if path.mark_dead(generation) {
-                        let _ = dead_tx.send(kind).await;
+                        let _ = dead_tx.send(path_id).await;
                     }
                     break;
                 }
@@ -874,11 +782,9 @@ fn spawn_reader(
 /// Spawn a periodic probe task on each live path. Matching Pongs update the
 /// per-path RTT exposed through status.
 fn spawn_probe(
-    wired: &Arc<Path>,
-    wifi: &Arc<Path>,
-    dead_tx: &mpsc::Sender<PathKind>,
+    paths: Vec<Arc<Path>>,
+    dead_tx: &mpsc::Sender<PathId>,
 ) -> tokio::task::JoinHandle<()> {
-    let paths = [Arc::clone(wired), Arc::clone(wifi)];
     let dead_tx = dead_tx.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(RTT_PROBE_INTERVAL);
@@ -895,8 +801,8 @@ fn spawn_probe(
                         continue;
                     }
                     if p.mark_dead(probe_generation) {
-                        tracing::warn!(path = %p.kind.label(), "path liveness probe timed out");
-                        let _ = dead_tx.send(p.kind).await;
+                        tracing::warn!(path_id = p.path_id.get(), uplink = %p.uplink_id, "path liveness probe timed out");
+                        let _ = dead_tx.send(p.path_id).await;
                     }
                     continue;
                 }
@@ -927,6 +833,38 @@ fn spawn_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn path(value: u16) -> PathId {
+        PathId::new(value)
+    }
+
+    fn test_connection(
+        path_id: u16,
+        uplink_id: &str,
+        connection: Connection,
+    ) -> UplinkConnection {
+        UplinkConnection {
+            path_id: path(path_id),
+            uplink_id: UplinkId::new(uplink_id).unwrap(),
+            connection,
+        }
+    }
+
+    fn test_dials(count: u16) -> Vec<UplinkDial> {
+        (1..=count)
+            .map(|id| UplinkDial {
+                path_id: path(id),
+                uplink_id: UplinkId::new(format!("path-{id}")).unwrap(),
+                source: "127.0.0.1".parse().unwrap(),
+            })
+            .collect()
+    }
+
+    fn mark_all_ready(transport: &Transport) {
+        for path_id in transport.path_ids() {
+            assert!(transport.mark_ready(path_id));
+        }
+    }
 
     /// Echo server: decodes replicated inbound data frames and re-sends each
     /// copy on the connection it arrived on; client dedup exposes one result.
@@ -1075,7 +1013,7 @@ mod tests {
         let wifi = dial(server_addr, "127.0.0.1".parse().unwrap(), "wifi-test")
             .await
             .unwrap();
-        let transport = Transport::from_connections(wired, wifi);
+        let transport = Transport::from_connections(vec![test_connection(1, "wired", wired), test_connection(2, "wifi", wifi)]);
 
         wired_forwarding.store(false, Ordering::Relaxed);
         let dead = tokio::time::timeout(Duration::from_secs(3), transport.recv_dead())
@@ -1083,7 +1021,7 @@ mod tests {
             .expect(
                 "application probe must detect a silent path before asymmetric QUIC idle timeout",
             );
-        assert_eq!(dead, PathKind::Wired);
+        assert_eq!(dead, path(1));
         assert!(
             tokio::time::timeout(Duration::from_millis(200), transport.recv_dead())
                 .await
@@ -1095,11 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_transport_closes_both_connections() {
         let (addr, mut closed_rx) = spawn_close_observing_server().await;
-        let transport = Transport::connect(
-            addr,
-            "127.0.0.1".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-        )
+        let transport = Transport::connect(addr, test_dials(2))
         .await
         .unwrap();
 
@@ -1116,32 +1050,26 @@ mod tests {
     #[tokio::test]
     async fn recv_data_reorders_striped_arrivals_before_delivery() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(
-            addr,
-            "127.0.0.1".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-        )
+        let t = Transport::connect(addr, test_dials(2))
         .await
         .unwrap();
-        for kind in PathKind::ALL {
-            t.mark_ready(kind);
-        }
+        mark_all_ready(&t);
 
         for data in [
             Data {
                 seq: 3,
                 packet: Bytes::from_static(b"three"),
-                path: PathKind::Wifi,
+                path: path(2),
             },
             Data {
                 seq: 1,
                 packet: Bytes::from_static(b"one"),
-                path: PathKind::Wired,
+                path: path(1),
             },
             Data {
                 seq: 2,
                 packet: Bytes::from_static(b"two"),
-                path: PathKind::Wired,
+                path: path(1),
             },
         ] {
             t.data_tx.send(data).await.unwrap();
@@ -1155,27 +1083,21 @@ mod tests {
     #[tokio::test]
     async fn recv_data_releases_suffix_after_gap_timeout_without_new_arrivals() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(
-            addr,
-            "127.0.0.1".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-        )
+        let t = Transport::connect(addr, test_dials(2))
         .await
         .unwrap();
-        for kind in PathKind::ALL {
-            t.mark_ready(kind);
-        }
+        mark_all_ready(&t);
 
         for data in [
             Data {
                 seq: 2,
                 packet: Bytes::from_static(b"two"),
-                path: PathKind::Wired,
+                path: path(1),
             },
             Data {
                 seq: 3,
                 packet: Bytes::from_static(b"three"),
-                path: PathKind::Wifi,
+                path: path(2),
             },
         ] {
             t.data_tx.send(data).await.unwrap();
@@ -1193,16 +1115,10 @@ mod tests {
     #[tokio::test]
     async fn aggregated_send_stripes_and_delivers_once() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(
-            addr,
-            "127.0.0.1".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-        )
+        let t = Transport::connect(addr, test_dials(2))
         .await
         .unwrap();
-        for kind in PathKind::ALL {
-            t.mark_ready(kind);
-        }
+        mark_all_ready(&t);
 
         const N: u64 = 20;
         for seq in 1..=N {
@@ -1224,8 +1140,8 @@ mod tests {
         // sent once, on one path), not 2N as in replication. Every packet is
         // retained in the send window for possible retransmission.
         let st = t.status();
-        let total_tx_bytes = st.wired.transmitted_bytes + st.wifi.transmitted_bytes;
-        let total_rx_bytes = st.wired.received_bytes + st.wifi.received_bytes;
+        let total_tx_bytes: u64 = st.uplinks.iter().map(|uplink| uplink.transmitted_bytes).sum();
+        let total_rx_bytes: u64 = st.uplinks.iter().map(|uplink| uplink.received_bytes).sum();
         assert_eq!(
             total_tx_bytes,
             N * 5,
@@ -1236,27 +1152,27 @@ mod tests {
             N * 5,
             "path counters track received payload bytes"
         );
-        let total_tx = st.wired.transmitted + st.wifi.transmitted;
+        let total_tx: u64 = st.uplinks.iter().map(|uplink| uplink.transmitted).sum();
         assert_eq!(total_tx, N, "each packet striped onto exactly one path");
     }
     #[tokio::test]
     async fn datagram_capacity_supports_tunnel_mtu() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(
-            addr,
-            "127.0.0.1".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-        )
+        let t = Transport::connect(addr, test_dials(2))
         .await
         .unwrap();
 
         const REQUIRED: usize = multipass_proto::TUNNEL_MTU as usize + 9;
-        for kind in PathKind::ALL {
-            let max = t.connection(kind).max_datagram_size().unwrap_or(0);
+        for path_id in t.path_ids() {
+            let max = t
+                .connection(path_id)
+                .unwrap()
+                .max_datagram_size()
+                .unwrap_or(0);
             assert!(
                 max >= REQUIRED,
                 "path {} starts with {max}-byte datagram capacity, need {REQUIRED}",
-                kind.label(),
+                path_id.get(),
             );
         }
     }
@@ -1264,18 +1180,18 @@ mod tests {
     #[tokio::test]
     async fn oversized_data_reports_send_failure() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(
-            addr,
-            "127.0.0.1".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-        )
+        let t = Transport::connect(addr, test_dials(2))
         .await
         .unwrap();
-        t.mark_ready(PathKind::Wired);
+        t.mark_ready(path(1));
 
         assert!(!t.send_data(1, Bytes::from(vec![0; 64 * 1024])));
         assert_eq!(
-            t.status().wired.transmitted + t.status().wifi.transmitted,
+            t.status()
+                .uplinks
+                .iter()
+                .map(|uplink| uplink.transmitted)
+                .sum::<u64>(),
             0
         );
     }
@@ -1283,16 +1199,10 @@ mod tests {
     #[tokio::test]
     async fn path_death_retransmits_unacked_on_survivor() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(
-            addr,
-            "127.0.0.1".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-        )
+        let t = Transport::connect(addr, test_dials(2))
         .await
         .unwrap();
-        for kind in PathKind::ALL {
-            t.mark_ready(kind);
-        }
+        mark_all_ready(&t);
 
         // Send a few packets; they stripe across paths and stay unacked
         // (the echo server returns them as Data, not Sack, so nothing retires).
@@ -1308,23 +1218,21 @@ mod tests {
         // Kill the wired path at the connection level. The reader task marks
         // it dead; recv_dead triggers retransmission of all unacked packets
         // onto the surviving wifi path.
-        t.connection(PathKind::Wired)
-            .close(0u32.into(), b"test: kill wired");
+        t.connection(path(1)).unwrap().close(0u32.into(), b"test: kill wired");
         let dead = tokio::time::timeout(Duration::from_secs(2), t.recv_dead())
             .await
             .expect("wired death must surface");
-        assert_eq!(dead, PathKind::Wired);
+        assert_eq!(dead, path(1));
 
         // Every unacked packet must have been retransmitted on wifi, so wifi's
         // transmitted count exceeds what it originally carried.
         let st = t.status();
-        assert!(!st.wired.alive);
-        // wifi now carries retransmissions of wired's unacked packets in
-        // addition to its own original stripes.
+        assert!(!st.get(path(1)).unwrap().alive);
+        let survivor = st.get(path(2)).unwrap();
         assert!(
-            st.wifi.transmitted >= N / 2,
+            survivor.transmitted >= N / 2,
             "survivor must carry retransmitted packets, got {}",
-            st.wifi.transmitted
+            survivor.transmitted
         );
     }
 }

@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use multipass_proto::{
-    Frame, PathKind, ReorderBuffer, ReorderInsert, SackScoreboard, Scheduler, SendWindow,
-    TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, encode,
+    Frame, PathId, ReorderBuffer, ReorderInsert, SackScoreboard, Scheduler, SendWindow,
+    TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, UplinkId, encode,
 };
 use noq::{Connection, Endpoint, ServerConfig, TransportConfig};
 use noq_proto::crypto::rustls::QuicServerConfig;
@@ -125,15 +125,14 @@ fn server_config() -> ServerConfig {
     cfg
 }
 
-/// One client connection and the epoch established by its first Hello.
+/// One client connection and its authenticated uplink registration.
 struct LiveConn {
     id: u64,
     conn: Option<Connection>,
     epoch: Option<u64>,
-    /// Scheduling slot for this path within the epoch (Wired/Wifi label; the
-    /// physical mapping is irrelevant — what matters is the scheduler can
-    /// distinguish the two paths by measured RTT/queue).
-    path: Option<PathKind>,
+    uplink_id: Option<UplinkId>,
+    path_id: Option<PathId>,
+    generation: Option<u64>,
 }
 
 struct SessionState {
@@ -188,7 +187,9 @@ impl Session {
             id,
             conn: Some(conn),
             epoch: None,
-            path: None,
+            uplink_id: None,
+            path_id: None,
+            generation: None,
         });
         debug!(id, "connection added to session");
         id
@@ -196,28 +197,68 @@ impl Session {
 
     async fn remove_conn(&self, id: u64) {
         let mut state = self.state.lock().await;
-        if let Some(conn) = state.conns.iter().find(|c| c.id == id)
-            && let Some(path) = conn.path
+        if let Some(path_id) = state
+            .conns
+            .iter()
+            .find(|conn| conn.id == id)
+            .and_then(|conn| conn.path_id)
         {
-            state.scheduler.set_eligible(path, false);
+            state.scheduler.set_eligible(path_id, false);
+            state.scheduler.remove(path_id);
         }
         state.conns.retain(|conn| conn.id != id);
         debug!(id, "connection removed from session");
     }
 
-    async fn authenticate(&self, id: u64, epoch: u64) -> bool {
+    async fn authenticate_uplink(
+        &self,
+        id: u64,
+        epoch: u64,
+        uplink_id: UplinkId,
+        path_id: PathId,
+        generation: u64,
+    ) -> bool {
         let mut state = self.state.lock().await;
         let Some(index) = state.conns.iter().position(|conn| conn.id == id) else {
             return false;
         };
         if let Some(authenticated_epoch) = state.conns[index].epoch {
-            return authenticated_epoch == epoch;
+            return authenticated_epoch == epoch
+                && state.conns[index].uplink_id.as_ref() == Some(&uplink_id)
+                && state.conns[index].path_id == Some(path_id)
+                && state.conns[index].generation == Some(generation);
         }
         if state.retired_epochs.contains(&epoch) {
             return false;
         }
 
-        if state.epoch != Some(epoch) {
+        let replacing_epoch = state.epoch != Some(epoch);
+        let mut replace_connection_id = None;
+        if !replacing_epoch {
+            // Per-uplink generations are scoped to one client epoch. Only
+            // registrations joining the active epoch compete with its paths.
+            for existing in state
+                .conns
+                .iter()
+                .filter(|conn| conn.id != id && conn.epoch == Some(epoch))
+            {
+                if existing.path_id == Some(path_id)
+                    && existing.uplink_id.as_ref() != Some(&uplink_id)
+                {
+                    return false;
+                }
+                if existing.uplink_id.as_ref() == Some(&uplink_id) {
+                    if existing.path_id != Some(path_id)
+                        || generation <= existing.generation.unwrap_or(0)
+                    {
+                        return false;
+                    }
+                    replace_connection_id = Some(existing.id);
+                }
+            }
+        }
+
+        if replacing_epoch {
             if let Some(previous) = state.epoch.replace(epoch) {
                 state.retired_epochs.insert(previous);
                 state.conns.retain_mut(|conn| {
@@ -237,25 +278,37 @@ impl Session {
             state.send_window = SendWindow::new(4096);
             state.scheduler = Scheduler::new();
             self.seq.store(1, Ordering::Relaxed);
+        } else if let Some(replace_id) = replace_connection_id {
+            if let Some(existing_index) = state.conns.iter().position(|conn| conn.id == replace_id) {
+                if let Some(handle) = state.conns[existing_index].conn.take() {
+                    handle.close(0u32.into(), b"uplink generation replaced");
+                }
+                state.conns.remove(existing_index);
+            }
         }
-
-        // Assign this connection the next free scheduling slot in the epoch.
-        let used: HashSet<PathKind> = state
-            .conns
-            .iter()
-            .filter_map(|c| (c.epoch == Some(epoch)).then_some(c.path).flatten())
-            .collect();
-        let slot = PathKind::ALL.into_iter().find(|k| !used.contains(k));
 
         let Some(conn) = state.conns.iter_mut().find(|conn| conn.id == id) else {
             return false;
         };
         conn.epoch = Some(epoch);
-        conn.path = slot;
-        if let Some(slot) = slot {
-            state.scheduler.set_eligible(slot, true);
-        }
+        conn.uplink_id = Some(uplink_id);
+        conn.path_id = Some(path_id);
+        conn.generation = Some(generation);
+        state.scheduler.insert(path_id);
+        state.scheduler.set_eligible(path_id, true);
         true
+    }
+
+    #[cfg(test)]
+    async fn authenticate(&self, id: u64, epoch: u64) -> bool {
+        self.authenticate_uplink(
+            id,
+            epoch,
+            UplinkId::new(format!("test-{id}")).unwrap(),
+            PathId::new(u16::try_from(id + 1).unwrap()),
+            1,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -407,15 +460,15 @@ impl Session {
         let epoch = state.epoch;
 
         // Collect per-connection stats first (immutable borrow), then release.
-        let stats: Vec<(PathKind, Option<noq_proto::PathStats>, usize)> = state
+        let stats: Vec<(PathId, Option<noq_proto::PathStats>, usize)> = state
             .conns
             .iter()
             .filter(|live| live.epoch == epoch)
             .filter_map(|live| {
-                let path = live.path?;
+                let path_id = live.path_id?;
                 let conn = live.conn.as_ref()?;
                 Some((
-                    path,
+                    path_id,
                     conn.path_stats(noq_proto::PathId::ZERO),
                     conn.datagram_send_buffer_space(),
                 ))
@@ -434,7 +487,7 @@ impl Session {
             return false;
         };
         for live in state.conns.iter_mut() {
-            if live.epoch != epoch || live.path != Some(chosen) {
+            if live.epoch != epoch || live.path_id != Some(chosen) {
                 continue;
             }
             let Some(conn) = live.conn.as_ref() else {
@@ -480,7 +533,9 @@ impl Session {
             id,
             conn: None,
             epoch: None,
-            path: None,
+            uplink_id: None,
+            path_id: None,
+            generation: None,
         });
         id
     }
@@ -512,15 +567,29 @@ async fn conn_handler(
                     continue;
                 };
                 match frame {
-                    Frame::Hello { client_nonce } => {
-                        if !session.authenticate(id, client_nonce).await {
+                    Frame::Hello {
+                        client_epoch,
+                        uplink_id,
+                        path_id,
+                        connection_generation,
+                    } => {
+                        if !session
+                            .authenticate_uplink(
+                                id,
+                                client_epoch,
+                                uplink_id.clone(),
+                                path_id,
+                                connection_generation,
+                            )
+                            .await
+                        {
                             break;
                         }
                         let assign = server_assignment(ipv6_client);
                         if conn.send_datagram(encode(&assign)).is_err() {
                             break;
                         }
-                        info!(id, client_nonce, "answered Hello: assigned");
+                        info!(id, client_epoch, uplink = %uplink_id, path_id = path_id.get(), connection_generation, "answered Hello: assigned");
                     }
                     Frame::Data { seq, packet } => {
                         for packet in session.accept_packet(id, seq, packet).await {
@@ -732,7 +801,7 @@ mod tests {
     use super::{
         Frame, REORDER_GAP_TIMEOUT, ServerOptions, Session, server_assignment, server_config,
     };
-    use multipass_proto::{TUNNEL_CLIENT, TUNNEL_PREFIX, encode};
+    use multipass_proto::{PathId, TUNNEL_CLIENT, TUNNEL_PREFIX, UplinkId, encode};
 
     #[tokio::test]
     async fn new_client_epoch_evicts_old_connections_and_rejects_rollback() {
@@ -960,6 +1029,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_registers_three_explicit_uplinks_in_one_epoch() {
+        let session = Session::new();
+        for id in 1..=3 {
+            let conn = session.add_test_conn().await;
+            assert!(
+                session
+                    .authenticate_uplink(
+                        conn,
+                        10,
+                        UplinkId::new(format!("uplink-{id}")).unwrap(),
+                        PathId::new(id as u16),
+                        1,
+                    )
+                    .await
+            );
+        }
+        let state = session.state.lock().await;
+        assert_eq!(state.conns.iter().filter(|conn| conn.epoch == Some(10)).count(), 3);
+        assert_eq!(state.scheduler.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn newer_uplink_generation_supersedes_only_matching_connection() {
+        let session = Session::new();
+        let old_wifi = session.add_test_conn().await;
+        let ethernet = session.add_test_conn().await;
+        assert!(session.authenticate_uplink(old_wifi, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 1).await);
+        assert!(session.authenticate_uplink(ethernet, 10, UplinkId::new("ethernet").unwrap(), PathId::new(2), 1).await);
+
+        let new_wifi = session.add_test_conn().await;
+        assert!(session.authenticate_uplink(new_wifi, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 2).await);
+        assert!(!session.authenticate_uplink(old_wifi, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 1).await);
+        assert!(session.accept_data(ethernet, 1).await);
+        assert!(session.accept_data(new_wifi, 2).await);
+    }
+
+    #[tokio::test]
+    async fn server_rejects_stale_generation_and_conflicting_path_id() {
+        let session = Session::new();
+        let wifi = session.add_test_conn().await;
+        assert!(session.authenticate_uplink(wifi, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 3).await);
+
+        let stale = session.add_test_conn().await;
+        assert!(!session.authenticate_uplink(stale, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 2).await);
+        let conflict = session.add_test_conn().await;
+        assert!(!session.authenticate_uplink(conflict, 10, UplinkId::new("ethernet").unwrap(), PathId::new(1), 1).await);
+    }
+
+    #[tokio::test]
+    async fn retired_epoch_rejection_does_not_mutate_valid_session() {
+        let session = Session::new();
+        let old = session.add_test_conn().await;
+        assert!(session.authenticate_uplink(old, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 3).await);
+        let current = session.add_test_conn().await;
+        assert!(session.authenticate_uplink(current, 20, UplinkId::new("wifi").unwrap(), PathId::new(1), 0).await);
+
+        let rollback = session.add_test_conn().await;
+        assert!(!session.authenticate_uplink(rollback, 10, UplinkId::new("ethernet").unwrap(), PathId::new(2), 0).await);
+        assert_eq!(session.state.lock().await.epoch, Some(20));
+        assert!(session.accept_data(current, 1).await);
+    }
+
+    #[tokio::test]
+    async fn new_epoch_restarts_uplink_generation() {
+        let session = Session::new();
+        let old = session.add_test_conn().await;
+        assert!(session.authenticate_uplink(old, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 3).await);
+
+        let restarted = session.add_test_conn().await;
+        assert!(session.authenticate_uplink(restarted, 20, UplinkId::new("wifi").unwrap(), PathId::new(1), 0).await);
+        assert_eq!(session.state.lock().await.epoch, Some(20));
+        assert!(session.accept_data(restarted, 1).await);
+    }
+
+    #[tokio::test]
     async fn server_assigns_distinct_path_slots_and_schedules() {
         let session = Session::new();
         let first = session.add_test_conn().await;
@@ -967,13 +1111,12 @@ mod tests {
         assert!(session.authenticate(first, 10).await);
         assert!(session.authenticate(second, 10).await);
 
-        // The two connections in one epoch must occupy distinct scheduling
-        // slots (Wired/Wifi labels), which is what lets the scheduler stripe
-        // the download direction across both.
+        // Explicit path IDs let the scheduler stripe the download direction
+        // across any number of registered uplinks.
         let (p1, p2) = {
             let state = session.state.lock().await;
-            let p1 = state.conns.iter().find(|c| c.id == first).unwrap().path;
-            let p2 = state.conns.iter().find(|c| c.id == second).unwrap().path;
+            let p1 = state.conns.iter().find(|c| c.id == first).unwrap().path_id;
+            let p2 = state.conns.iter().find(|c| c.id == second).unwrap().path_id;
             (p1, p2)
         };
         assert!(p1.is_some() && p2.is_some());

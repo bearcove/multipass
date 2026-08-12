@@ -4,13 +4,23 @@
 //! delivered exactly once.
 
 use bytes::Bytes;
-use multipass::{PathKind, Transport};
+use multipass::{PathId, Transport, UplinkDial, UplinkId};
 use multipass_proto::{Dedup, Frame, SackScoreboard};
 use noq::Endpoint;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
+
+fn test_dials(count: u16) -> Vec<UplinkDial> {
+    (1..=count)
+        .map(|id| UplinkDial {
+            path_id: PathId::new(id),
+            uplink_id: UplinkId::new(format!("path-{id}")).unwrap(),
+            source: "127.0.0.1".parse().unwrap(),
+        })
+        .collect()
+}
 
 /// Spawn a server that dedups inbound Data and periodically SACKs back its
 /// receive state. Returns the server address and a count of unique packets
@@ -86,15 +96,11 @@ async fn spawn_sack_server() -> (SocketAddr, Arc<AtomicUsize>) {
 #[tokio::test]
 async fn aggregation_delivers_all_and_retires_window() {
     let (addr, accepted) = spawn_sack_server().await;
-    let t = Transport::connect(
-        addr,
-        "127.0.0.1".parse().unwrap(),
-        "127.0.0.1".parse().unwrap(),
-    )
+    let t = Transport::connect(addr, test_dials(2))
     .await
     .unwrap();
-    for kind in PathKind::ALL {
-        t.mark_ready(kind);
+    for path_id in t.path_ids() {
+        assert!(t.mark_ready(path_id));
     }
 
     const N: u64 = 200;
