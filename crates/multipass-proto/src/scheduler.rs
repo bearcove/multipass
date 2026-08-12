@@ -11,7 +11,8 @@
 //! scheduler picks the lowest-cost ready path per packet, which naturally
 //! stripes in proportion to each path's real-time capacity.
 
-use crate::PathKind;
+use crate::PathId;
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Per-path scheduling inputs, updated from QUIC path statistics.
@@ -41,59 +42,85 @@ impl Default for PathState {
     }
 }
 
-/// Picks the path with the lowest estimated delivery time for each packet.
+/// Picks paths using smooth weighted round-robin over dynamically registered IDs.
 pub struct Scheduler {
-    paths: [PathState; 2],
-}
-
-fn idx(p: PathKind) -> usize {
-    match p {
-        PathKind::Wired => 0,
-        PathKind::Wifi => 1,
-    }
+    paths: Vec<(PathId, PathState)>,
+    indices: HashMap<PathId, usize>,
 }
 
 impl Scheduler {
     pub fn new() -> Self {
         Self {
-            paths: [PathState::default(), PathState::default()],
+            paths: Vec::new(),
+            indices: HashMap::new(),
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub fn insert(&mut self, path: PathId) -> bool {
+        if self.indices.contains_key(&path) {
+            return false;
+        }
+        let index = self.paths.len();
+        self.paths.push((path, PathState::default()));
+        self.indices.insert(path, index);
+        true
+    }
+
+    pub fn remove(&mut self, path: PathId) -> bool {
+        let Some(index) = self.indices.remove(&path) else {
+            return false;
+        };
+        self.paths.remove(index);
+        for (new_index, (id, _)) in self.paths[index..].iter().enumerate() {
+            self.indices.insert(*id, index + new_index);
+        }
+        true
+    }
+
+    fn state_mut(&mut self, path: PathId) -> Option<&mut PathState> {
+        let index = *self.indices.get(&path)?;
+        Some(&mut self.paths[index].1)
+    }
+
     /// Mark a path eligible (alive + ready) or not.
-    pub fn set_eligible(&mut self, path: PathKind, eligible: bool) {
-        let state = &mut self.paths[idx(path)];
+    pub fn set_eligible(&mut self, path: PathId, eligible: bool) {
+        let Some(state) = self.state_mut(path) else {
+            return;
+        };
         if state.eligible != eligible {
             state.current_weight = 0.0;
         }
         state.eligible = eligible;
     }
 
-    /// Record a measured RTT for a path while preserving its current
-    /// congestion-window estimate.
-    pub fn note_rtt(&mut self, path: PathKind, rtt: Duration) {
-        self.paths[idx(path)].rtt = Some(rtt);
+    pub fn note_rtt(&mut self, path: PathId, rtt: Duration) {
+        if let Some(state) = self.state_mut(path) {
+            state.rtt = Some(rtt);
+        }
     }
 
-    /// Record QUIC path capacity inputs. `cwnd / RTT` estimates the path's
-    /// current service rate; smooth weighted round-robin then stripes packets
-    /// in proportion to that estimate without starving slower healthy paths.
-    pub fn note_path_stats(&mut self, path: PathKind, rtt: Duration, cwnd: u64) {
-        let state = &mut self.paths[idx(path)];
-        state.rtt = Some(rtt);
-        state.cwnd = cwnd.max(1);
+    pub fn note_path_stats(&mut self, path: PathId, rtt: Duration, cwnd: u64) {
+        if let Some(state) = self.state_mut(path) {
+            state.rtt = Some(rtt);
+            state.cwnd = cwnd.max(1);
+        }
     }
 
-    /// Record the current datagram send buffer space for a path.
-    pub fn note_queue_space(&mut self, path: PathKind, bytes: usize) {
-        self.paths[idx(path)].queue_space = bytes;
+    pub fn note_queue_space(&mut self, path: PathId, bytes: usize) {
+        if let Some(state) = self.state_mut(path) {
+            state.queue_space = bytes;
+        }
     }
 
-    /// Effective path service-rate weight. Returns `None` if the path is not
-    /// eligible. Queue pressure reduces, but never eliminates, the weight of a
-    /// live path; only liveness/handshake state can make a path ineligible.
-    fn weight(&self, path: PathKind) -> Option<f64> {
-        let state = &self.paths[idx(path)];
+    fn weight(state: &PathState) -> Option<f64> {
         if !state.eligible {
             return None;
         }
@@ -114,45 +141,40 @@ impl Scheduler {
         Some((service_rate * queue_factor).max(1.0))
     }
 
-    /// Pick a path using smooth weighted round-robin. Each eligible path's
-    /// accumulator grows by its current capacity estimate; the largest wins
-    /// and pays the total weight. Over a batch this yields the capacity ratio
-    /// while retaining deterministic, per-packet decisions.
-    pub fn pick(&mut self) -> Option<PathKind> {
-        let mut weights = [self.weight(PathKind::Wired), self.weight(PathKind::Wifi)];
-        let strongest = weights.iter().flatten().copied().fold(0.0, f64::max);
+    pub fn pick(&mut self) -> Option<PathId> {
+        let strongest = self
+            .paths
+            .iter()
+            .filter_map(|(_, state)| Self::weight(state))
+            .fold(0.0, f64::max);
         if strongest == 0.0 {
             return None;
         }
 
-        // A path that receives no traffic cannot grow its congestion window,
-        // so a pure cwnd/RTT weight creates a positive-feedback starvation
-        // loop. Give every eligible path at least 5% of picks against the
-        // strongest path: floor / (strongest + floor) = 1 / 20.
         let exploration_floor = strongest / 19.0;
-        for weight in weights.iter_mut().flatten() {
-            *weight = weight.max(exploration_floor);
-        }
+        let total: f64 = self
+            .paths
+            .iter()
+            .filter_map(|(_, state)| Self::weight(state))
+            .map(|weight| weight.max(exploration_floor))
+            .sum();
 
-        let total: f64 = weights.iter().flatten().sum();
         let mut chosen = None;
         let mut best = f64::NEG_INFINITY;
-        for (index, weight) in weights.into_iter().enumerate() {
-            let Some(weight) = weight else { continue };
-            self.paths[index].current_weight += weight;
-            if self.paths[index].current_weight > best {
-                best = self.paths[index].current_weight;
+        for (index, (_, state)) in self.paths.iter_mut().enumerate() {
+            let Some(weight) = Self::weight(state) else {
+                continue;
+            };
+            state.current_weight += weight.max(exploration_floor);
+            if state.current_weight > best {
+                best = state.current_weight;
                 chosen = Some(index);
             }
         }
 
         let chosen = chosen.expect("positive total weight has an eligible path");
-        self.paths[chosen].current_weight -= total;
-        Some(if chosen == 0 {
-            PathKind::Wired
-        } else {
-            PathKind::Wifi
-        })
+        self.paths[chosen].1.current_weight -= total;
+        Some(self.paths[chosen].0)
     }
 }
 
@@ -166,120 +188,128 @@ impl Default for Scheduler {
 mod tests {
     use super::*;
 
-    #[test]
-    fn scheduler_picks_faster_path() {
-        let mut sched = Scheduler::new();
-        sched.set_eligible(PathKind::Wired, true);
-        sched.set_eligible(PathKind::Wifi, true);
-        sched.note_rtt(PathKind::Wired, Duration::from_millis(1));
-        sched.note_rtt(PathKind::Wifi, Duration::from_millis(10));
-
-        assert_eq!(sched.pick(), Some(PathKind::Wired));
+    fn path(value: u16) -> PathId {
+        PathId::new(value)
     }
 
     #[test]
-    fn scheduler_does_not_starve_slower_eligible_path() {
-        let mut sched = Scheduler::new();
-        sched.set_eligible(PathKind::Wired, true);
-        sched.set_eligible(PathKind::Wifi, true);
-        sched.note_rtt(PathKind::Wired, Duration::from_millis(1));
-        sched.note_rtt(PathKind::Wifi, Duration::from_millis(10));
+    fn scheduler_returns_none_with_zero_paths() {
+        assert_eq!(Scheduler::new().pick(), None);
+    }
 
-        let mut wired = 0;
-        let mut wifi = 0;
+    #[test]
+    fn scheduler_always_selects_the_only_eligible_path() {
+        let mut scheduler = Scheduler::new();
+        scheduler.insert(path(7));
+        scheduler.set_eligible(path(7), true);
+
         for _ in 0..100 {
-            match sched.pick().unwrap() {
-                PathKind::Wired => wired += 1,
-                PathKind::Wifi => wifi += 1,
-            }
+            assert_eq!(scheduler.pick(), Some(path(7)));
         }
-
-        assert!(wired > wifi, "faster path should receive the larger share");
-        assert!(
-            wifi > 0,
-            "every eligible uncongested path must carry traffic"
-        );
     }
 
     #[test]
-    fn scheduler_weights_by_quic_cwnd_over_rtt() {
-        let mut sched = Scheduler::new();
-        sched.set_eligible(PathKind::Wired, true);
-        sched.set_eligible(PathKind::Wifi, true);
-        sched.note_path_stats(PathKind::Wired, Duration::from_millis(1), 64 * 1024);
-        sched.note_path_stats(PathKind::Wifi, Duration::from_millis(2), 64 * 1024);
+    fn scheduler_weights_two_paths_by_quic_cwnd_over_rtt() {
+        let mut scheduler = Scheduler::new();
+        scheduler.insert(path(1));
+        scheduler.insert(path(2));
+        scheduler.set_eligible(path(1), true);
+        scheduler.set_eligible(path(2), true);
+        scheduler.note_path_stats(path(1), Duration::from_millis(1), 64 * 1024);
+        scheduler.note_path_stats(path(2), Duration::from_millis(2), 64 * 1024);
 
-        let mut wired = 0;
-        let mut wifi = 0;
+        let mut counts = [0; 2];
         for _ in 0..300 {
-            match sched.pick().unwrap() {
-                PathKind::Wired => wired += 1,
-                PathKind::Wifi => wifi += 1,
-            }
+            counts[usize::from(scheduler.pick().unwrap().get() - 1)] += 1;
         }
 
-        assert_eq!((wired, wifi), (200, 100));
+        assert_eq!(counts, [200, 100]);
+    }
+
+    #[test]
+    fn scheduler_selects_three_registered_paths() {
+        let mut scheduler = Scheduler::new();
+        for id in 1..=3 {
+            scheduler.insert(path(id));
+            scheduler.set_eligible(path(id), true);
+            scheduler.note_path_stats(path(id), Duration::from_millis(1), 64 * 1024);
+        }
+
+        let mut counts = [0; 3];
+        for _ in 0..300 {
+            counts[usize::from(scheduler.pick().unwrap().get() - 1)] += 1;
+        }
+
+        assert_eq!(counts, [100, 100, 100]);
+    }
+
+    #[test]
+    fn scheduler_removal_discards_path_state_without_disturbing_survivors() {
+        let mut scheduler = Scheduler::new();
+        for id in 1..=3 {
+            scheduler.insert(path(id));
+            scheduler.set_eligible(path(id), true);
+        }
+        assert!(scheduler.remove(path(2)));
+        assert!(!scheduler.remove(path(2)));
+
+        for _ in 0..100 {
+            assert_ne!(scheduler.pick(), Some(path(2)));
+        }
+        assert_eq!(scheduler.len(), 2);
+    }
+
+    #[test]
+    fn scheduler_rejects_duplicate_registration() {
+        let mut scheduler = Scheduler::new();
+        assert!(scheduler.insert(path(1)));
+        assert!(!scheduler.insert(path(1)));
+        assert_eq!(scheduler.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_skips_ineligible_paths() {
+        let mut scheduler = Scheduler::new();
+        scheduler.insert(path(1));
+        scheduler.insert(path(2));
+        scheduler.set_eligible(path(1), false);
+        scheduler.set_eligible(path(2), true);
+
+        assert_eq!(scheduler.pick(), Some(path(2)));
     }
 
     #[test]
     fn scheduler_preserves_exploration_share_for_low_cwnd_path() {
-        let mut sched = Scheduler::new();
-        sched.set_eligible(PathKind::Wired, true);
-        sched.set_eligible(PathKind::Wifi, true);
-        sched.note_path_stats(PathKind::Wired, Duration::from_millis(1), 4 * 1024 * 1024);
-        sched.note_path_stats(PathKind::Wifi, Duration::from_millis(2), 16 * 1024);
+        let mut scheduler = Scheduler::new();
+        scheduler.insert(path(1));
+        scheduler.insert(path(2));
+        scheduler.set_eligible(path(1), true);
+        scheduler.set_eligible(path(2), true);
+        scheduler.note_path_stats(path(1), Duration::from_millis(1), 4 * 1024 * 1024);
+        scheduler.note_path_stats(path(2), Duration::from_millis(2), 16 * 1024);
 
-        let mut wifi = 0;
+        let mut slow = 0;
         for _ in 0..1_000 {
-            if sched.pick() == Some(PathKind::Wifi) {
-                wifi += 1;
+            if scheduler.pick() == Some(path(2)) {
+                slow += 1;
             }
         }
 
-        assert!(
-            wifi >= 50,
-            "an eligible path needs at least a 5% exploration share to grow its congestion window"
-        );
-    }
-    #[test]
-    fn scheduler_skips_ineligible_path() {
-        let mut sched = Scheduler::new();
-        sched.set_eligible(PathKind::Wired, false);
-        sched.set_eligible(PathKind::Wifi, true);
-        sched.note_rtt(PathKind::Wired, Duration::from_millis(1));
-        sched.note_rtt(PathKind::Wifi, Duration::from_millis(10));
-
-        assert_eq!(sched.pick(), Some(PathKind::Wifi));
-    }
-
-    #[test]
-    fn scheduler_returns_none_when_no_paths() {
-        let mut sched = Scheduler::new();
-        assert_eq!(sched.pick(), None);
-    }
-
-    #[test]
-    fn scheduler_prefers_unmeasured_over_slow() {
-        let mut sched = Scheduler::new();
-        sched.set_eligible(PathKind::Wired, true);
-        sched.set_eligible(PathKind::Wifi, true);
-        // Wired unmeasured (defaults to 1ms), wifi slow
-        sched.note_rtt(PathKind::Wifi, Duration::from_millis(50));
-
-        assert_eq!(sched.pick(), Some(PathKind::Wired));
+        assert!(slow >= 50);
     }
 
     #[test]
     fn scheduler_penalizes_congested_path() {
-        let mut sched = Scheduler::new();
-        sched.set_eligible(PathKind::Wired, true);
-        sched.set_eligible(PathKind::Wifi, true);
-        // Equal RTT, but wired is nearly out of send buffer
-        sched.note_rtt(PathKind::Wired, Duration::from_millis(2));
-        sched.note_rtt(PathKind::Wifi, Duration::from_millis(2));
-        sched.note_queue_space(PathKind::Wired, 32 * 1024); // below LOW threshold
-        sched.note_queue_space(PathKind::Wifi, 1024 * 1024);
+        let mut scheduler = Scheduler::new();
+        scheduler.insert(path(1));
+        scheduler.insert(path(2));
+        scheduler.set_eligible(path(1), true);
+        scheduler.set_eligible(path(2), true);
+        scheduler.note_rtt(path(1), Duration::from_millis(2));
+        scheduler.note_rtt(path(2), Duration::from_millis(2));
+        scheduler.note_queue_space(path(1), 32 * 1024);
+        scheduler.note_queue_space(path(2), 1024 * 1024);
 
-        assert_eq!(sched.pick(), Some(PathKind::Wifi));
+        assert_eq!(scheduler.pick(), Some(path(2)));
     }
 }
