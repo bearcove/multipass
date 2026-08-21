@@ -28,6 +28,40 @@ impl PathId {
         self.0
     }
 }
+/// Stable authenticated VPN client identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClientId(Box<str>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidClientId;
+
+impl ClientId {
+    pub const MAX_LEN: usize = 63;
+
+    pub fn new(value: impl AsRef<str>) -> Result<Self, InvalidClientId> {
+        let value = value.as_ref();
+        if value.is_empty()
+            || value.len() > Self::MAX_LEN
+            || !value.is_ascii()
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(InvalidClientId);
+        }
+        Ok(Self(value.into()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ClientId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Stable configuration identity for one logical uplink.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -64,8 +98,8 @@ impl std::fmt::Display for UplinkId {
     }
 }
 
-/// ALPN for wire protocol version 3. Version 3 carries explicit uplink identity.
-pub const ALPN: &[u8] = b"multipass/3";
+/// ALPN for wire protocol version 4. Version 4 binds Hello to a client identity.
+pub const ALPN: &[u8] = b"multipass/4";
 
 /// Well-known tunnel subnet layout. Server is .1, first client is .2.
 pub const TUNNEL_SERVER: Ipv4Addr = Ipv4Addr::new(10, 10, 99, 1);
@@ -124,6 +158,7 @@ pub enum Frame {
         packet: Bytes,
     },
     Hello {
+        client_id: ClientId,
         client_epoch: u64,
         uplink_id: UplinkId,
         path_id: PathId,
@@ -159,17 +194,22 @@ pub fn encode(frame: &Frame) -> Bytes {
             out.extend_from_slice(packet);
         }
         Frame::Hello {
+            client_id,
             client_epoch,
             uplink_id,
             path_id,
             connection_generation,
         } => {
-            out.reserve(1 + 8 + 2 + 8 + 1 + uplink_id.as_str().len());
+            out.reserve(
+                1 + 8 + 2 + 8 + 1 + 1 + client_id.as_str().len() + uplink_id.as_str().len(),
+            );
             out.put_u8(Tag::Hello as u8);
             out.put_u64(*client_epoch);
             out.put_u16(path_id.get());
             out.put_u64(*connection_generation);
+            out.put_u8(u8::try_from(client_id.as_str().len()).expect("validated client ID length"));
             out.put_u8(u8::try_from(uplink_id.as_str().len()).expect("validated uplink ID length"));
+            out.extend_from_slice(client_id.as_str().as_bytes());
             out.extend_from_slice(uplink_id.as_str().as_bytes());
         }
         Frame::Assign {
@@ -256,18 +296,22 @@ pub fn decode(mut buf: &[u8]) -> Option<Frame> {
             Some(Frame::Data { seq, packet })
         }
         Tag::Hello => {
-            if buf.remaining() < 8 + 2 + 8 + 1 {
+            if buf.remaining() < 8 + 2 + 8 + 1 + 1 {
                 return None;
             }
             let client_epoch = buf.get_u64();
             let path_id = PathId::new(buf.get_u16());
             let connection_generation = buf.get_u64();
+            let client_len = usize::from(buf.get_u8());
             let uplink_len = usize::from(buf.get_u8());
-            if buf.remaining() != uplink_len {
+            if buf.remaining() != client_len + uplink_len {
                 return None;
             }
+            let client_id = ClientId::new(std::str::from_utf8(&buf[..client_len]).ok()?).ok()?;
+            buf.advance(client_len);
             let uplink_id = UplinkId::new(std::str::from_utf8(buf).ok()?).ok()?;
             Some(Frame::Hello {
+                client_id,
                 client_epoch,
                 uplink_id,
                 path_id,
@@ -634,8 +678,8 @@ mod tests {
     }
 
     #[test]
-    fn alpn_identifies_dynamic_uplink_contract() {
-        assert_eq!(ALPN, b"multipass/3");
+    fn alpn_identifies_authenticated_client_contract() {
+        assert_eq!(ALPN, b"multipass/4");
     }
 
     #[test]
@@ -659,6 +703,7 @@ mod tests {
     fn control_roundtrip() {
         for f in [
             Frame::Hello {
+                client_id: ClientId::new("scooter").unwrap(),
                 client_epoch: 0xdeadbeef,
                 uplink_id: UplinkId::new("wifi").unwrap(),
                 path_id: PathId::new(7),
@@ -681,8 +726,9 @@ mod tests {
     }
 
     #[test]
-    fn hello_roundtrip_preserves_dynamic_uplink_identity() {
+    fn hello_roundtrip_preserves_authenticated_client_and_uplink_identity() {
         let frame = Frame::Hello {
+            client_id: ClientId::new("scooter").unwrap(),
             client_epoch: 42,
             uplink_id: UplinkId::new("wifi").unwrap(),
             path_id: PathId::new(7),
@@ -700,15 +746,23 @@ mod tests {
     }
 
     #[test]
+    fn client_id_rejects_empty_oversized_and_control_characters() {
+        assert!(ClientId::new("").is_err());
+        assert!(ClientId::new("x".repeat(ClientId::MAX_LEN + 1)).is_err());
+        assert!(ClientId::new("scooter\nspoof").is_err());
+    }
+
+    #[test]
     fn hello_decode_rejects_invalid_uplink_id_bytes() {
         let mut encoded = encode(&Frame::Hello {
+            client_id: ClientId::new("scooter").unwrap(),
             client_epoch: 42,
             uplink_id: UplinkId::new("wifi").unwrap(),
             path_id: PathId::new(7),
             connection_generation: 3,
         })
         .to_vec();
-        let uplink_start = 1 + 8 + 2 + 8 + 1;
+        let uplink_start = 1 + 8 + 2 + 8 + 1 + 1 + "scooter".len();
         encoded[uplink_start] = b'\n';
 
         assert!(decode(&encoded).is_none());

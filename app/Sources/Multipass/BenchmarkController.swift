@@ -440,7 +440,7 @@ final class BenchmarkController {
             try await tunnel.acquireBenchmarkOwnership(owner)
             try checkCancellation()
             let initialStatus = try await tunnel.observedStatus()
-            initiallyConnected = initialStatus.connected
+            initiallyConnected = initialStatus.enabled
 
             state = .loadingTopology
             let reply = try await daemon.request(.benchmarkTopology)
@@ -457,12 +457,13 @@ final class BenchmarkController {
             lastError = nil
             runningTopology = loadedTopology
             addUnavailableTunnelResults(topology: loadedTopology, to: &results)
+            addUnavailablePhysicalResults(topology: loadedTopology, to: &results)
             measurements = results
 
             if !tunnelInvocations.isEmpty {
                 do {
                     try checkCancellation()
-                    if !initialStatus.connected {
+                    if !initialStatus.enabled {
                         state = .connecting
                         try await tunnel.setConnected(true, owner: .benchmark(owner))
                         try checkCancellation()
@@ -472,8 +473,12 @@ final class BenchmarkController {
                         let refreshedPlan = try BenchmarkPlanner.plan(topology: refreshed, parameters: parameters)
                         tunnelInvocations = refreshedPlan.invocations.filter { $0.id.route == .tunnel }
                         rawInvocations = refreshedPlan.invocations.filter { $0.id.route != .tunnel }
-                        results = results.filter { $0.key.route != .tunnel }
+                        results = results.filter {
+                            $0.key.route != .tunnel
+                                && !Self.isPhysicalRoute($0.key.route)
+                        }
                         addUnavailableTunnelResults(topology: refreshed, to: &results)
+                        addUnavailablePhysicalResults(topology: refreshed, to: &results)
                         measurements = results
                         plannedMeasurementIDs = tunnelInvocations.map(\.id) + rawInvocations.map(\.id)
                     }
@@ -504,7 +509,7 @@ final class BenchmarkController {
             if !rawInvocations.isEmpty {
                 try checkCancellation()
                 let currentStatus = try await tunnel.observedStatus()
-                if currentStatus.connected {
+                if currentStatus.enabled {
                     state = .restoring
                     try await tunnel.setConnected(false, owner: .benchmark(owner))
                     try checkCancellation()
@@ -592,10 +597,10 @@ final class BenchmarkController {
                 throw BenchmarkControllerError.missingInvocation(id)
             }
             let initialStatus = try await tunnel.observedStatus()
-            initiallyConnected = initialStatus.connected
+            initiallyConnected = initialStatus.enabled
 
             if invocation.id.route == .tunnel {
-                if !initialStatus.connected {
+                if !initialStatus.enabled {
                     state = .connecting
                 }
                 try await tunnel.setConnected(true, owner: .benchmark(owner))
@@ -691,6 +696,11 @@ final class BenchmarkController {
         return refreshed
     }
 
+    private nonisolated static func isPhysicalRoute(_ route: BenchmarkRoute) -> Bool {
+        if case .physical = route { return true }
+        return false
+    }
+
     private nonisolated static func matchesPlanningTopology(
         _ refreshed: BenchmarkTopology,
         _ captured: BenchmarkTopology
@@ -699,8 +709,11 @@ final class BenchmarkController {
             && refreshed.daemonVersion == captured.daemonVersion
             && refreshed.underlayTarget == captured.underlayTarget
             && refreshed.listenerBasePort == captured.listenerBasePort
-            && refreshed.listenerCount == captured.listenerCount
-            && refreshed.paths == captured.paths
+            && refreshed.paths.elementsEqual(captured.paths) { refreshedPath, capturedPath in
+                refreshedPath.id == capturedPath.id
+                    && refreshedPath.displayName == capturedPath.displayName
+                    && refreshedPath.interface == capturedPath.interface
+            }
     }
 
     private func runMeasurement(_ invocation: BenchmarkInvocation) async -> BenchmarkResult {
@@ -718,6 +731,22 @@ final class BenchmarkController {
                 return .failed(CancellationError().localizedDescription)
             }
             return .failed(error.localizedDescription)
+        }
+    }
+
+    private func addUnavailablePhysicalResults(
+        topology: BenchmarkTopology,
+        to results: inout [BenchmarkTestID: BenchmarkResult]
+    ) {
+        for path in topology.paths where path.sourceAddress == nil {
+            for direction in [BenchmarkDirection.upload, .download] {
+                let id = BenchmarkTestID(
+                    route: .physical(pathID: path.id),
+                    direction: direction,
+                    addressFamily: .ipv4
+                )
+                results[id] = .skipped("physical source address unavailable")
+            }
         }
     }
 

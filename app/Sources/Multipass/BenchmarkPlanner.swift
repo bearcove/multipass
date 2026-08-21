@@ -9,9 +9,13 @@ nonisolated enum BenchmarkPlanner {
             throw BenchmarkPlanningError.noncanonicalParameters
         }
         try validate(topology)
+        let availablePaths = topology.paths.compactMap { path -> (BenchmarkPath, String)? in
+            guard let sourceAddress = path.sourceAddress else { return nil }
+            return (path, sourceAddress)
+        }
 
         var invocations: [BenchmarkInvocation] = []
-        invocations.reserveCapacity(topology.paths.count * 2 + 6)
+        invocations.reserveCapacity(availablePaths.count * 2 + 6)
         if let target = topology.tunnelIPv4Target {
             appendTunnelInvocations(
                 to: &invocations,
@@ -29,7 +33,7 @@ nonisolated enum BenchmarkPlanner {
             )
         }
 
-        for path in topology.paths {
+        for (path, sourceAddress) in availablePaths {
             for direction in [BenchmarkDirection.upload, .download] {
                 invocations.append(.single(
                     id: BenchmarkTestID(
@@ -39,35 +43,38 @@ nonisolated enum BenchmarkPlanner {
                     ),
                     target: topology.underlayTarget,
                     port: topology.listenerBasePort,
-                    sourceAddress: path.sourceAddress,
+                    sourceAddress: sourceAddress,
                     interface: path.interface
                 ))
             }
         }
 
-        for direction in [BenchmarkDirection.upload, .download] {
-            let members = topology.paths.enumerated().map { index, path in
-                BenchmarkInvocation.single(
+        if !availablePaths.isEmpty {
+            for direction in [BenchmarkDirection.upload, .download] {
+                let members = availablePaths.enumerated().map { index, available in
+                    let (path, sourceAddress) = available
+                    return BenchmarkInvocation.single(
+                        id: BenchmarkTestID(
+                            route: .physical(pathID: path.id),
+                            direction: direction,
+                            addressFamily: .ipv4,
+                            execution: .simultaneousMember(pathID: path.id)
+                        ),
+                        target: topology.underlayTarget,
+                        port: topology.listenerBasePort + UInt16(index),
+                        sourceAddress: sourceAddress,
+                        interface: path.interface
+                    )
+                }
+                invocations.append(.aggregate(
                     id: BenchmarkTestID(
-                        route: .physical(pathID: path.id),
+                        route: .physicalAggregate,
                         direction: direction,
-                        addressFamily: .ipv4,
-                        execution: .simultaneousMember(pathID: path.id)
+                        addressFamily: .ipv4
                     ),
-                    target: topology.underlayTarget,
-                    port: topology.listenerBasePort + UInt16(index),
-                    sourceAddress: path.sourceAddress,
-                    interface: path.interface
-                )
+                    members: members
+                ))
             }
-            invocations.append(.aggregate(
-                id: BenchmarkTestID(
-                    route: .physicalAggregate,
-                    direction: direction,
-                    addressFamily: .ipv4
-                ),
-                members: members
-            ))
         }
 
 
@@ -75,7 +82,7 @@ nonisolated enum BenchmarkPlanner {
     }
 
     private static func validate(_ topology: BenchmarkTopology) throws {
-        guard !topology.paths.isEmpty else {
+        guard !topology.paths.isEmpty || topology.tunnelIPv4Target != nil || topology.tunnelIPv6Target != nil else {
             throw BenchmarkPlanningError.emptyPaths
         }
         guard isAddress(topology.underlayTarget, family: .ipv4) else {
@@ -106,10 +113,11 @@ nonisolated enum BenchmarkPlanner {
             guard pathIDs.insert(path.id).inserted else {
                 throw BenchmarkPlanningError.duplicatePathID(path.id)
             }
-            guard isAddress(path.sourceAddress, family: .ipv4) else {
+            if let sourceAddress = path.sourceAddress,
+               !isAddress(sourceAddress, family: .ipv4) {
                 throw BenchmarkPlanningError.invalidSourceAddress(
                     pathID: path.id,
-                    value: path.sourceAddress
+                    value: sourceAddress
                 )
             }
         }
@@ -122,9 +130,10 @@ nonisolated enum BenchmarkPlanner {
             )
         }
 
-        guard Int(topology.listenerCount) >= topology.paths.count else {
+        let availablePathCount = topology.paths.lazy.filter { $0.sourceAddress != nil }.count
+        guard Int(topology.listenerCount) >= availablePathCount else {
             throw BenchmarkPlanningError.insufficientListeners(
-                required: topology.paths.count,
+                required: availablePathCount,
                 available: Int(topology.listenerCount)
             )
         }

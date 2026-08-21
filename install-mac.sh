@@ -1,90 +1,187 @@
 #!/bin/bash
-# multipass — macOS client install. Run with:  sudo ./install-mac.sh
+# multipass — macOS client install.
 #
-# What this does as root, and why:
-#   1. Copies the multipassd daemon to /usr/local/libexec/multipassd
-#      (needs root to create the utun device + manage routes at runtime).
-#   2. Installs a LaunchDaemon so multipassd starts at boot and restarts on
-#      crash. This is the ONLY always-on root component.
-#   3. Copies the Multipass menubar app to /Applications (plain user app).
+# Non-mutating oracle:
+#   ./install-mac.sh --plan
 #
-# It does NOT: touch DNS, install a NetworkExtension, add login items behind
-# your back, or phone anywhere. The daemon only talks to your router over two
-# QUIC connections (wired + wifi). Read the daemon source in
-# crates/multipass/src/bin/multipassd/ before you run this if you like.
+# Real install:
+#   sudo ./install-mac.sh
 #
-# Auto-detects your wired + wifi IPv4 addresses and the default gateway
-# (assumed to be the router running multipass-server). Override via env:
-#   MULTIPASS_SERVER=10.10.10.1:51823 MULTIPASS_WIRED_IF=en17 MULTIPASS_WIFI_IF=en0 sudo ./install-mac.sh
+# The installer never discovers addresses or requires a live uplink. The daemon
+# resolves configured interfaces and races configured gateway endpoints at
+# runtime. Existing operator configuration and identity are preserved.
 
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DAEMON_BIN="$REPO/target/release/multipassd"
-APP_BIN="$REPO/app/.build/release/Multipass"
-SOURCE_APP_PLIST="$REPO/app/Sources/Multipass/Info.plist"
+DAEMON_SOURCE="$REPO/target/release/multipassd"
+APP_SOURCE="$REPO/app/.build/release/Multipass"
+APP_INFO_SOURCE="$REPO/app/Sources/Multipass/Info.plist"
+
 LABEL="eu.bearcove.multipassd"
-PLIST="/Library/LaunchDaemons/$LABEL.plist"
-LIBEXEC="/usr/local/libexec"
+DAEMON_DEST="/usr/local/libexec/multipassd"
+APP_DEST="/Applications/Multipass.app"
+PLIST_DEST="/Library/LaunchDaemons/$LABEL.plist"
+CONFIG_DIR="/Library/Application Support/Multipass"
+CONFIG_DEST="$CONFIG_DIR/config.json"
+KEY_DIR="/var/db/multipass"
+KEY_DEST="$KEY_DIR/client.key"
+IPC_SOCKET="/var/run/multipassd.sock"
+LOG_PATH="/var/log/multipassd.log"
+
+# Documentation-only initial values. Operators replace these in the root-owned
+# config before connecting. Reinstall never overwrites an existing config.
+DEFAULT_GATEWAY_ID="jax"
+DEFAULT_SERVER_PUBLIC_KEY="ed25519:ERERERERERERERERERERERERERERERERERERERERERE"
+DEFAULT_LAN_ENDPOINT="192.0.2.1:51823"
+DEFAULT_PUBLIC_IPV4_ENDPOINT="198.51.100.23:51823"
+DEFAULT_PUBLIC_IPV6_ENDPOINT="[2001:db8:1088:1c17::1]:51823"
+DEFAULT_CLIENT_ID="scooter"
+
+usage() {
+    cat <<EOF
+usage: $0 [--plan]
+
+  --plan  Print and validate the source-owned installation contract without
+          requiring root, built artifacts, network interfaces, or live uplinks.
+  no arg  Install built artifacts and create missing persistent state as root.
+
+Existing $CONFIG_DEST and $KEY_DEST are always preserved.
+EOF
+}
+
+MODE="install"
+case "${1:-}" in
+    "") ;;
+    --plan|--validate) MODE="plan" ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+esac
+[ "$#" -le 1 ] || { usage >&2; exit 2; }
+
+print_plan() {
+    cat <<EOF
+multipass macOS installation plan (non-mutating):
+  daemon source      : $DAEMON_SOURCE
+  daemon destination : $DAEMON_DEST (root:wheel 0755)
+  app source         : $APP_SOURCE
+  app destination    : $APP_DEST
+  config              : $CONFIG_DEST (root:wheel 0600)
+  client private key : $KEY_DEST (root:wheel 0600)
+  LaunchDaemon plist : $PLIST_DEST (root:wheel 0644)
+  launch arguments   : $DAEMON_DEST --config $CONFIG_DEST
+  IPC socket         : $IPC_SOCKET (from config, created by daemon)
+  daemon log         : $LOG_PATH
+  identity policy    : create the client key only when absent; never print or overwrite it
+  config policy      : create a documentation-default config only when absent; preserve operator endpoints, uplinks, pinned server key, and client identity on reinstall
+  uplink policy      : zero currently usable uplinks is accepted; enabled VPN intent waits for configured interfaces and races LAN/public endpoints when they appear
+  uninstall policy   : binaries, app, plist, and runtime socket are removed; config and client identity are preserved unless explicitly purged
+EOF
+}
+
+if [ "$MODE" = "plan" ]; then
+    print_plan
+    exit 0
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "run with sudo:  sudo $0" >&2
     exit 1
 fi
 
-# --- locate binaries ---
-[ -x "$DAEMON_BIN" ] || { echo "missing $DAEMON_BIN — run: cargo build --release -p multipass --bin multipassd" >&2; exit 1; }
-[ -x "$APP_BIN" ] || { echo "missing $APP_BIN — run: (cd app && swift build -c release)" >&2; exit 1; }
-[ -f "$SOURCE_APP_PLIST" ] || { echo "missing $SOURCE_APP_PLIST" >&2; exit 1; }
+[ -x "$DAEMON_SOURCE" ] || { echo "missing $DAEMON_SOURCE — run: cargo build --release -p multipass --bin multipassd" >&2; exit 1; }
+[ -x "$APP_SOURCE" ] || { echo "missing $APP_SOURCE — run: (cd app && swift build -c release)" >&2; exit 1; }
+[ -f "$APP_INFO_SOURCE" ] || { echo "missing $APP_INFO_SOURCE" >&2; exit 1; }
+command -v openssl >/dev/null 2>&1 || { echo "missing openssl; cannot create Ed25519 client identity" >&2; exit 1; }
 
-# --- figure out wired + wifi interfaces and their IPs ---
-WIFI_IF="${MULTIPASS_WIFI_IF:-en0}"
-WIRED_IF="${MULTIPASS_WIRED_IF:-}"
+atomic_install_file() {
+    local source="$1"
+    local destination="$2"
+    local mode="$3"
+    local directory temporary
+    directory="$(dirname "$destination")"
+    mkdir -p "$directory"
+    temporary="$(mktemp "$directory/.multipass-install.XXXXXX")"
+    install -m "$mode" -o root -g wheel "$source" "$temporary"
+    if ! mv -f "$temporary" "$destination"; then
+        rm -f "$temporary"
+        return 1
+    fi
+}
 
-ip_of() { ipconfig getifaddr "$1" 2>/dev/null || true; }
+atomic_write_stdin() {
+    local destination="$1"
+    local mode="$2"
+    local directory temporary
+    directory="$(dirname "$destination")"
+    mkdir -p "$directory"
+    temporary="$(mktemp "$directory/.multipass-install.XXXXXX")"
+    cat > "$temporary"
+    chmod "$mode" "$temporary"
+    chown root:wheel "$temporary"
+    if ! mv -f "$temporary" "$destination"; then
+        rm -f "$temporary"
+        return 1
+    fi
+}
 
-WIFI_IP="$(ip_of "$WIFI_IF")"
-if [ -z "$WIRED_IF" ]; then
-    # first active non-wifi interface with an IPv4 address
-    for i in $(ifconfig -l); do
-        [ "$i" = "$WIFI_IF" ] && continue
-        case "$i" in en*) ;; *) continue;; esac
-        a="$(ip_of "$i")"
-        if [ -n "$a" ]; then WIRED_IF="$i"; WIRED_IP="$a"; break; fi
-    done
+mkdir -p "$KEY_DIR" "$CONFIG_DIR"
+chmod 700 "$KEY_DIR"
+chmod 755 "$CONFIG_DIR"
+chown root:wheel "$KEY_DIR" "$CONFIG_DIR"
+
+if [ -e "$KEY_DEST" ]; then
+    [ -f "$KEY_DEST" ] && [ ! -L "$KEY_DEST" ] || { echo "refusing unsafe existing client key path: $KEY_DEST" >&2; exit 1; }
+    chmod 600 "$KEY_DEST"
+    chown root:wheel "$KEY_DEST"
+    echo "preserving existing client identity at $KEY_DEST"
 else
-    WIRED_IP="$(ip_of "$WIRED_IF")"
+    KEY_TEMP="$(mktemp "$KEY_DIR/.client-key.XXXXXX")"
+    trap 'rm -f "${KEY_TEMP:-}" "${APP_INFO_TEMP:-}" "${PLIST_TEMP:-}"' EXIT
+    chmod 600 "$KEY_TEMP"
+    chown root:wheel "$KEY_TEMP"
+    openssl genpkey -algorithm ED25519 -outform DER -out "$KEY_TEMP"
+    if ! mv "$KEY_TEMP" "$KEY_DEST"; then
+        rm -f "$KEY_TEMP"
+        exit 1
+    fi
+    KEY_TEMP=""
+    echo "created client identity at $KEY_DEST (private material not displayed)"
 fi
 
-# --- server: default gateway (the router) ---
-GW="$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')"
-SERVER="${MULTIPASS_SERVER:-$GW:51823}"
-
-echo "multipass install plan:"
-echo "  wired iface : ${WIRED_IF:-<none>}  ip=${WIRED_IP:-<none>}"
-echo "  wifi  iface : $WIFI_IF  ip=${WIFI_IP:-<none>}"
-echo "  server      : $SERVER"
-echo "  daemon      : $LIBEXEC/multipassd (LaunchDaemon $LABEL)"
-echo "  app         : /Applications/Multipass.app"
-echo
-
-if [ -z "${WIRED_IP:-}" ] || [ -z "${WIFI_IP:-}" ]; then
-    echo "ERROR: need both a wired and a wifi IPv4 address up right now." >&2
-    echo "  (wired=${WIRED_IF:-?}/${WIRED_IP:-none}  wifi=$WIFI_IF/${WIFI_IP:-none})" >&2
-    echo "  plug in Ethernet / join Wi-Fi, or set MULTIPASS_WIRED_IF / MULTIPASS_WIFI_IF." >&2
-    exit 1
+if [ -e "$CONFIG_DEST" ]; then
+    [ -f "$CONFIG_DEST" ] && [ ! -L "$CONFIG_DEST" ] || { echo "refusing unsafe existing config path: $CONFIG_DEST" >&2; exit 1; }
+    chmod 600 "$CONFIG_DEST"
+    chown root:wheel "$CONFIG_DEST"
+    echo "preserving existing operator config at $CONFIG_DEST"
+else
+    atomic_write_stdin "$CONFIG_DEST" 600 <<EOF
+{
+  "gateway": {
+    "id": "$DEFAULT_GATEWAY_ID",
+    "server_public_key": "$DEFAULT_SERVER_PUBLIC_KEY",
+    "endpoints": [
+      { "address": "$DEFAULT_LAN_ENDPOINT", "display_name": "Home LAN" },
+      { "address": "$DEFAULT_PUBLIC_IPV4_ENDPOINT", "display_name": "Public IPv4" },
+      { "address": "$DEFAULT_PUBLIC_IPV6_ENDPOINT", "display_name": "Public IPv6" }
+    ]
+  },
+  "client": {
+    "id": "$DEFAULT_CLIENT_ID",
+    "private_key_file": "$KEY_DEST"
+  },
+  "uplinks": [],
+  "ipc_socket": "$IPC_SOCKET"
+}
+EOF
+    echo "created $CONFIG_DEST with zero uplinks and documentation endpoints"
+    echo "edit the root-owned config with the deployment's pinned server key, endpoints, and uplinks before connecting"
 fi
-if [ -z "$GW" ] && [ -z "${MULTIPASS_SERVER:-}" ]; then
-    echo "ERROR: no default gateway found and MULTIPASS_SERVER not set." >&2
-    exit 1
-fi
 
-# --- install daemon ---
-mkdir -p "$LIBEXEC"
-install -m 755 -o root -g wheel "$DAEMON_BIN" "$LIBEXEC/multipassd"
+atomic_install_file "$DAEMON_SOURCE" "$DAEMON_DEST" 755
 
-# --- LaunchDaemon plist ---
-cat > "$PLIST" <<PLIST
+PLIST_TEMP="$(mktemp "${TMPDIR:-/tmp}/multipass-launchd.XXXXXX.plist")"
+cat > "$PLIST_TEMP" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -92,37 +189,55 @@ cat > "$PLIST" <<PLIST
     <key>Label</key><string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$LIBEXEC/multipassd</string>
-        <string>$SERVER</string>
-        <string>$WIRED_IP</string>
-        <string>$WIFI_IP</string>
+        <string>$DAEMON_DEST</string>
+        <string>--config</string>
+        <string>$CONFIG_DEST</string>
     </array>
     <key>RunAtLoad</key><false/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/var/log/multipassd.log</string>
-    <key>StandardErrorPath</key><string>/var/log/multipassd.log</string>
+    <key>StandardOutPath</key><string>$LOG_PATH</string>
+    <key>StandardErrorPath</key><string>$LOG_PATH</string>
 </dict>
 </plist>
-PLIST
-chmod 644 "$PLIST"; chown root:wheel "$PLIST"
+EOF
+atomic_install_file "$PLIST_TEMP" "$PLIST_DEST" 644
+rm -f "$PLIST_TEMP"
+PLIST_TEMP=""
 
-# --- install app as a .app bundle ---
-APP_DIR="/Applications/Multipass.app/Contents"
-APP_PLIST="$(mktemp "${TMPDIR:-/tmp}/multipass-info.XXXXXX.plist")"
-trap 'rm -f "$APP_PLIST"' EXIT
-cp "$SOURCE_APP_PLIST" "$APP_PLIST"
+APP_INFO_TEMP="$(mktemp "${TMPDIR:-/tmp}/multipass-info.XXXXXX.plist")"
+cp "$APP_INFO_SOURCE" "$APP_INFO_TEMP"
 GIT_COMMIT="$(/usr/bin/git -C "$REPO" rev-parse HEAD)"
-/usr/libexec/PlistBuddy -c "Set :MultipassGitCommit $GIT_COMMIT" "$APP_PLIST"
-mkdir -p "$APP_DIR/MacOS" "$APP_DIR/Resources"
-install -m 755 "$APP_BIN" "$APP_DIR/MacOS/Multipass"
-install -m 644 "$APP_PLIST" "$APP_DIR/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :MultipassGitCommit $GIT_COMMIT" "$APP_INFO_TEMP"
+APP_STAGE="$(mktemp -d "/Applications/.Multipass.app.XXXXXX")"
+trap 'rm -f "${KEY_TEMP:-}" "${APP_INFO_TEMP:-}" "${PLIST_TEMP:-}"; rm -rf "${APP_STAGE:-}" "${APP_BACKUP:-}"' EXIT
+mkdir -p "$APP_STAGE/Contents/MacOS" "$APP_STAGE/Contents/Resources"
+install -m 755 -o root -g wheel "$APP_SOURCE" "$APP_STAGE/Contents/MacOS/Multipass"
+install -m 644 -o root -g wheel "$APP_INFO_TEMP" "$APP_STAGE/Contents/Info.plist"
+APP_BACKUP=""
+if [ -e "$APP_DEST" ]; then
+    APP_BACKUP="$(mktemp -d "/Applications/.Multipass.previous.XXXXXX")"
+    rmdir "$APP_BACKUP"
+    mv "$APP_DEST" "$APP_BACKUP"
+fi
+if ! mv "$APP_STAGE" "$APP_DEST"; then
+    [ -z "$APP_BACKUP" ] || mv "$APP_BACKUP" "$APP_DEST"
+    exit 1
+fi
+APP_STAGE=""
+if [ -n "$APP_BACKUP" ]; then
+    rm -rf "$APP_BACKUP"
+    APP_BACKUP=""
+fi
+rm -f "$APP_INFO_TEMP"
+APP_INFO_TEMP=""
 
-# --- load daemon (not started until you toggle connect in the app) ---
 launchctl bootout "system/$LABEL" 2>/dev/null || true
-launchctl bootstrap system "$PLIST"
+launchctl bootstrap system "$PLIST_DEST"
 launchctl enable "system/$LABEL"
 
 echo
-echo "installed. The daemon is loaded but the tunnel is OFF until you open"
-echo "Multipass and toggle Connect. Logs: /var/log/multipassd.log"
-echo "To uninstall: sudo $REPO/uninstall-mac.sh"
+echo "installed. The daemon is loaded but VPN intent remains OFF until you open"
+echo "Multipass and choose Connect. It is valid to remain enabled with zero ready uplinks."
+echo "Config: $CONFIG_DEST"
+echo "Logs: $LOG_PATH"
+echo "To uninstall while preserving config and identity: sudo $REPO/uninstall-mac.sh"

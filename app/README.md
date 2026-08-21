@@ -1,9 +1,9 @@
 # Multipass (menubar app)
 
-SwiftUI menubar app for multipass — the seamless eth⇄wifi failover VPN.
+SwiftUI menubar app for multipass — an N-uplink roaming VPN.
 macOS 27 only, SwiftPM executable, no sandbox, no root: the app is a thin UI
 over the privileged `multipassd` LaunchDaemon, which owns the utun device and
-the two noq QUIC connections.
+dynamic authenticated QUIC uplinks.
 
 ```
 swift build        # produces .build/debug/Multipass
@@ -14,8 +14,8 @@ swift build        # produces .build/debug/Multipass
 | File | Role |
 | --- | --- |
 | `MultipassApp.swift` | `@main` App, single `MenuBarExtra` (`.window` style). Menubar icon is a state-reflecting SF Symbol: filled multipath glyph when connected, outline when disconnected, `network.slash` when the daemon is unreachable, animated arrows during a failover flash. |
-| `MenuBarView.swift` | The panel: header with state, per-path rows (Wired / Wi-Fi, inline ↑ upload and ↓ download rates, green = live / red = down, ACTIVE badge on the current path), failover banner, aggregate RTT / sent / received / up / down rates, prominent Connect/Disconnect toggle (`d` shortcut), Launch-at-Login toggle, Quit (`q`). |
-| `TunnelController.swift` | `@Observable` model. Polls status once per second, serializes connect/disconnect commands, derives aggregate and per-path throughput rates from cumulative counters, and raises the failover flash when `active_path` changes while connected. |
+| `MenuBarView.swift` | The panel: persistent VPN intent and readiness, ordered dynamic uplink rows with runtime state, source/endpoint diagnostics, RTT and rates, ACTIVE badge, failover banner, aggregate counters/rates, prominent Connect/Disconnect toggle (`d` shortcut), benchmark controls, Launch-at-Login toggle, Quit (`q`). |
+| `TunnelController.swift` | MainActor `@Observable` model. Polls status once per second, serializes connect/disconnect commands by persistent `enabled` intent, preserves daemon uplink order, derives aggregate and per-ID throughput rates from cumulative counters, and raises the failover flash when `active_uplink_id` changes while connected. |
 | `DaemonClient.swift` | POSIX unix-socket client (actor). Lazy connect, one retry on a stale connection, 2s send/recv timeouts, `SO_NOSIGPIPE`. |
 | `DaemonProtocol.swift` | Codable encoding of the IPC schema below. |
 | `LaunchAtLogin.swift` | `SMAppService.mainApp` wrapper (same pattern as baratheon). |
@@ -38,8 +38,8 @@ connection, the client transparently reconnects and retries once.
 | JSON | Meaning |
 | --- | --- |
 | `{"cmd":"status"}` | Query tunnel status. Always answered, connected or not. |
-| `{"cmd":"connect"}` | Bring the tunnel up (dial both underlays, configure utun). |
-| `{"cmd":"disconnect"}` | Tear the tunnel down (remove routes, close connections). |
+| `{"cmd":"connect"}` | Persistently enable the VPN and begin bringing configured uplinks online. |
+| `{"cmd":"disconnect"}` | Disable the VPN and tear down the logical tunnel and uplink connections. |
 | `{"cmd":"benchmark_topology"}` | Query authoritative underlay paths, tunnel targets, and the reserved jax listener range. |
 
 Unknown `cmd` values MUST be answered with a `type:"error"` reply.
@@ -49,38 +49,57 @@ Unknown `cmd` values MUST be answered with a `type:"error"` reply.
 **Status** — the only reply to `{"cmd":"status"}`:
 
 ```json
-{"type":"status","connected":true,"wired":true,"wifi":true,"active_path":"wired","rtt_ms":12.4,"tx":123456,"rx":789012,"wired_tx":90000,"wired_rx":500000,"wifi_tx":33456,"wifi_rx":289012}
+{"type":"status","enabled":true,"connected":true,"active_uplink_id":"wifi","tx":123456,"rx":789012,"uplinks":[{"id":"desk-ethernet","display_name":"Desk Ethernet","interface":"en17","configured_enabled":true,"state":"waiting_for_address","ready":false,"source_address":null,"gateway_endpoint":null,"rtt_ms":null,"tx":0,"rx":0,"last_error":null},{"id":"wifi","display_name":"Wi-Fi","interface":"en0","configured_enabled":true,"state":"ready","ready":true,"source_address":"192.0.2.10","gateway_endpoint":"[2001:db8::10]:51823","rtt_ms":18.4,"tx":123456,"rx":789012,"last_error":null}]}
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `type` | `"status"` | Discriminator. |
-| `connected` | bool | Tunnel is up (utun configured, at least one QUIC connection live). |
-| `wired` | bool | Wired underlay path is currently live (its QUIC connection is up). |
-| `wifi` | bool | Wi-Fi underlay path is currently live. |
-| `active_path` | `"wired"` \| `"wifi"` \| null | The path currently winning seq dedup (delivering first copies). null when not connected. **The menubar failover flash triggers on changes to this field while `connected` stays true** — keep it stable per path and flip it only on a real delivery-path change, not per-packet jitter. |
-| `rtt_ms` | number \| null | Smoothed RTT of the active path in milliseconds. null when unknown/disconnected. |
-| `tx` | u64 | Cumulative tunnel payload bytes sent (into the tunnel) since the session started. MUST be monotonically non-decreasing across polls (the app derives rates from deltas); reset only on daemon restart / tunnel re-establishment. |
-| `rx` | u64 | Cumulative tunnel payload bytes received. Same monotonicity rule. |
-| `wired_tx` / `wired_rx` | u64 | Cumulative tunnel payload bytes transmitted/received through the wired QUIC path. The app derives the wired row's directional rates from consecutive samples. |
-| `wifi_tx` / `wifi_rx` | u64 | Equivalent cumulative counters for the Wi-Fi QUIC path. Retransmitted payload bytes count on the path that carries the retransmission; received bytes count before tunnel dedup so the rows describe physical-path traffic. |
+| `enabled` | bool | Persistent VPN intent. Connect converges when this becomes true even if no uplink is ready; Disconnect converges when it becomes false. |
+| `connected` | bool | At least one mutually authenticated uplink is ready and the logical tunnel is active. May remain false while `enabled` is true. |
+| `active_uplink_id` | string \| null | Stable ID of the most recent first-delivery uplink. null without a ready delivery path. A change while `connected` stays true triggers the menubar failover flash. |
+| `tx` | u64 | Cumulative logical-tunnel payload bytes sent for the current epoch. The app derives aggregate rate from consecutive samples and treats a decrease as a reset. |
+| `rx` | u64 | Cumulative logical-tunnel payload bytes received for the current epoch. Same rate/reset semantics. |
+| `uplinks` | array | Every configured uplink in configuration order. IDs are stable and unique. |
+
+Each `uplinks` element has exactly these fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | Stable uplink identity used for row identity, rate history, active selection, and failover. |
+| `display_name` | string | User-facing configured name. |
+| `interface` | string | Resolved interface name. |
+| `configured_enabled` | bool | Whether root-owned configuration allows this uplink to participate. |
+| `state` | string | Dynamic runtime state such as `disabled`, `waiting_for_address`, `racing_endpoints`, `authenticating`, `ready`, or an error state. |
+| `ready` | bool | This uplink has a mutually authenticated connection ready for tunnel traffic. |
+| `source_address` | string \| null | Selected source address, or null while unavailable. |
+| `gateway_endpoint` | string \| null | Selected gateway socket endpoint, or null before selection. |
+| `rtt_ms` | number \| null | Smoothed RTT for this uplink, or null when unknown. |
+| `tx` | u64 | Cumulative physical-path payload bytes sent, including retransmissions. |
+| `rx` | u64 | Cumulative physical-path payload bytes received before tunnel deduplication. |
+| `last_error` | string \| null | Concise routing/authentication/runtime error without secrets. |
+
+Per-uplink counters are logically monotonic across connection-generation
+replacement. The app derives rates independently by stable `id`, so a reset or
+new sample for one uplink never suppresses another uplink's rate.
 
 **Benchmark topology** — reply to `{"cmd":"benchmark_topology"}`:
 
 ```json
-{"type":"benchmark_topology","protocol_version":2,"daemon_version":"<multipassd commit>","server_version":"<authenticated multipass-server commit or unknown while disconnected>","underlay_target":"10.10.10.1","tunnel_ipv4_target":"10.10.99.1","tunnel_ipv6_target":"fd00:99::1","listener_base_port":5210,"listener_count":16,"paths":[{"id":"wired","display_name":"Wired","interface":"en17","source_address":"10.10.10.171"},{"id":"wifi","display_name":"Wi-Fi","interface":"en0","source_address":"10.10.10.169"}]}
+{"type":"benchmark_topology","protocol_version":2,"daemon_version":"<multipassd commit>","server_version":"<authenticated multipass-server commit or unknown while disconnected>","underlay_target":"10.10.10.1","tunnel_ipv4_target":"10.10.99.1","tunnel_ipv6_target":"fd00:99::1","listener_base_port":5210,"listener_count":16,"paths":[{"id":"desk-ethernet","display_name":"Desk Ethernet","interface":"en17","source_address":null},{"id":"wifi","display_name":"Wi-Fi","interface":"en0","source_address":"192.0.2.10"}]}
 ```
 
-`paths` is ordered and uses stable IDs; benchmark code MUST treat it as an
-array rather than fixed wired/Wi-Fi fields. `interface` and `source_address`
-are the exact values resolved by the daemon. Either tunnel target may be null
-when that family is unsupported. The half-open listener range is
+`paths` is ordered and uses stable IDs. `interface` is the configured/resolved
+interface and `source_address` is nullable. A configured path with null
+`source_address` remains in the ordered topology but is unavailable for a
+physical benchmark; tunnel benchmarks remain valid. Either tunnel target may
+be null when that family is unsupported. The half-open listener range is
 `listener_base_port ..< listener_base_port + listener_count`; simultaneous
-tests require at least one distinct listener per path. `protocol_version`
-versions this control contract independently from the QUIC wire protocol.
-`daemon_version` identifies the installed client daemon. `server_version`
-identifies the currently authenticated server learned through the live QUIC
-handshake and is `unknown` while disconnected.
+tests require at least one distinct listener per currently benchmarkable path.
+`protocol_version` versions this control contract independently from the QUIC
+wire protocol. `daemon_version` identifies the installed client daemon.
+`server_version` identifies the authenticated server learned through the live
+QUIC handshake and is `unknown` while disconnected.
 
 **OK** — reply to successful connect/disconnect:
 

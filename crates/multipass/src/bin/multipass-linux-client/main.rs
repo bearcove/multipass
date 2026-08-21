@@ -14,7 +14,7 @@ mod linux {
 
     use std::io;
     use std::mem;
-    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv6Addr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +26,9 @@ mod linux {
         SIOCSIFADDR, SIOCSIFFLAGS, SIOCSIFMTU, SIOCSIFNETMASK, SOCK_DGRAM, c_char, c_int, c_short,
         c_ulong, in_addr, sockaddr, sockaddr_in,
     };
-    use multipass::{PathKind, Transport};
+    use multipass::config::ClientConfigFile;
+    use multipass::identity::client_config;
+    use multipass::{ClientId, PathId, Transport, UplinkDial, transport_config};
     use multipass_proto::{Frame, TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX};
     use tokio::sync::mpsc;
     use tracing::{info, warn};
@@ -212,19 +214,31 @@ mod linux {
 
     async fn await_assign(
         transport: &Transport,
-        nonce: u64,
+        client_id: &ClientId,
+        client_epoch: u64,
     ) -> Result<Option<(Ipv6Addr, u8)>, String> {
-        for kind in PathKind::ALL {
+        for path_id in transport.path_ids() {
+            let status = transport
+                .path_status(path_id)
+                .ok_or_else(|| format!("registered path {} disappeared", path_id.get()))?;
             transport.send_frame_on(
-                kind,
+                path_id,
                 &Frame::Hello {
-                    client_nonce: nonce,
+                    client_id: client_id.clone(),
+                    client_epoch,
+                    uplink_id: status.uplink_id,
+                    path_id,
+                    connection_generation: 0,
                 },
             );
         }
         let mut ipv6 = None;
-        while PathKind::ALL.iter().any(|kind| !transport.is_ready(*kind)) {
-            let Some((path, frame)) = transport.recv_control().await else {
+        let mut assigned_server_version = None;
+        while transport
+            .path_ids()
+            .any(|path_id| !transport.is_ready(path_id))
+        {
+            let Some((path_id, frame)) = transport.recv_control().await else {
                 return Err("transport closed before assignment".into());
             };
             if let Frame::Assign {
@@ -238,11 +252,26 @@ mod linux {
                 if ipv4 != Some((TUNNEL_CLIENT, TUNNEL_PREFIX)) || mtu != TUNNEL_MTU {
                     return Err("server assignment does not match tunnel contract".into());
                 }
+                if let Some(assigned) = &assigned_server_version {
+                    if assigned != &server_version {
+                        return Err("paths reported different server build identities".into());
+                    }
+                } else {
+                    assigned_server_version = Some(server_version.clone());
+                }
                 if ipv6.is_none() {
                     ipv6 = assigned_ipv6;
                 }
-                transport.mark_ready(path);
-                info!(path = %path.label(), %server_version, "path assigned");
+                let status = transport.path_status(path_id).ok_or_else(|| {
+                    format!("assignment arrived on unknown path {}", path_id.get())
+                })?;
+                transport.mark_ready(path_id);
+                info!(
+                    path_id = path_id.get(),
+                    uplink = %status.uplink_id,
+                    %server_version,
+                    "path assigned"
+                );
             }
         }
         Ok(ipv6)
@@ -264,20 +293,45 @@ mod linux {
             .init();
 
         let args = std::env::args().collect::<Vec<_>>();
-        if args.len() != 5 {
+        if args.len() != 4 {
             return Err(format!(
-                "usage: {} <server:port> <path-a-source-ip> <path-b-source-ip> <client-nonce>",
+                "usage: {} <config.json> <source-ip> <client-epoch>",
                 args[0]
             )
             .into());
         }
-        let server = args[1].parse::<SocketAddr>()?;
-        let path_a = args[2].parse::<IpAddr>()?;
-        let path_b = args[3].parse::<IpAddr>()?;
-        let nonce = args[4].parse::<u64>()?;
-
-        let transport = Transport::connect(server, path_a, path_b).await?;
-        let ipv6 = await_assign(&transport, nonce)
+        let runtime = ClientConfigFile::load_validated_runtime(&args[1])?;
+        let config = &runtime.config;
+        let source = args[2].parse::<IpAddr>()?;
+        let client_epoch = args[3].parse::<u64>()?;
+        let server = config
+            .gateway
+            .endpoints
+            .first()
+            .ok_or_else(|| io::Error::other("validated config has no gateway endpoint"))?
+            .address;
+        let uplink = config
+            .uplinks
+            .iter()
+            .find(|uplink| uplink.enabled)
+            .ok_or_else(|| io::Error::other("config has no enabled uplink"))?;
+        let client_id = config.client.id.clone();
+        let quic_config = client_config(
+            &runtime.identity,
+            config.gateway.server_public_key,
+            transport_config(),
+        )?;
+        let transport = Transport::connect_with_client_config(
+            server,
+            vec![UplinkDial {
+                path_id: PathId::new(1),
+                uplink_id: uplink.id.clone(),
+                source,
+            }],
+            quic_config,
+        )
+        .await?;
+        let ipv6 = await_assign(&transport, &client_id, client_epoch)
             .await
             .map_err(io::Error::other)?;
         let tun = Arc::new(Tun::open(ipv6)?);
@@ -306,7 +360,11 @@ mod linux {
                     if control.is_none() { break; }
                 }
                 dead = transport.recv_dead() => {
-                    warn!(path = %dead.label(), "local benchmark path died");
+                    if let Some(status) = transport.path_status(dead) {
+                        warn!(path_id = dead.get(), uplink = %status.uplink_id, "local benchmark path died");
+                    } else {
+                        warn!(path_id = dead.get(), "unknown local benchmark path died");
+                    }
                 }
                 _ = sack_tick.tick() => transport.broadcast_sack(),
             }

@@ -44,13 +44,13 @@ struct BenchmarkControllerTests {
         await tunnel.stop()
     }
 
-    @Test("per-path rates derive independently from consecutive daemon samples")
-    func perPathRatesDeriveIndependently() async throws {
+    @Test("per-uplink rates derive independently from consecutive daemon samples")
+    func perUplinkRatesDeriveIndependently() async throws {
         let daemon = FakeDaemon(
             connected: true,
             statuses: [
-                statusSnapshot(connected: true, wiredTx: 100, wiredRx: 200, wifiTx: 300, wifiRx: 400),
-                statusSnapshot(connected: true, wiredTx: 1_100, wiredRx: 2_200, wifiTx: 3_300, wifiRx: 4_400),
+                statusSnapshot(connected: true, primaryTx: 100, primaryRx: 200, secondaryTx: 300, secondaryRx: 400),
+                statusSnapshot(connected: true, primaryTx: 1_100, primaryRx: 2_200, secondaryTx: 3_300, secondaryRx: 4_400),
             ]
         )
         let tunnel = testTunnel(client: daemon)
@@ -59,19 +59,20 @@ struct BenchmarkControllerTests {
         try await Task.sleep(for: .milliseconds(10))
         _ = try await tunnel.observedStatus()
 
-        #expect(tunnel.wiredTxRate > 0)
-        #expect(tunnel.wiredRxRate > tunnel.wiredTxRate)
-        #expect(tunnel.wifiTxRate > tunnel.wiredRxRate)
-        #expect(tunnel.wifiRxRate > tunnel.wifiTxRate)
+        let rates = Dictionary(uniqueKeysWithValues: tunnel.uplinks.map { ($0.id, ($0.txRate, $0.rxRate)) })
+        #expect(rates["primary"]!.0 > 0)
+        #expect(rates["primary"]!.1 > rates["primary"]!.0)
+        #expect(rates["secondary"]!.0 > rates["primary"]!.1)
+        #expect(rates["secondary"]!.1 > rates["secondary"]!.0)
     }
 
-    @Test("one reset path does not suppress rates on the other path")
+    @Test("one reset uplink does not suppress rates on another ID")
     func pathCounterResetIsIndependent() async throws {
         let daemon = FakeDaemon(
             connected: true,
             statuses: [
-                statusSnapshot(connected: true, wiredTx: 10_000, wiredRx: 20_000, wifiTx: 30_000, wifiRx: 40_000),
-                statusSnapshot(connected: true, wiredTx: 100, wiredRx: 200, wifiTx: 31_000, wifiRx: 42_000),
+                statusSnapshot(connected: true, primaryTx: 10_000, primaryRx: 20_000, secondaryTx: 30_000, secondaryRx: 40_000),
+                statusSnapshot(connected: true, primaryTx: 100, primaryRx: 200, secondaryTx: 31_000, secondaryRx: 42_000),
             ]
         )
         let tunnel = testTunnel(client: daemon)
@@ -80,11 +81,35 @@ struct BenchmarkControllerTests {
         try await Task.sleep(for: .milliseconds(10))
         _ = try await tunnel.observedStatus()
 
-        #expect(tunnel.wiredTxRate == 0)
-        #expect(tunnel.wiredRxRate == 0)
-        #expect(tunnel.wifiTxRate > 0)
-        #expect(tunnel.wifiRxRate > tunnel.wifiTxRate)
+        let rates = Dictionary(uniqueKeysWithValues: tunnel.uplinks.map { ($0.id, ($0.txRate, $0.rxRate)) })
+        #expect(rates["primary"]!.0 == 0)
+        #expect(rates["primary"]!.1 == 0)
+        #expect(rates["secondary"]!.0 > 0)
+        #expect(rates["secondary"]!.1 > rates["secondary"]!.0)
     }
+    @Test("menu toggle disables enabled intent even when no uplink is ready")
+    func enabledWaitingToggleDisconnects() async throws {
+        var topology = testTopology
+        topology.paths[0].sourceAddress = nil
+        let daemon = FakeDaemon(
+            connected: false,
+            enabled: true,
+            topology: topology,
+            connectedTopology: topology
+        )
+        let tunnel = testTunnel(client: daemon)
+
+        _ = try await tunnel.observedStatus()
+        #expect(tunnel.enabled)
+        #expect(tunnel.state == .disconnected)
+
+        tunnel.toggle()
+        try await waitUntil { await daemon.requests.contains { $0 == .disconnect } }
+        try await waitUntil { tunnel.enabled == false }
+
+        #expect(tunnel.state == .disconnected)
+    }
+
 
 
     @Test("a suite cannot start before daemon availability is confirmed")
@@ -776,6 +801,70 @@ struct BenchmarkControllerTests {
         #expect(await daemon.connected == false)
     }
 
+    @Test("a disconnected suite accepts source addresses learned after enabling")
+    func disconnectedSuiteAcceptsDynamicSourceAddress() async throws {
+        var disconnectedTopology = testTopology
+        disconnectedTopology.serverVersion = "unknown"
+        disconnectedTopology.paths[0].sourceAddress = nil
+        var connectedTopology = disconnectedTopology
+        connectedTopology.serverVersion = "authenticated-server-build"
+        connectedTopology.paths[0].sourceAddress = "10.10.10.171"
+        let daemon = FakeDaemon(
+            connected: false,
+            topology: disconnectedTopology,
+            connectedTopology: connectedTopology
+        )
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner
+        )
+        let expectedInvocationIDs = try BenchmarkPlanner.plan(
+            topology: connectedTopology,
+            parameters: .init()
+        ).invocations.map(\.id)
+
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+
+        #expect(controller.state == .completed)
+        #expect(controller.completedRun?.topology == connectedTopology)
+        #expect(await runner.invocationIDs == expectedInvocationIDs)
+        #expect(await daemon.connected == false)
+    }
+    @Test("configured path without source address is skipped while tunnel benchmarks run")
+    func unavailablePhysicalPathIsSkipped() async throws {
+        var topology = testTopology
+        topology.paths[0].sourceAddress = nil
+        let daemon = FakeDaemon(connected: true, topology: topology, connectedTopology: topology)
+        let runner = FakeBenchmarkRunner(recorder: daemon)
+        let controller = BenchmarkController(
+            daemon: daemon,
+            tunnel: testTunnel(client: daemon),
+            runner: runner
+        )
+        let physicalUpload = BenchmarkTestID(
+            route: .physical(pathID: topology.paths[0].id),
+            direction: .upload,
+            addressFamily: .ipv4
+        )
+        let physicalDownload = BenchmarkTestID(
+            route: .physical(pathID: topology.paths[0].id),
+            direction: .download,
+            addressFamily: .ipv4
+        )
+
+        controller.startFullSuite()
+        try await waitUntil { !controller.isRunning }
+
+        #expect(controller.state == .completed)
+        #expect(controller.completedRun?.results[physicalUpload] == .skipped("physical source address unavailable"))
+        #expect(controller.completedRun?.results[physicalDownload] == .skipped("physical source address unavailable"))
+        #expect(await runner.invocationIDs.allSatisfy { $0.route == .tunnel })
+    }
+
+
     @Test("a disconnected suite rejects changed topology after connecting and restores")
     func disconnectedSuiteRejectsChangedTopology() async throws {
         let directory = try temporaryControllerStoreDirectory()
@@ -967,9 +1056,7 @@ struct BenchmarkControllerTests {
             .status,
             .status,
             .status,
-            .status,
             .disconnect,
-            .status,
             .status,
             .status,
         ])
@@ -1416,6 +1503,7 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
     }
 
     private(set) var connected: Bool
+    private var enabled: Bool
     private(set) var requests: [DaemonRequest] = []
     private(set) var events: [Event] = []
     private(set) var waitingRequest: DaemonRequest?
@@ -1426,13 +1514,14 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
     private let disconnectError: (any Error & Sendable)?
     private let staleStatusRepliesAfterCommand: Int
     private let rejectConcurrentRequestsWhileSuspended: Bool
-    private var pendingConnected: Bool?
+    private var pendingEnabled: Bool?
     private var staleStatusRepliesRemaining = 0
     private var requestToSuspend: DaemonRequest?
     private var requestContinuation: CheckedContinuation<Void, Never>?
 
     init(
         connected: Bool,
+        enabled: Bool? = nil,
         statuses: [StatusSnapshot] = [],
         topology: BenchmarkTopology = testTopology,
         connectedTopology: BenchmarkTopology? = nil,
@@ -1443,6 +1532,7 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
         rejectConcurrentRequestsWhileSuspended: Bool = false
     ) {
         self.connected = connected
+        self.enabled = enabled ?? connected
         self.statuses = statuses
         self.topology = topology
         self.connectedTopology = connectedTopology
@@ -1474,29 +1564,32 @@ private actor FakeDaemon: DaemonRequesting, BenchmarkEventRecording {
             }
             if staleStatusRepliesRemaining > 0 {
                 staleStatusRepliesRemaining -= 1
-            } else if let pendingConnected {
-                connected = pendingConnected
-                self.pendingConnected = nil
+            } else if let pendingEnabled {
+                enabled = pendingEnabled
+                connected = pendingEnabled && (connectedTopology ?? topology).paths.contains { $0.sourceAddress != nil }
+                self.pendingEnabled = nil
             }
-            return .status(statusSnapshot(connected: connected))
+            return .status(statusSnapshot(enabled: enabled, connected: connected))
         case .benchmarkTopology:
             return .benchmarkTopology(connected ? connectedTopology ?? topology : topology)
         case .connect:
             if let connectError { throw connectError }
-            pendingConnected = true
+            pendingEnabled = true
             staleStatusRepliesRemaining = staleStatusRepliesAfterCommand
             if staleStatusRepliesRemaining == 0 {
-                connected = true
-                pendingConnected = nil
+                enabled = true
+                connected = (connectedTopology ?? topology).paths.contains { $0.sourceAddress != nil }
+                pendingEnabled = nil
             }
             return .ok
         case .disconnect:
             if let disconnectError { throw disconnectError }
-            pendingConnected = false
+            pendingEnabled = false
             staleStatusRepliesRemaining = staleStatusRepliesAfterCommand
             if staleStatusRepliesRemaining == 0 {
+                enabled = false
                 connected = false
-                pendingConnected = nil
+                pendingEnabled = nil
             }
             return .ok
         }
@@ -1705,24 +1798,51 @@ private let rawInvocations = allInvocations.filter { $0.id.route != .tunnel }
 private let tunnelInvocations = allInvocations.filter { $0.id.route == .tunnel }
 
 private func statusSnapshot(
+    enabled: Bool? = nil,
     connected: Bool,
-    wiredTx: UInt64 = 0,
-    wiredRx: UInt64 = 0,
-    wifiTx: UInt64 = 0,
-    wifiRx: UInt64 = 0
+    primaryTx: UInt64 = 0,
+    primaryRx: UInt64 = 0,
+    secondaryTx: UInt64 = 0,
+    secondaryRx: UInt64 = 0
 ) -> StatusSnapshot {
-    StatusSnapshot(
+    let enabled = enabled ?? connected
+    let uplinks = [
+        UplinkSnapshot(
+            id: "primary",
+            displayName: "Primary",
+            interface: "en17",
+            configuredEnabled: true,
+            state: connected ? "ready" : (enabled ? "waiting_for_address" : "disabled"),
+            ready: connected,
+            sourceAddress: connected ? "10.10.10.171" : nil,
+            gatewayEndpoint: connected ? "10.10.10.1:51823" : nil,
+            rttMs: connected ? 10 : nil,
+            tx: primaryTx,
+            rx: primaryRx,
+            lastError: nil
+        ),
+        UplinkSnapshot(
+            id: "secondary",
+            displayName: "Secondary",
+            interface: "en0",
+            configuredEnabled: true,
+            state: connected ? "ready" : (enabled ? "authenticating" : "disabled"),
+            ready: connected,
+            sourceAddress: connected ? "10.10.10.169" : nil,
+            gatewayEndpoint: connected ? "10.10.10.1:51823" : nil,
+            rttMs: connected ? 12 : nil,
+            tx: secondaryTx,
+            rx: secondaryRx,
+            lastError: nil
+        ),
+    ]
+    return StatusSnapshot(
+        enabled: enabled,
         connected: connected,
-        wired: connected,
-        wifi: false,
-        activePath: connected ? .wired : nil,
-        rttMs: connected ? 10 : nil,
-        tx: wiredTx + wifiTx,
-        rx: wiredRx + wifiRx,
-        wiredTx: wiredTx,
-        wiredRx: wiredRx,
-        wifiTx: wifiTx,
-        wifiRx: wifiRx
+        activeUplinkID: connected ? "primary" : nil,
+        tx: primaryTx + secondaryTx,
+        rx: primaryRx + secondaryRx,
+        uplinks: uplinks
     )
 }
 

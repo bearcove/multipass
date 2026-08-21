@@ -1,8 +1,61 @@
 import SwiftUI
 
-/// The menubar panel: tunnel state, per-path health, throughput, and the
-/// connect/disconnect toggle. All state comes from `TunnelController` — this
-/// view is a pure projection of the daemon's status replies.
+nonisolated struct UplinkPresentation: Equatable {
+    nonisolated enum Tone: Equatable {
+        case disabled
+        case waiting
+        case working
+        case ready
+        case error
+    }
+
+    let label: String
+    let tone: Tone
+    let symbol: String
+
+    nonisolated init(state: String, configuredEnabled: Bool, ready: Bool, lastError: String?) {
+        if !configuredEnabled || state == "disabled" {
+            label = "Disabled"
+            tone = .disabled
+            symbol = "minus.circle"
+        } else if let lastError, !lastError.isEmpty {
+            label = "Error: \(lastError)"
+            tone = .error
+            symbol = "exclamationmark.triangle.fill"
+        } else if ready || state == "ready" {
+            label = "Ready"
+            tone = .ready
+            symbol = "checkmark.circle.fill"
+        } else {
+            switch state {
+            case "waiting_for_address":
+                label = "Waiting for address"
+                tone = .waiting
+                symbol = "clock"
+            case "racing_endpoints", "resolving_endpoints":
+                label = "Racing endpoints"
+                tone = .working
+                symbol = "arrow.trianglehead.branch"
+            case "authenticating":
+                label = "Authenticating"
+                tone = .working
+                symbol = "lock.rotation"
+            case "waiting", "idle":
+                label = "Waiting"
+                tone = .waiting
+                symbol = "clock"
+            default:
+                label = state.replacingOccurrences(of: "_", with: " ").capitalized
+                tone = state.localizedCaseInsensitiveContains("error") ? .error : .waiting
+                symbol = tone == .error ? "exclamationmark.triangle.fill" : "clock"
+            }
+        }
+    }
+
+}
+
+/// The menubar panel: tunnel state, ordered uplink health, throughput, and the
+/// connect/disconnect toggle. It is a pure projection of `TunnelController`.
 struct MenuBarView: View {
     @Bindable var controller: TunnelController
     @Bindable var benchmarkController: BenchmarkController
@@ -24,7 +77,7 @@ struct MenuBarView: View {
             footer
         }
         .padding(16)
-        .frame(width: 292)
+        .frame(width: 360)
     }
 
     // MARK: - Header
@@ -50,15 +103,18 @@ struct MenuBarView: View {
 
     private var stateDescription: String {
         switch controller.state {
-        case .daemonUnavailable: "Daemon unavailable"
-        case .disconnected: "Disconnected"
-        case .transitioning: "Working…"
+        case .daemonUnavailable:
+            "Daemon unavailable"
+        case .transitioning:
+            "Working…"
         case .connected:
-            if let path = controller.activePath {
-                "Connected via \(path.displayName)"
+            if let uplink = controller.activeUplink {
+                "Connected via \(uplink.displayName)"
             } else {
                 "Connected"
             }
+        case .disconnected:
+            controller.enabled ? "Enabled — waiting for connectivity" : "Disabled"
         }
     }
 
@@ -67,30 +123,23 @@ struct MenuBarView: View {
     private var statusBody: some View {
         VStack(alignment: .leading, spacing: 12) {
             failoverBanner
-            pathRow(
-                name: "Wired",
-                symbol: "cable.connector",
-                live: controller.wiredLive,
-                active: controller.activePath == .wired,
-                txRate: controller.wiredTxRate,
-                rxRate: controller.wiredRxRate,
-            )
-            pathRow(
-                name: "Wi-Fi",
-                symbol: "wifi",
-                live: controller.wifiLive,
-                active: controller.activePath == .wifi,
-                txRate: controller.wifiTxRate,
-                rxRate: controller.wifiRxRate,
-            )
+            if controller.uplinks.isEmpty {
+                Text(controller.enabled ? "No configured uplinks are available yet." : "No uplinks configured.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(controller.uplinks, id: \.id) { uplink in
+                    uplinkRow(uplink)
+                }
+            }
             Divider()
             statsGrid
         }
-        .animation(.snappy, value: controller.failoverTo)
+        .animation(.snappy, value: controller.failoverToID)
     }
 
-    /// Appears briefly when the active path changes while connected — the
-    /// failover event this VPN exists for.
+    /// Appears briefly when the active ID changes while the tunnel stays ready.
     @ViewBuilder
     private var failoverBanner: some View {
         if let failoverTo = controller.failoverTo {
@@ -105,58 +154,95 @@ struct MenuBarView: View {
         }
     }
 
-    private func pathRow(
-        name: String,
-        symbol: String,
-        live: Bool,
-        active: Bool,
-        txRate: Double,
-        rxRate: Double
-    ) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: symbol)
-                .frame(width: 20)
-                .foregroundStyle(live ? .primary : .secondary)
-            Text(name)
-                .font(.body)
-            if active, controller.state.isConnected {
-                Text("ACTIVE")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Color.accentColor)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 2)
-                    .background(Color.accentColor.opacity(0.15), in: .capsule)
-            }
-            Spacer()
-            if controller.state.isConnected {
-                Text("↑ \(rateText(txRate))  ↓ \(rateText(rxRate))")
+    private func uplinkRow(_ uplink: UplinkStatus) -> some View {
+        let presentation = UplinkPresentation(
+            state: uplink.state,
+            configuredEnabled: uplink.configuredEnabled,
+            ready: uplink.ready,
+            lastError: uplink.lastError
+        )
+        let active = controller.activeUplinkID == uplink.id
+
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Image(systemName: presentation.symbol)
+                    .frame(width: 18)
+                    .foregroundStyle(presentationColor(presentation.tone))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(uplink.displayName)
+                        .font(.body.weight(.medium))
+                    Text(uplink.interface)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.tertiary)
+                }
+                if active, controller.state.isConnected {
+                    Text("ACTIVE")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.15), in: .capsule)
+                }
+                Spacer()
+                Text("↑ \(rateText(uplink.txRate))  ↓ \(rateText(uplink.rxRate))")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .contentTransition(.numericText())
             }
-            Circle()
-                .fill(live ? Color.green : Color.red)
-                .frame(width: 8, height: 8)
-                .shadow(color: live ? .green.opacity(0.6) : .clear, radius: 3)
-            Text(live ? "live" : "down")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .frame(width: 34, alignment: .trailing)
+            HStack(spacing: 6) {
+                Text(presentation.label)
+                    .foregroundStyle(presentationColor(presentation.tone))
+                if let rtt = uplink.rttMs {
+                    Text("•")
+                    Text(rttText(rtt))
+                }
+                Spacer()
+            }
+            .font(.caption)
+            diagnosticLine(uplink)
         }
+        .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "\(name) path \(live ? "live" : "down")\(active ? ", active" : "")"
-                + (controller.state.isConnected
-                    ? ", upload \(rateText(txRate)), download \(rateText(rxRate))"
-                    : "")
-        )
+        .accessibilityLabel(uplinkAccessibilityLabel(uplink, presentation: presentation, active: active))
     }
+
+    @ViewBuilder
+    private func diagnosticLine(_ uplink: UplinkStatus) -> some View {
+        let source = uplink.sourceAddress ?? "No source address"
+        let endpoint = uplink.gatewayEndpoint ?? "No endpoint selected"
+        Text("\(source)  →  \(endpoint)")
+            .font(.caption2.monospaced())
+            .foregroundStyle(.tertiary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .help("Source: \(source)\nGateway: \(endpoint)")
+    }
+
+    private func uplinkAccessibilityLabel(
+        _ uplink: UplinkStatus,
+        presentation: UplinkPresentation,
+        active: Bool
+    ) -> String {
+        "\(uplink.displayName), interface \(uplink.interface), \(presentation.label)"
+            + (active ? ", active" : "")
+            + ", upload \(rateText(uplink.txRate)), download \(rateText(uplink.rxRate))"
+    }
+    private func presentationColor(_ tone: UplinkPresentation.Tone) -> Color {
+        switch tone {
+        case .disabled: .secondary
+        case .waiting: .orange
+        case .working: .blue
+        case .ready: .green
+        case .error: .red
+        }
+    }
+
 
     private var statsGrid: some View {
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
             GridRow {
                 statLabel("RTT")
-                statValue(rttText)
+                statValue(controller.rttMs.map(rttText) ?? "—")
                 statLabel("Up")
                 statValue(rateText(controller.txRate))
             }
@@ -187,11 +273,8 @@ struct MenuBarView: View {
             .animation(.default, value: text)
     }
 
-    private var rttText: String {
-        guard let rtt = controller.rttMs else { return "—" }
-        return rtt < 10
-            ? String(format: "%.1f ms", rtt)
-            : String(format: "%.0f ms", rtt)
+    private func rttText(_ rtt: Double) -> String {
+        rtt < 10 ? String(format: "%.1f ms", rtt) : String(format: "%.0f ms", rtt)
     }
 
     private func rateText(_ bytesPerSecond: Double) -> String {
@@ -233,14 +316,14 @@ struct MenuBarView: View {
                         .controlSize(.small)
                         .frame(maxWidth: .infinity)
                 } else {
-                    Text(controller.state.isConnected ? "Disconnect" : "Connect")
+                    Text(controller.enabled ? "Disconnect" : "Connect")
                         .frame(maxWidth: .infinity)
                 }
             }
             .padding(.vertical, 4)
         }
         .buttonStyle(.borderedProminent)
-        .tint(controller.state.isConnected ? .red : .accentColor)
+        .tint(controller.enabled ? .red : .accentColor)
         .disabled(!controller.canToggle)
         .keyboardShortcut("d")
         .help(toggleHelp)
@@ -257,7 +340,7 @@ struct MenuBarView: View {
         if controller.state == .transitioning {
             return "The tunnel is changing state."
         }
-        return controller.state.isConnected ? "Disconnect the Multipass tunnel." : "Connect the Multipass tunnel."
+        return controller.enabled ? "Disable the Multipass tunnel." : "Enable the Multipass tunnel."
     }
 
     private var benchmarkButton: some View {
@@ -271,7 +354,6 @@ struct MenuBarView: View {
         .keyboardShortcut("b", modifiers: [.command, .shift])
         .help("Open the benchmark window. Saved history remains available when the daemon is offline.")
     }
-
 
     // MARK: - Footer
 
@@ -294,7 +376,7 @@ struct MenuBarView: View {
                 }
             Spacer()
             Button("Quit", action: requestQuit)
-            .keyboardShortcut("q")
+                .keyboardShortcut("q")
         }
     }
 }

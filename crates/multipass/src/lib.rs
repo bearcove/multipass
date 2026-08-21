@@ -20,28 +20,30 @@
 //! Hello/Assign handshake; it drives them through [`Transport::send_frame_on`]
 //! and [`Transport::recv_control`].
 
+pub mod config;
+pub mod identity;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use multipass_proto::{Frame, ReorderBuffer, ReorderInsert};
-use noq::{ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig};
-use noq_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use noq::{ClientConfig, Connection, Endpoint, TransportConfig};
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
 
 /// Re-export the wire format so callers don't need a second `use` path.
 pub use multipass_proto;
-pub use multipass_proto::{PathId, Scheduler, SendWindow, UplinkId};
+pub use multipass_proto::{ClientId, PathId, Scheduler, SendWindow, UplinkId};
 
 /// ALPN for the multipass tunnel (from multipass-proto).
 pub const ALPN: &[u8] = multipass_proto::ALPN;
-/// TLS server name (SNI) used when dialing. The self-signed cert is generated
-/// for this name; the client verifier skips validation anyway.
+/// TLS server name used only as the QUIC SNI routing label. Authentication is
+/// exact Ed25519 public-key pinning and is independent of this value.
 pub const SERVER_NAME: &str = "multipass";
 
 /// How often the transport sends a Ping probe on each live path to measure RTT.
@@ -66,6 +68,8 @@ pub enum TransportError {
     Connect(noq::ConnectError),
     /// The handshake failed or the connection was refused.
     Handshake(noq::ConnectionError),
+    /// Initial uplink IDs conflict within the supplied registry.
+    Registry(RegistryError),
 }
 
 impl fmt::Display for TransportError {
@@ -73,6 +77,7 @@ impl fmt::Display for TransportError {
         match self {
             TransportError::Bind(e) => write!(f, "bind endpoint: {e}"),
             TransportError::Connect(e) => write!(f, "connect: {e}"),
+            TransportError::Registry(e) => write!(f, "uplink registry: {e}"),
             TransportError::Handshake(e) => write!(f, "handshake: {e}"),
         }
     }
@@ -83,6 +88,7 @@ impl std::error::Error for TransportError {
         match self {
             TransportError::Bind(e) => Some(e),
             TransportError::Connect(e) => Some(e),
+            TransportError::Registry(e) => Some(e),
             TransportError::Handshake(e) => Some(e),
         }
     }
@@ -100,98 +106,21 @@ pub fn transport_config() -> Arc<TransportConfig> {
     Arc::new(tc)
 }
 
-/// Build a self-signed server config. Used by the failover test binary's echo
-/// server; the real server crate has its own (see multipass-server).
-pub fn server_config() -> ServerConfig {
-    // Self-signed cert; the client intentionally skips verification.
-    let cert = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into()]).unwrap();
-    let der = CertificateDer::from(cert.cert);
-    let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
-    let mut tls = rustls::ServerConfig::builder_with_provider(provider.into())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![der], key.into())
-        .unwrap();
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-
-    let mut cfg = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()));
-    cfg.transport_config(transport_config());
-    cfg
-}
-
-/// A certificate verifier that accepts any server certificate (self-signed
-/// dev transport). Do not use outside of this controlled tunnel.
-#[derive(Debug)]
-struct SkipVerify(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for SkipVerify {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// Build the client config: SkipVerify cert validation, the multipass ALPN,
-/// and the shared transport config.
-pub fn client_config() -> ClientConfig {
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
-    let tls = rustls::ClientConfig::builder_with_provider(provider.clone().into())
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipVerify(provider.into())))
-        .with_no_client_auth();
-    let mut qcc = QuicClientConfig::try_from(tls).unwrap();
-    qcc.set_alpn_protocols(vec![ALPN.to_vec()]);
-
-    let mut cfg = ClientConfig::new(Arc::new(qcc));
-    cfg.transport_config(transport_config());
-    cfg
-}
-
-/// Open ONE connection on an endpoint bound to `src_ip` (that interface's
-/// source address), targeting `server`. `label` names the path in logs.
+/// Open one authenticated connection on an endpoint bound to `src_ip`.
 pub async fn dial(
     server: SocketAddr,
     src_ip: IpAddr,
     label: &str,
+    client_config: ClientConfig,
 ) -> Result<Connection, TransportError> {
     let ep = Endpoint::client(SocketAddr::new(src_ip, 0)).map_err(TransportError::Bind)?;
-    ep.set_default_client_config(client_config());
+    ep.set_default_client_config(client_config);
     let conn = ep
         .connect(server, SERVER_NAME)
         .map_err(TransportError::Connect)?
         .await
         .map_err(TransportError::Handshake)?;
-    tracing::info!(path = %label, src_ip = %src_ip, %server, "connection up");
+    tracing::info!(path = %label, src_ip = %src_ip, %server, "authenticated connection up");
     Ok(conn)
 }
 
@@ -210,6 +139,43 @@ pub struct UplinkConnection {
     pub connection: Connection,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryError {
+    DuplicatePathId(PathId),
+    DuplicateUplinkId(UplinkId),
+    UnknownPath(PathId),
+    StaleGeneration {
+        path_id: PathId,
+        current: u64,
+        expected: u64,
+    },
+}
+
+impl fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicatePathId(path_id) => {
+                write!(f, "path ID {} is already registered", path_id.get())
+            }
+            Self::DuplicateUplinkId(uplink_id) => {
+                write!(f, "uplink ID {uplink_id} is already registered")
+            }
+            Self::UnknownPath(path_id) => write!(f, "unknown path ID {}", path_id.get()),
+            Self::StaleGeneration {
+                path_id,
+                current,
+                expected,
+            } => write!(
+                f,
+                "path ID {} generation is {current}, expected {expected}",
+                path_id.get()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RegistryError {}
+
 /// A single live QUIC connection for one logical uplink.
 struct Path {
     path_id: PathId,
@@ -227,6 +193,52 @@ struct Path {
     transmitted: Arc<AtomicU64>,
     received_bytes: Arc<AtomicU64>,
     transmitted_bytes: Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+struct Registry {
+    ordered: Vec<Arc<Path>>,
+    by_path: HashMap<PathId, usize>,
+    by_uplink: HashMap<UplinkId, usize>,
+}
+
+impl Registry {
+    fn insert(&mut self, path: Arc<Path>) -> Result<(), RegistryError> {
+        if self.by_path.contains_key(&path.path_id) {
+            return Err(RegistryError::DuplicatePathId(path.path_id));
+        }
+        if self.by_uplink.contains_key(&path.uplink_id) {
+            return Err(RegistryError::DuplicateUplinkId(path.uplink_id.clone()));
+        }
+        let index = self.ordered.len();
+        self.by_path.insert(path.path_id, index);
+        self.by_uplink.insert(path.uplink_id.clone(), index);
+        self.ordered.push(path);
+        Ok(())
+    }
+
+    fn remove(&mut self, path_id: PathId) -> Option<Arc<Path>> {
+        let index = self.by_path.remove(&path_id)?;
+        let path = self.ordered.remove(index);
+        self.by_uplink.remove(&path.uplink_id);
+        for (offset, shifted) in self.ordered[index..].iter().enumerate() {
+            let shifted_index = index + offset;
+            self.by_path.insert(shifted.path_id, shifted_index);
+            self.by_uplink
+                .insert(shifted.uplink_id.clone(), shifted_index);
+        }
+        Some(path)
+    }
+
+    fn snapshot(&self) -> Vec<Arc<Path>> {
+        self.ordered.clone()
+    }
+
+    fn path(&self, path_id: PathId) -> Option<Arc<Path>> {
+        self.by_path
+            .get(&path_id)
+            .map(|index| Arc::clone(&self.ordered[*index]))
+    }
 }
 
 impl Path {
@@ -259,6 +271,7 @@ impl Path {
         UplinkStatus {
             path_id: self.path_id,
             uplink_id: self.uplink_id.clone(),
+            generation: self.generation.load(Ordering::Relaxed),
             alive: self.alive.load(Ordering::Relaxed),
             ready: self.ready.load(Ordering::Relaxed),
             last_recv,
@@ -281,7 +294,7 @@ impl Path {
     }
 
     fn mark_dead(&self, generation: u64) -> bool {
-        let connection = self.conn.lock().unwrap();
+        let connection = self.conn.lock();
         if self.generation.load(Ordering::Acquire) != generation
             || self
                 .alive
@@ -293,7 +306,7 @@ impl Path {
         self.ready.store(false, Ordering::Release);
         connection.close(0u32.into(), b"path liveness timeout");
         drop(connection);
-        *self.probe.lock().unwrap() = None;
+        *self.probe.lock() = None;
         true
     }
 }
@@ -307,6 +320,7 @@ fn micros_to_instant(started: Instant, micros: u64) -> Option<Instant> {
 pub struct UplinkStatus {
     pub path_id: PathId,
     pub uplink_id: UplinkId,
+    pub generation: u64,
     pub alive: bool,
     pub ready: bool,
     pub last_recv: Option<Instant>,
@@ -342,8 +356,7 @@ pub struct Data {
 /// Dynamic N-uplink client transport. Reliability state belongs to the logical
 /// session; connections and their liveness state belong to registered uplinks.
 pub struct Transport {
-    paths: Vec<Arc<Path>>,
-    path_indices: HashMap<PathId, usize>,
+    registry: Arc<RwLock<Registry>>,
     data_rx: tokio::sync::Mutex<mpsc::Receiver<Data>>,
     control_rx: tokio::sync::Mutex<mpsc::Receiver<(PathId, Frame)>>,
     dead_rx: tokio::sync::Mutex<mpsc::Receiver<PathId>>,
@@ -359,50 +372,54 @@ pub struct Transport {
 }
 
 impl Transport {
-    pub async fn connect(server: SocketAddr, uplinks: Vec<UplinkDial>) -> Result<Self, TransportError> {
+    pub async fn connect_with_client_config(
+        server: SocketAddr,
+        uplinks: Vec<UplinkDial>,
+        client_config: ClientConfig,
+    ) -> Result<Self, TransportError> {
         let mut connections = Vec::with_capacity(uplinks.len());
         for uplink in uplinks {
-            let connection = dial(server, uplink.source, uplink.uplink_id.as_str()).await?;
+            let connection = dial(
+                server,
+                uplink.source,
+                uplink.uplink_id.as_str(),
+                client_config.clone(),
+            )
+            .await?;
             connections.push(UplinkConnection {
                 path_id: uplink.path_id,
                 uplink_id: uplink.uplink_id,
                 connection,
             });
         }
-        Ok(Self::from_connections(connections))
+        Self::try_from_connections(connections).map_err(TransportError::Registry)
     }
 
-    pub fn from_connections(connections: Vec<UplinkConnection>) -> Self {
+    pub fn from_connections(connections: Vec<UplinkConnection>) -> Result<Self, RegistryError> {
+        Self::try_from_connections(connections)
+    }
+
+    pub fn try_from_connections(connections: Vec<UplinkConnection>) -> Result<Self, RegistryError> {
         let (data_tx, data_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (dead_tx, dead_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let mut paths = Vec::with_capacity(connections.len());
-        let mut path_indices = HashMap::with_capacity(connections.len());
+        let registry = Arc::new(RwLock::new(Registry::default()));
         let mut scheduler = Scheduler::new();
 
         for uplink in connections {
-            assert!(
-                !path_indices.contains_key(&uplink.path_id),
-                "duplicate path ID {}",
-                uplink.path_id.get()
-            );
-            let index = paths.len();
-            path_indices.insert(uplink.path_id, index);
-            scheduler.insert(uplink.path_id);
-            paths.push(Arc::new(Path::new(
+            let path = Arc::new(Path::new(
                 uplink.path_id,
                 uplink.uplink_id,
                 uplink.connection,
-            )));
+            ));
+            registry.write().insert(Arc::clone(&path))?;
+            scheduler.insert(path.path_id);
+            spawn_reader(&path, &data_tx, &control_tx, &dead_tx);
         }
-        for path in &paths {
-            spawn_reader(path, &data_tx, &control_tx, &dead_tx);
-        }
-        let probe_task = spawn_probe(paths.clone(), &dead_tx);
+        let probe_task = spawn_probe(Arc::clone(&registry), &dead_tx);
 
-        Self {
-            paths,
-            path_indices,
+        Ok(Self {
+            registry,
             data_rx: tokio::sync::Mutex::new(data_rx),
             control_rx: tokio::sync::Mutex::new(control_rx),
             dead_rx: tokio::sync::Mutex::new(dead_rx),
@@ -415,40 +432,112 @@ impl Transport {
             probe_task,
             send_window: Mutex::new(SendWindow::new(CHANNEL_CAPACITY)),
             scheduler: Mutex::new(scheduler),
-        }
+        })
     }
 
-    pub fn path_ids(&self) -> impl ExactSizeIterator<Item = PathId> + '_ {
-        self.paths.iter().map(|path| path.path_id)
+    pub fn path_ids(&self) -> impl ExactSizeIterator<Item = PathId> {
+        self.paths_snapshot().into_iter().map(|path| path.path_id)
+    }
+
+    pub fn register_uplink(&self, uplink: UplinkConnection) -> Result<u64, RegistryError> {
+        let path = Arc::new(Path::new(
+            uplink.path_id,
+            uplink.uplink_id,
+            uplink.connection,
+        ));
+        let mut scheduler = self.scheduler.lock();
+        self.registry.write().insert(Arc::clone(&path))?;
+        scheduler.insert(path.path_id);
+        drop(scheduler);
+        spawn_reader(&path, &self.data_tx, &self.control_tx, &self.dead_tx);
+        tracing::info!(path_id = path.path_id.get(), uplink = %path.uplink_id, "path registered");
+        Ok(0)
+    }
+
+    pub fn replace_uplink(
+        &self,
+        path_id: PathId,
+        expected_generation: u64,
+        new_conn: Connection,
+    ) -> Result<u64, RegistryError> {
+        let path = self
+            .path(path_id)
+            .ok_or(RegistryError::UnknownPath(path_id))?;
+        let mut connection = path.conn.lock();
+        let current = path.generation.load(Ordering::Acquire);
+        if current != expected_generation {
+            return Err(RegistryError::StaleGeneration {
+                path_id,
+                current,
+                expected: expected_generation,
+            });
+        }
+        let new_generation = current + 1;
+        path.alive.store(false, Ordering::Release);
+        path.generation.store(new_generation, Ordering::Release);
+        connection.close(0u32.into(), b"uplink connection replaced");
+        *connection = new_conn;
+        path.ready.store(false, Ordering::Relaxed);
+        path.rtt.store(0, Ordering::Relaxed);
+        path.alive.store(true, Ordering::Release);
+        drop(connection);
+        *path.probe.lock() = None;
+        self.scheduler.lock().set_eligible(path_id, false);
+        spawn_reader(&path, &self.data_tx, &self.control_tx, &self.dead_tx);
+        tracing::info!(path_id = path_id.get(), uplink = %path.uplink_id, generation = new_generation, "path replaced");
+        Ok(new_generation)
+    }
+
+    pub fn remove_uplink(
+        &self,
+        path_id: PathId,
+        expected_generation: u64,
+    ) -> Result<(), RegistryError> {
+        let path = {
+            let mut scheduler = self.scheduler.lock();
+            let mut registry = self.registry.write();
+            let path = registry
+                .path(path_id)
+                .ok_or(RegistryError::UnknownPath(path_id))?;
+            let current = path.generation.load(Ordering::Acquire);
+            if current != expected_generation {
+                return Err(RegistryError::StaleGeneration {
+                    path_id,
+                    current,
+                    expected: expected_generation,
+                });
+            }
+            let path = registry
+                .remove(path_id)
+                .expect("path cloned from registry remains registered");
+            scheduler.remove(path_id);
+            path
+        };
+        path.alive.store(false, Ordering::Release);
+        path.ready.store(false, Ordering::Release);
+        path.conn.lock().close(0u32.into(), b"uplink removed");
+        *path.probe.lock() = None;
+        tracing::info!(path_id = path_id.get(), uplink = %path.uplink_id, "path removed");
+        Ok(())
     }
 
     pub fn install_reconnected_path(&self, path_id: PathId, new_conn: Connection) -> bool {
         let Some(path) = self.path(path_id) else {
             return false;
         };
-        {
-            let mut connection = path.conn.lock().unwrap();
-            path.alive.store(false, Ordering::Release);
-            path.generation.fetch_add(1, Ordering::AcqRel);
-            *connection = new_conn;
-            path.ready.store(false, Ordering::Relaxed);
-            path.rtt.store(0, Ordering::Relaxed);
-            path.alive.store(true, Ordering::Release);
-        }
-        *path.probe.lock().unwrap() = None;
-        spawn_reader(path, &self.data_tx, &self.control_tx, &self.dead_tx);
-        tracing::info!(path_id = path_id.get(), uplink = %path.uplink_id, "path reconnected");
-        true
+        let generation = path.generation.load(Ordering::Acquire);
+        self.replace_uplink(path_id, generation, new_conn).is_ok()
     }
 
     fn refresh_scheduler(&self) {
-        let mut scheduler = self.scheduler.lock().unwrap();
-        for path in &self.paths {
+        let paths = self.paths_snapshot();
+        let mut scheduler = self.scheduler.lock();
+        for path in paths {
             scheduler.set_eligible(
                 path.path_id,
                 path.ready.load(Ordering::Relaxed) && path.alive.load(Ordering::Relaxed),
             );
-            let connection = path.conn.lock().unwrap();
+            let connection = path.conn.lock();
             if let Some(stats) = connection.path_stats(noq_proto::PathId::ZERO) {
                 scheduler.note_path_stats(path.path_id, stats.rtt, stats.cwnd);
             } else {
@@ -467,10 +556,10 @@ impl Transport {
             seq,
             packet: packet.clone(),
         });
-        if !self.paths.iter().any(|path| {
+        let paths = self.paths_snapshot();
+        if !paths.iter().any(|path| {
             path.conn
                 .lock()
-                .unwrap()
                 .max_datagram_size()
                 .is_some_and(|max| encoded.len() <= max)
         }) {
@@ -478,15 +567,18 @@ impl Transport {
         }
 
         self.refresh_scheduler();
-        let Some(path_id) = self.scheduler.lock().unwrap().pick() else {
+        let Some(path_id) = self.scheduler.lock().pick() else {
             return false;
         };
-        self.send_window.lock().unwrap().insert(seq, packet);
-        let path = self.path(path_id).expect("scheduler returned registered path");
-        match path.conn.lock().unwrap().send_datagram(encoded) {
+        self.send_window.lock().insert(seq, packet);
+        let path = self
+            .path(path_id)
+            .expect("scheduler returned registered path");
+        match path.conn.lock().send_datagram(encoded) {
             Ok(()) => {
                 path.transmitted.fetch_add(1, Ordering::Relaxed);
-                path.transmitted_bytes.fetch_add(packet_len, Ordering::Relaxed);
+                path.transmitted_bytes
+                    .fetch_add(packet_len, Ordering::Relaxed);
                 true
             }
             Err(error) => {
@@ -497,9 +589,9 @@ impl Transport {
     }
 
     fn handle_sack(&self, largest_contiguous: u64, ranges: &[(u64, u64)]) {
-        let gaps = self.send_window.lock().unwrap().ack(largest_contiguous, ranges);
+        let gaps = self.send_window.lock().ack(largest_contiguous, ranges);
         for seq in gaps {
-            if let Some(packet) = self.send_window.lock().unwrap().get(seq) {
+            if let Some(packet) = self.send_window.lock().get(seq) {
                 self.retransmit(seq, packet);
             }
         }
@@ -507,24 +599,27 @@ impl Transport {
 
     fn retransmit(&self, seq: u64, packet: Bytes) {
         self.refresh_scheduler();
-        let Some(path_id) = self.scheduler.lock().unwrap().pick() else {
+        let Some(path_id) = self.scheduler.lock().pick() else {
             return;
         };
         let packet_len = packet.len() as u64;
         let encoded = multipass_proto::encode(&Frame::Data { seq, packet });
-        let path = self.path(path_id).expect("scheduler returned registered path");
-        if path.conn.lock().unwrap().send_datagram(encoded).is_ok() {
+        let path = self
+            .path(path_id)
+            .expect("scheduler returned registered path");
+        if path.conn.lock().send_datagram(encoded).is_ok() {
             path.transmitted.fetch_add(1, Ordering::Relaxed);
-            path.transmitted_bytes.fetch_add(packet_len, Ordering::Relaxed);
+            path.transmitted_bytes
+                .fetch_add(packet_len, Ordering::Relaxed);
             tracing::debug!(seq, path_id = path_id.get(), uplink = %path.uplink_id, "retransmitted packet");
         }
     }
 
     pub fn on_path_dead(&self, dead: PathId) {
-        self.scheduler.lock().unwrap().set_eligible(dead, false);
-        let unacked = self.send_window.lock().unwrap().unacked();
+        self.scheduler.lock().set_eligible(dead, false);
+        let unacked = self.send_window.lock().unacked();
         for seq in unacked {
-            if let Some(packet) = self.send_window.lock().unwrap().get(seq) {
+            if let Some(packet) = self.send_window.lock().get(seq) {
                 self.retransmit(seq, packet);
             }
         }
@@ -537,7 +632,11 @@ impl Transport {
         if !path.alive.load(Ordering::Relaxed) {
             return false;
         }
-        match path.conn.lock().unwrap().send_datagram(multipass_proto::encode(frame)) {
+        match path
+            .conn
+            .lock()
+            .send_datagram(multipass_proto::encode(frame))
+        {
             Ok(()) => {
                 path.transmitted.fetch_add(1, Ordering::Relaxed);
                 true
@@ -551,25 +650,24 @@ impl Transport {
 
     pub async fn recv_data(&self) -> Option<Data> {
         loop {
-            if let Some(ready) = self.reorder.lock().unwrap().pop_ready() {
+            if let Some(ready) = self.reorder.lock().pop_ready() {
                 return Some(ready);
             }
             let gap_deadline = self
                 .reorder
                 .lock()
-                .unwrap()
                 .has_gap()
-                .then(|| *self.reorder_activity.lock().unwrap() + REORDER_GAP_TIMEOUT);
+                .then(|| *self.reorder_activity.lock() + REORDER_GAP_TIMEOUT);
             let mut data_rx = self.data_rx.lock().await;
             let data = if let Some(deadline) = gap_deadline {
                 tokio::select! {
                     data = data_rx.recv() => data?,
                     _ = tokio::time::sleep_until(deadline.into()) => {
                         drop(data_rx);
-                        let mut reorder = self.reorder.lock().unwrap();
+                        let mut reorder = self.reorder.lock();
                         if let Some((first, last)) = reorder.skip_missing_prefix() {
                             tracing::debug!(first, last, next_seq = reorder.next_seq(), occupancy = reorder.occupancy(), span = ?reorder.buffered_span(), "reorder gap timed out; releasing buffered suffix");
-                            self.recv_scoreboard.lock().unwrap().abandon_through(last);
+                            self.recv_scoreboard.lock().abandon_through(last);
                         }
                         continue;
                     }
@@ -579,15 +677,15 @@ impl Transport {
             };
             drop(data_rx);
             let seq = data.seq;
-            *self.reorder_activity.lock().unwrap() = Instant::now();
-            let mut reorder = self.reorder.lock().unwrap();
+            *self.reorder_activity.lock() = Instant::now();
+            let mut reorder = self.reorder.lock();
             match reorder.insert(seq, data) {
                 ReorderInsert::Rejected => continue,
                 ReorderInsert::Admitted => {
-                    self.recv_scoreboard.lock().unwrap().insert(seq);
+                    self.recv_scoreboard.lock().insert(seq);
                 }
                 ReorderInsert::AdmittedAfterSkipping { last, .. } => {
-                    let mut scoreboard = self.recv_scoreboard.lock().unwrap();
+                    let mut scoreboard = self.recv_scoreboard.lock();
                     scoreboard.abandon_through(last);
                     scoreboard.insert(seq);
                 }
@@ -596,10 +694,10 @@ impl Transport {
     }
 
     pub fn broadcast_sack(&self) {
-        let encoded = multipass_proto::encode(&self.recv_scoreboard.lock().unwrap().generate_sack());
-        for path in &self.paths {
+        let encoded = multipass_proto::encode(&self.recv_scoreboard.lock().generate_sack());
+        for path in self.paths_snapshot() {
             if path.alive.load(Ordering::Relaxed) {
-                let _ = path.conn.lock().unwrap().send_datagram(encoded.clone());
+                let _ = path.conn.lock().send_datagram(encoded.clone());
             }
         }
     }
@@ -631,7 +729,11 @@ impl Transport {
 
     pub fn status(&self) -> TransportStatus {
         TransportStatus {
-            uplinks: self.paths.iter().map(|path| path.status()).collect(),
+            uplinks: self
+                .paths_snapshot()
+                .into_iter()
+                .map(|path| path.status())
+                .collect(),
         }
     }
 
@@ -658,12 +760,11 @@ impl Transport {
     }
 
     pub fn send_window_len(&self) -> usize {
-        self.send_window.lock().unwrap().len()
+        self.send_window.lock().len()
     }
 
     pub fn connection(&self, path_id: PathId) -> Option<Connection> {
-        self.path(path_id)
-            .map(|path| path.conn.lock().unwrap().clone())
+        self.path(path_id).map(|path| path.conn.lock().clone())
     }
 
     pub fn verify_datagram_capacity(&self, path_id: PathId, required: usize) -> bool {
@@ -672,18 +773,20 @@ impl Transport {
             .is_some_and(|max| max >= required)
     }
 
-    fn path(&self, path_id: PathId) -> Option<&Arc<Path>> {
-        self.path_indices.get(&path_id).map(|index| &self.paths[*index])
+    fn paths_snapshot(&self) -> Vec<Arc<Path>> {
+        self.registry.read().snapshot()
+    }
+
+    fn path(&self, path_id: PathId) -> Option<Arc<Path>> {
+        self.registry.read().path(path_id)
     }
 }
 impl Drop for Transport {
     fn drop(&mut self) {
         self.probe_task.abort();
-        for path in &self.paths {
-            path.conn
-                .lock()
-                .unwrap()
-                .close(0u32.into(), b"transport dropped");
+        let paths = self.registry.read().snapshot();
+        for path in paths {
+            path.conn.lock().close(0u32.into(), b"transport dropped");
         }
     }
 }
@@ -722,7 +825,7 @@ fn spawn_reader(
 
     tokio::spawn(async move {
         loop {
-            let conn = conn.lock().unwrap().clone();
+            let conn = conn.lock().clone();
             match conn.read_datagram().await {
                 Ok(d) => {
                     mark_recv();
@@ -747,7 +850,7 @@ fn spawn_reader(
                                 conn.send_datagram(multipass_proto::encode(&Frame::Pong { nonce }));
                         }
                         Some(Frame::Pong { nonce }) => {
-                            let mut inflight = probe.lock().unwrap();
+                            let mut inflight = probe.lock();
                             if let Some((probe_generation, probe_nonce, sent)) = *inflight
                                 && probe_generation == generation
                                 && probe_nonce == nonce
@@ -782,7 +885,7 @@ fn spawn_reader(
 /// Spawn a periodic probe task on each live path. Matching Pongs update the
 /// per-path RTT exposed through status.
 fn spawn_probe(
-    paths: Vec<Arc<Path>>,
+    registry: Arc<RwLock<Registry>>,
     dead_tx: &mpsc::Sender<PathId>,
 ) -> tokio::task::JoinHandle<()> {
     let dead_tx = dead_tx.clone();
@@ -791,11 +894,12 @@ fn spawn_probe(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            for p in &paths {
+            let paths = registry.read().snapshot();
+            for p in paths {
                 if !p.alive.load(Ordering::Acquire) {
                     continue;
                 }
-                let probe_state = *p.probe.lock().unwrap();
+                let probe_state = *p.probe.lock();
                 if let Some((probe_generation, _, sent)) = probe_state {
                     if sent.elapsed() < PROBE_TIMEOUT {
                         continue;
@@ -810,7 +914,7 @@ fn spawn_probe(
                 let nonce = p.probe_nonce.fetch_add(1, Ordering::Relaxed);
                 let datagram = multipass_proto::encode(&Frame::Ping { nonce });
                 let sent_generation = {
-                    let connection = p.conn.lock().unwrap();
+                    let connection = p.conn.lock();
                     let generation = p.generation.load(Ordering::Acquire);
                     connection
                         .send_datagram(datagram)
@@ -818,7 +922,7 @@ fn spawn_probe(
                         .then_some(generation)
                 };
                 if let Some(generation) = sent_generation {
-                    let mut inflight = p.probe.lock().unwrap();
+                    let mut inflight = p.probe.lock();
                     if p.alive.load(Ordering::Acquire)
                         && p.generation.load(Ordering::Acquire) == generation
                     {
@@ -833,16 +937,145 @@ fn spawn_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TestQuicConfig {
+        client: ClientConfig,
+        server: noq::ServerConfig,
+    }
+
+    fn test_quic_config() -> &'static TestQuicConfig {
+        use noq_proto::crypto::rustls::QuicServerConfig;
+        use rcgen::PublicKeyData as _;
+        use rustls::DistinguishedName;
+        use rustls::crypto::{CryptoProvider, verify_tls13_signature_with_raw_key};
+        use rustls::pki_types::{
+            CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer, UnixTime,
+        };
+        use rustls::server::AlwaysResolvesServerRawPublicKeys;
+        use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+        use rustls::sign::CertifiedKey;
+        use std::sync::LazyLock;
+
+        #[derive(Debug)]
+        struct PinnedTestClient {
+            pinned: identity::PublicKey,
+            provider: Arc<CryptoProvider>,
+        }
+
+        impl ClientCertVerifier for PinnedTestClient {
+            fn root_hint_subjects(&self) -> &[DistinguishedName] {
+                &[]
+            }
+
+            fn verify_client_cert(
+                &self,
+                end_entity: &CertificateDer<'_>,
+                intermediates: &[CertificateDer<'_>],
+                _now: UnixTime,
+            ) -> Result<ClientCertVerified, rustls::Error> {
+                if !intermediates.is_empty()
+                    || identity::public_key_from_spki(end_entity.as_ref()).map_err(|_| {
+                        rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+                    })? != self.pinned
+                {
+                    return Err(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::UnknownIssuer,
+                    ));
+                }
+                Ok(ClientCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Err(rustls::Error::General("TLS 1.2 is disabled".into()))
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                verify_tls13_signature_with_raw_key(
+                    message,
+                    &SubjectPublicKeyInfoDer::from(cert.as_ref()),
+                    dss,
+                    &self.provider.signature_verification_algorithms,
+                )
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                vec![rustls::SignatureScheme::ED25519]
+            }
+
+            fn requires_raw_public_keys(&self) -> bool {
+                true
+            }
+        }
+
+        static CONFIG: LazyLock<TestQuicConfig> = LazyLock::new(|| {
+            let client_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+            let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+            let client_identity =
+                identity::ClientIdentity::from_secure_bytes(client_key.serialize_der()).unwrap();
+            let server_public =
+                identity::public_key_from_spki(&server_key.subject_public_key_info()).unwrap();
+            let client =
+                identity::client_config(&client_identity, server_public, transport_config())
+                    .unwrap();
+
+            let provider = rustls::crypto::aws_lc_rs::default_provider();
+            let signing_key = provider
+                .key_provider
+                .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    server_key.serialize_der(),
+                )))
+                .unwrap();
+            let public_spki = signing_key.public_key().unwrap();
+            let certified_key = Arc::new(CertifiedKey::new(
+                vec![CertificateDer::from(public_spki.as_ref().to_vec())],
+                signing_key,
+            ));
+            let verifier = Arc::new(PinnedTestClient {
+                pinned: client_identity.public_key(),
+                provider: provider.clone().into(),
+            });
+            let mut tls = rustls::ServerConfig::builder_with_provider(provider.into())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(Arc::new(AlwaysResolvesServerRawPublicKeys::new(
+                    certified_key,
+                )));
+            tls.alpn_protocols = vec![ALPN.to_vec()];
+            let crypto = QuicServerConfig::try_from(tls).unwrap();
+            let mut server = noq::ServerConfig::with_crypto(Arc::new(crypto));
+            server.transport_config(transport_config());
+            TestQuicConfig { client, server }
+        });
+        &CONFIG
+    }
+
+    async fn connect_test_transport(server: SocketAddr, count: u16) -> Transport {
+        Transport::connect_with_client_config(
+            server,
+            test_dials(count),
+            test_quic_config().client.clone(),
+        )
+        .await
+        .unwrap()
+    }
 
     fn path(value: u16) -> PathId {
         PathId::new(value)
     }
 
-    fn test_connection(
-        path_id: u16,
-        uplink_id: &str,
-        connection: Connection,
-    ) -> UplinkConnection {
+    fn test_connection(path_id: u16, uplink_id: &str, connection: Connection) -> UplinkConnection {
         UplinkConnection {
             path_id: path(path_id),
             uplink_id: UplinkId::new(uplink_id).unwrap(),
@@ -869,7 +1102,11 @@ mod tests {
     /// Echo server: decodes replicated inbound data frames and re-sends each
     /// copy on the connection it arrived on; client dedup exposes one result.
     async fn spawn_echo_server() -> SocketAddr {
-        let server = Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server = Endpoint::server(
+            test_quic_config().server.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
         let addr = server.local_addr().unwrap();
         tokio::spawn(async move {
             while let Some(incoming) = server.accept().await {
@@ -892,7 +1129,11 @@ mod tests {
         addr
     }
     async fn spawn_close_observing_server() -> (SocketAddr, mpsc::Receiver<()>) {
-        let server = Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server = Endpoint::server(
+            test_quic_config().server.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
         let addr = server.local_addr().unwrap();
         let (closed_tx, closed_rx) = mpsc::channel(2);
         tokio::spawn(async move {
@@ -968,7 +1209,11 @@ mod tests {
 
     #[tokio::test]
     async fn silent_network_blackhole_closes_path_within_failover_bound() {
-        let server = Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server = Endpoint::server(
+            test_quic_config().server.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
         tokio::spawn(async move {
             let Some(incoming) = server.accept().await else {
@@ -978,9 +1223,14 @@ mod tests {
             let _ = conn.closed().await;
         });
         let (proxy, forwarding) = spawn_blackhole_proxy(server_addr).await;
-        let conn = dial(proxy, "127.0.0.1".parse().unwrap(), "blackhole-test")
-            .await
-            .unwrap();
+        let conn = dial(
+            proxy,
+            "127.0.0.1".parse().unwrap(),
+            "blackhole-test",
+            test_quic_config().client.clone(),
+        )
+        .await
+        .unwrap();
 
         forwarding.store(false, Ordering::Relaxed);
         tokio::time::timeout(Duration::from_secs(4), conn.closed())
@@ -990,7 +1240,11 @@ mod tests {
 
     #[tokio::test]
     async fn unanswered_probe_surfaces_path_death_once() {
-        let server = Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server = Endpoint::server(
+            test_quic_config().server.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
         tokio::spawn(async move {
             while let Some(incoming) = server.accept().await {
@@ -1007,13 +1261,27 @@ mod tests {
         });
         let (wired_proxy, wired_forwarding) =
             spawn_client_to_server_blackhole_proxy(server_addr).await;
-        let wired = dial(wired_proxy, "127.0.0.1".parse().unwrap(), "wired-test")
-            .await
-            .unwrap();
-        let wifi = dial(server_addr, "127.0.0.1".parse().unwrap(), "wifi-test")
-            .await
-            .unwrap();
-        let transport = Transport::from_connections(vec![test_connection(1, "wired", wired), test_connection(2, "wifi", wifi)]);
+        let wired = dial(
+            wired_proxy,
+            "127.0.0.1".parse().unwrap(),
+            "wired-test",
+            test_quic_config().client.clone(),
+        )
+        .await
+        .unwrap();
+        let wifi = dial(
+            server_addr,
+            "127.0.0.1".parse().unwrap(),
+            "wifi-test",
+            test_quic_config().client.clone(),
+        )
+        .await
+        .unwrap();
+        let transport = Transport::from_connections(vec![
+            test_connection(1, "wired", wired),
+            test_connection(2, "wifi", wifi),
+        ])
+        .unwrap();
 
         wired_forwarding.store(false, Ordering::Relaxed);
         let dead = tokio::time::timeout(Duration::from_secs(3), transport.recv_dead())
@@ -1033,9 +1301,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_transport_closes_both_connections() {
         let (addr, mut closed_rx) = spawn_close_observing_server().await;
-        let transport = Transport::connect(addr, test_dials(2))
-        .await
-        .unwrap();
+        let transport = connect_test_transport(addr, 2).await;
 
         drop(transport);
 
@@ -1050,9 +1316,7 @@ mod tests {
     #[tokio::test]
     async fn recv_data_reorders_striped_arrivals_before_delivery() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(addr, test_dials(2))
-        .await
-        .unwrap();
+        let t = connect_test_transport(addr, 2).await;
         mark_all_ready(&t);
 
         for data in [
@@ -1083,9 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn recv_data_releases_suffix_after_gap_timeout_without_new_arrivals() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(addr, test_dials(2))
-        .await
-        .unwrap();
+        let t = connect_test_transport(addr, 2).await;
         mark_all_ready(&t);
 
         for data in [
@@ -1115,9 +1377,7 @@ mod tests {
     #[tokio::test]
     async fn aggregated_send_stripes_and_delivers_once() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(addr, test_dials(2))
-        .await
-        .unwrap();
+        let t = connect_test_transport(addr, 2).await;
         mark_all_ready(&t);
 
         const N: u64 = 20;
@@ -1140,7 +1400,11 @@ mod tests {
         // sent once, on one path), not 2N as in replication. Every packet is
         // retained in the send window for possible retransmission.
         let st = t.status();
-        let total_tx_bytes: u64 = st.uplinks.iter().map(|uplink| uplink.transmitted_bytes).sum();
+        let total_tx_bytes: u64 = st
+            .uplinks
+            .iter()
+            .map(|uplink| uplink.transmitted_bytes)
+            .sum();
         let total_rx_bytes: u64 = st.uplinks.iter().map(|uplink| uplink.received_bytes).sum();
         assert_eq!(
             total_tx_bytes,
@@ -1158,9 +1422,7 @@ mod tests {
     #[tokio::test]
     async fn datagram_capacity_supports_tunnel_mtu() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(addr, test_dials(2))
-        .await
-        .unwrap();
+        let t = connect_test_transport(addr, 2).await;
 
         const REQUIRED: usize = multipass_proto::TUNNEL_MTU as usize + 9;
         for path_id in t.path_ids() {
@@ -1180,9 +1442,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_data_reports_send_failure() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(addr, test_dials(2))
-        .await
-        .unwrap();
+        let t = connect_test_transport(addr, 2).await;
         t.mark_ready(path(1));
 
         assert!(!t.send_data(1, Bytes::from(vec![0; 64 * 1024])));
@@ -1199,9 +1459,7 @@ mod tests {
     #[tokio::test]
     async fn path_death_retransmits_unacked_on_survivor() {
         let addr = spawn_echo_server().await;
-        let t = Transport::connect(addr, test_dials(2))
-        .await
-        .unwrap();
+        let t = connect_test_transport(addr, 2).await;
         mark_all_ready(&t);
 
         // Send a few packets; they stripe across paths and stay unacked
@@ -1218,7 +1476,9 @@ mod tests {
         // Kill the wired path at the connection level. The reader task marks
         // it dead; recv_dead triggers retransmission of all unacked packets
         // onto the surviving wifi path.
-        t.connection(path(1)).unwrap().close(0u32.into(), b"test: kill wired");
+        t.connection(path(1))
+            .unwrap()
+            .close(0u32.into(), b"test: kill wired");
         let dead = tokio::time::timeout(Duration::from_secs(2), t.recv_dead())
             .await
             .expect("wired death must surface");

@@ -29,47 +29,54 @@ nonisolated enum DaemonRequest: Encodable, Sendable, Equatable {
     }
 }
 
-/// Which underlay path is currently winning the dedup race (delivering the
-/// first copy of each packet). Drives the failover flash in the UI.
-nonisolated enum ActivePath: String, Decodable, Sendable {
-    case wired
-    case wifi
-
-    var displayName: String {
-        switch self {
-        case .wired: "Wired"
-        case .wifi: "Wi-Fi"
-        }
-    }
-}
-
-/// `{"type":"status", ...}` payload. `tx`/`rx` are cumulative tunnel byte
-/// counters since the daemon (re)started the session.
-nonisolated struct StatusSnapshot: Decodable, Sendable {
-    var connected: Bool
-    var wired: Bool
-    var wifi: Bool
-    var activePath: ActivePath?
-    var rttMs: Double?
-    var tx: UInt64
-    var rx: UInt64
-    var wiredTx: UInt64
-    var wiredRx: UInt64
-    var wifiTx: UInt64
-    var wifiRx: UInt64
+/// One configured underlay in the daemon's ordered status snapshot.
+nonisolated struct UplinkSnapshot: Decodable, Sendable, Equatable {
+    let id: String
+    let displayName: String
+    let interface: String
+    let configuredEnabled: Bool
+    let state: String
+    let ready: Bool
+    let sourceAddress: String?
+    let gatewayEndpoint: String?
+    let rttMs: Double?
+    let tx: UInt64
+    let rx: UInt64
+    let lastError: String?
 
     private enum CodingKeys: String, CodingKey {
-        case connected
-        case wired
-        case wifi
-        case activePath = "active_path"
+        case id
+        case displayName = "display_name"
+        case interface
+        case configuredEnabled = "configured_enabled"
+        case state
+        case ready
+        case sourceAddress = "source_address"
+        case gatewayEndpoint = "gateway_endpoint"
         case rttMs = "rtt_ms"
         case tx
         case rx
-        case wiredTx = "wired_tx"
-        case wiredRx = "wired_rx"
-        case wifiTx = "wifi_tx"
-        case wifiRx = "wifi_rx"
+        case lastError = "last_error"
+    }
+}
+
+/// `{"type":"status", ...}` payload. All values are immutable and
+/// `Sendable` so the daemon actor can hand the snapshot to MainActor UI state.
+nonisolated struct StatusSnapshot: Decodable, Sendable, Equatable {
+    let enabled: Bool
+    let connected: Bool
+    let activeUplinkID: String?
+    let tx: UInt64
+    let rx: UInt64
+    let uplinks: [UplinkSnapshot]
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case connected
+        case activeUplinkID = "active_uplink_id"
+        case tx
+        case rx
+        case uplinks
     }
 }
 
@@ -77,7 +84,7 @@ nonisolated struct BenchmarkPath: Codable, Sendable, Equatable {
     var id: String
     var displayName: String
     var interface: String
-    var sourceAddress: String
+    var sourceAddress: String?
 
     private enum CodingKeys: String, CodingKey {
         case id

@@ -176,7 +176,7 @@ private struct MenuBarIcon: View {
     private var symbolName: String {
         switch controller.state {
         case .connected:
-            if controller.failoverTo != nil {
+            if controller.failoverToID != nil {
                 return "arrow.triangle.2.circlepath"
             }
             return "point.3.filled.connected.trianglepath.dotted"
@@ -193,6 +193,6 @@ private struct MenuBarIcon: View {
         Image(systemName: symbolName)
             .symbolRenderingMode(.monochrome)
             .contentTransition(.symbolEffect(.replace))
-            .symbolEffect(.bounce, value: controller.failoverTo)
+            .symbolEffect(.bounce, value: controller.failoverToID)
     }
 }

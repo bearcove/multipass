@@ -1,94 +1,31 @@
-//! multipass-server — the router side of the multipass failover VPN.
+//! multipass-server — the authenticated router side of the multipass VPN.
 //!
-//! Listens on `0.0.0.0:51823` (noq QUIC, ALPN `multipass/0`). The client
-//! opens TWO independent connections (one per interface: wired + wifi); the
-//! server treats them as one logical session and the client sends every Data
-//! frame on both, so the server dedups inbound by `seq` (see
-//! `multipass_proto::Dedup`).
-//!
-//! Owns a Linux TUN device on 10.10.99.0/24 (server .1, client .2). Inbound
-//! frames are decapsulated and written to the TUN; outbound packets read from
-//! the TUN are wrapped as Data frames and sent on every live client
-//! connection (active-active redundancy, same as the proven transport).
+//! One logical client session may use any number of mutually authenticated
+//! uplink connections. The current tunnel address contract serves one active
+//! client identity at a time.
 
+mod config;
+mod identity;
 mod tun;
 
 use std::collections::HashSet;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use multipass_proto::{
-    Frame, PathId, ReorderBuffer, ReorderInsert, SackScoreboard, Scheduler, SendWindow,
+    ClientId, Frame, PathId, ReorderBuffer, ReorderInsert, SackScoreboard, Scheduler, SendWindow,
     TUNNEL_CLIENT, TUNNEL_MTU, TUNNEL_PREFIX, UplinkId, encode,
 };
-use noq::{Connection, Endpoint, ServerConfig, TransportConfig};
-use noq_proto::crypto::rustls::QuicServerConfig;
+use noq::{Connection, Endpoint, TransportConfig};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
-
-/// Server bind.
-const BIND_DEFAULT: &str = "0.0.0.0:51823";
 
 /// Outbound/inbound channel capacity to/from the TUN reader/writer threads.
 const TUN_CHANNEL: usize = 1024;
 const REORDER_GAP_TIMEOUT: Duration = Duration::from_millis(50);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ServerOptions {
-    bind: SocketAddr,
-    ipv6_server: Ipv6Addr,
-    ipv6_client: Ipv6Addr,
-}
-
-impl ServerOptions {
-    fn new(bind: SocketAddr, prefix: Ipv6Addr) -> Self {
-        let base = u128::from(prefix);
-        Self {
-            bind,
-            ipv6_server: Ipv6Addr::from(base | 1),
-            ipv6_client: Ipv6Addr::from(base | 2),
-        }
-    }
-
-    fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Self, String> {
-        let mut args = args.into_iter();
-        let program = args
-            .next()
-            .map(|value| value.as_ref().to_owned())
-            .unwrap_or_else(|| "multipass-server".into());
-        let values = args
-            .map(|value| value.as_ref().to_owned())
-            .collect::<Vec<_>>();
-        let (bind, prefix) = match values.as_slice() {
-            [prefix] => (
-                BIND_DEFAULT.parse().expect("valid default bind"),
-                prefix.as_str(),
-            ),
-            [bind, prefix] => (
-                bind.parse::<SocketAddr>()
-                    .map_err(|error| format!("invalid bind address: {error}"))?,
-                prefix.as_str(),
-            ),
-            _ => return Err(format!("usage: {program} [bind] <ipv6-prefix/64>")),
-        };
-        let (address, length) = prefix
-            .split_once('/')
-            .ok_or_else(|| "IPv6 prefix must include /64".to_owned())?;
-        if length != "64" {
-            return Err("IPv6 tunnel prefix must be /64".into());
-        }
-        let address = address
-            .parse::<Ipv6Addr>()
-            .map_err(|error| format!("invalid IPv6 tunnel prefix: {error}"))?;
-        if u128::from(address) & u64::MAX as u128 != 0 {
-            return Err("IPv6 tunnel prefix must not contain host bits".into());
-        }
-        Ok(Self::new(bind, address))
-    }
-}
 
 fn transport() -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
@@ -104,27 +41,6 @@ fn transport() -> Arc<TransportConfig> {
     Arc::new(tc)
 }
 
-fn server_config() -> ServerConfig {
-    let cert = rcgen::generate_simple_self_signed(vec!["multipass".into()])
-        .expect("generate self-signed cert");
-    let der = rustls::pki_types::CertificateDer::from(cert.cert);
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
-    let mut tls = rustls::ServerConfig::builder_with_provider(provider.into())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3 configuration")
-        .with_no_client_auth()
-        .with_single_cert(vec![der], key.into())
-        .expect("server config with cert");
-    tls.alpn_protocols = vec![multipass_proto::ALPN.to_vec()];
-
-    let crypto = QuicServerConfig::try_from(tls).expect("QUIC server config");
-    let mut cfg = ServerConfig::with_crypto(Arc::new(crypto));
-    cfg.transport_config(transport());
-    cfg
-}
-
 /// One client connection and its authenticated uplink registration.
 struct LiveConn {
     id: u64,
@@ -137,6 +53,7 @@ struct LiveConn {
 
 struct SessionState {
     conns: Vec<LiveConn>,
+    active_client_id: Option<ClientId>,
     epoch: Option<u64>,
     retired_epochs: HashSet<u64>,
     /// Receive scoreboard for client→server packets; generates SACKs.
@@ -149,6 +66,16 @@ struct SessionState {
     send_window: SendWindow,
     /// Path scheduler for server→client aggregation (the download direction).
     scheduler: Scheduler,
+}
+
+struct UplinkAuthentication<'a> {
+    authenticated_client_id: &'a ClientId,
+    claimed_client_id: &'a ClientId,
+    connection_id: u64,
+    epoch: u64,
+    uplink_id: UplinkId,
+    path_id: PathId,
+    generation: u64,
 }
 
 /// A single logical client session. Connection authentication, epoch changes,
@@ -164,6 +91,7 @@ impl Session {
         Self {
             state: Mutex::new(SessionState {
                 conns: Vec::new(),
+                active_client_id: None,
                 epoch: None,
                 retired_epochs: HashSet::new(),
                 scoreboard: SackScoreboard::new(),
@@ -210,15 +138,25 @@ impl Session {
         debug!(id, "connection removed from session");
     }
 
-    async fn authenticate_uplink(
-        &self,
-        id: u64,
-        epoch: u64,
-        uplink_id: UplinkId,
-        path_id: PathId,
-        generation: u64,
-    ) -> bool {
+    async fn authenticate_uplink(&self, authentication: UplinkAuthentication<'_>) -> bool {
+        let UplinkAuthentication {
+            authenticated_client_id,
+            claimed_client_id,
+            connection_id: id,
+            epoch,
+            uplink_id,
+            path_id,
+            generation,
+        } = authentication;
+        if authenticated_client_id != claimed_client_id {
+            return false;
+        }
         let mut state = self.state.lock().await;
+        if let Some(active) = &state.active_client_id
+            && active != authenticated_client_id
+        {
+            return false;
+        }
         let Some(index) = state.conns.iter().position(|conn| conn.id == id) else {
             return false;
         };
@@ -278,13 +216,13 @@ impl Session {
             state.send_window = SendWindow::new(4096);
             state.scheduler = Scheduler::new();
             self.seq.store(1, Ordering::Relaxed);
-        } else if let Some(replace_id) = replace_connection_id {
-            if let Some(existing_index) = state.conns.iter().position(|conn| conn.id == replace_id) {
-                if let Some(handle) = state.conns[existing_index].conn.take() {
-                    handle.close(0u32.into(), b"uplink generation replaced");
-                }
-                state.conns.remove(existing_index);
+        } else if let Some(replace_id) = replace_connection_id
+            && let Some(existing_index) = state.conns.iter().position(|conn| conn.id == replace_id)
+        {
+            if let Some(handle) = state.conns[existing_index].conn.take() {
+                handle.close(0u32.into(), b"uplink generation replaced");
             }
+            state.conns.remove(existing_index);
         }
 
         let Some(conn) = state.conns.iter_mut().find(|conn| conn.id == id) else {
@@ -296,18 +234,24 @@ impl Session {
         conn.generation = Some(generation);
         state.scheduler.insert(path_id);
         state.scheduler.set_eligible(path_id, true);
+        if state.active_client_id.is_none() {
+            state.active_client_id = Some(authenticated_client_id.clone());
+        }
         true
     }
 
     #[cfg(test)]
     async fn authenticate(&self, id: u64, epoch: u64) -> bool {
-        self.authenticate_uplink(
-            id,
+        let client_id = ClientId::new("test-client").unwrap();
+        self.authenticate_uplink(UplinkAuthentication {
+            authenticated_client_id: &client_id,
+            claimed_client_id: &client_id,
+            connection_id: id,
             epoch,
-            UplinkId::new(format!("test-{id}")).unwrap(),
-            PathId::new(u16::try_from(id + 1).unwrap()),
-            1,
-        )
+            uplink_id: UplinkId::new(format!("test-{id}")).unwrap(),
+            path_id: PathId::new(u16::try_from(id + 1).unwrap()),
+            generation: 1,
+        })
         .await
     }
 
@@ -551,9 +495,10 @@ fn server_assignment(ipv6_client: Ipv6Addr) -> Frame {
     }
 }
 
-/// Drive one client connection: read datagrams, decode, dispatch.
+/// Drive one mutually authenticated client connection.
 async fn conn_handler(
     conn: Connection,
+    authenticated_client_id: ClientId,
     id: u64,
     session: Arc<Session>,
     to_tun: mpsc::Sender<Bytes>,
@@ -568,19 +513,22 @@ async fn conn_handler(
                 };
                 match frame {
                     Frame::Hello {
+                        client_id,
                         client_epoch,
                         uplink_id,
                         path_id,
                         connection_generation,
                     } => {
                         if !session
-                            .authenticate_uplink(
-                                id,
-                                client_epoch,
-                                uplink_id.clone(),
+                            .authenticate_uplink(UplinkAuthentication {
+                                authenticated_client_id: &authenticated_client_id,
+                                claimed_client_id: &client_id,
+                                connection_id: id,
+                                epoch: client_epoch,
+                                uplink_id: uplink_id.clone(),
                                 path_id,
-                                connection_generation,
-                            )
+                                generation: connection_generation,
+                            })
                             .await
                         {
                             break;
@@ -589,7 +537,7 @@ async fn conn_handler(
                         if conn.send_datagram(encode(&assign)).is_err() {
                             break;
                         }
-                        info!(id, client_epoch, uplink = %uplink_id, path_id = path_id.get(), connection_generation, "answered Hello: assigned");
+                        info!(id, client = %authenticated_client_id, client_epoch, uplink = %uplink_id, path_id = path_id.get(), connection_generation, "answered authenticated Hello: assigned");
                     }
                     Frame::Data { seq, packet } => {
                         for packet in session.accept_packet(id, seq, packet).await {
@@ -621,9 +569,15 @@ async fn conn_handler(
     }
 }
 
-async fn run(options: ServerOptions) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tun = tun::open(options.ipv6_server)?;
-    info!(name = %tun.name, ipv6 = %options.ipv6_server, "TUN device up");
+async fn run(
+    runtime: config::ServerRuntimeConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config::ServerRuntimeConfig { config, identity } = runtime;
+    let base = u128::from(config.routed_ipv6_prefix);
+    let ipv6_server = Ipv6Addr::from(base | 1);
+    let ipv6_client = Ipv6Addr::from(base | 2);
+    let tun = tun::open(ipv6_server)?;
+    info!(name = %tun.name, ipv6 = %ipv6_server, "TUN device up");
 
     // Spawn a reader thread (blocking read => packets as Bytes) and a writer
     // thread (Bytes => blocking write). Channels bridge them to the async
@@ -693,8 +647,10 @@ async fn run(options: ServerOptions) -> Result<(), Box<dyn std::error::Error + S
         });
     }
 
-    let server = Endpoint::server(server_config(), options.bind)?;
-    info!(addr = %server.local_addr()?, "listening for client connections");
+    let authorized_clients = identity::AuthorizedClients::new(&config.authorized_clients);
+    let server_tls = identity::server_config(&identity, authorized_clients.clone(), transport())?;
+    let server = Endpoint::server(server_tls, config.bind)?;
+    info!(addr = %server.local_addr()?, server_key = %identity.public_key(), "listening for authenticated client connections");
 
     let session = Arc::new(Session::new());
     // A missing striped packet can stall inner TCP, so recovery must not wait
@@ -735,18 +691,23 @@ async fn run(options: ServerOptions) -> Result<(), Box<dyn std::error::Error + S
                 let Some(incoming) = incoming else { break };
                 let session = session.clone();
                 let to_tun = to_tun_tx.clone();
+                let authorized_clients = authorized_clients.clone();
                 tokio::spawn(async move {
                     let conn = match incoming.await {
                         Ok(c) => c,
-                        Err(e) => { warn!(%e, "handshake failed"); return; }
+                        Err(e) => { warn!(%e, "mutual-auth handshake failed"); return; }
+                    };
+                    let authenticated_client_id = match authorized_clients.client_id_for_connection(&conn) {
+                        Ok(id) => id,
+                        Err(error) => { warn!(%error, "authenticated peer identity unavailable"); return; }
                     };
                     let remote = conn.path(noq_proto::PathId::ZERO)
                         .and_then(|p| p.remote_address().ok());
-                    info!(remote = ?remote, "client connection established");
+                    info!(client = %authenticated_client_id, remote = ?remote, "authenticated client connection established");
                     let id = session.add_conn(conn.clone()).await;
-                    conn_handler(conn, id, session.clone(), to_tun, options.ipv6_client).await;
+                    conn_handler(conn, authenticated_client_id.clone(), id, session.clone(), to_tun, ipv6_client).await;
                     session.remove_conn(id).await;
-                    info!(id, remote = ?remote, "client connection closed");
+                    info!(id, client = %authenticated_client_id, remote = ?remote, "client connection closed");
                 });
             }
             // A packet read from the TUN: aggregate onto the best live connection.
@@ -781,27 +742,28 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    let options = ServerOptions::parse(std::env::args())?;
-
+    let args = std::env::args().collect::<Vec<_>>();
+    let config_path = match args.as_slice() {
+        [_, flag, path] if flag == "--config" => path,
+        [program, ..] => return Err(format!("usage: {program} --config <path>").into()),
+        [] => return Err("usage: multipass-server --config <path>".into()),
+    };
+    let config = config::ServerConfigFile::load_validated_runtime(config_path)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(options))
+    rt.block_on(run(config))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::net::Ipv6Addr;
     use std::time::Duration;
 
     use bytes::Bytes;
 
-    use noq::Endpoint;
-
-    use super::{
-        Frame, REORDER_GAP_TIMEOUT, ServerOptions, Session, server_assignment, server_config,
-    };
-    use multipass_proto::{PathId, TUNNEL_CLIENT, TUNNEL_PREFIX, UplinkId, encode};
+    use super::{Frame, REORDER_GAP_TIMEOUT, Session, UplinkAuthentication, server_assignment};
+    use multipass_proto::{ClientId, PathId, TUNNEL_CLIENT, TUNNEL_PREFIX, UplinkId, encode};
 
     #[tokio::test]
     async fn new_client_epoch_evicts_old_connections_and_rejects_rollback() {
@@ -902,24 +864,6 @@ mod tests {
         assert!(session.authenticate(conn, 10).await);
         assert!(!session.authenticate(conn, 20).await);
     }
-    #[tokio::test]
-    async fn production_server_negotiates_wire_protocol_alpn() {
-        let server = Endpoint::server(
-            server_config(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-        )
-        .unwrap();
-        let server_addr = server.local_addr().unwrap();
-
-        let client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
-        client.set_default_client_config(multipass::client_config());
-        let connecting = client.connect(server_addr, multipass::SERVER_NAME).unwrap();
-
-        let (accepted, connected) =
-            tokio::join!(async { server.accept().await.unwrap().await }, connecting,);
-        accepted.unwrap();
-        connected.unwrap();
-    }
 
     #[tokio::test]
     async fn server_generates_sack_with_gap() {
@@ -966,9 +910,10 @@ mod tests {
     #[test]
     fn configured_prefix_drives_server_and_client_addresses() {
         let prefix = Ipv6Addr::new(0x2001, 0xdb8, 0x1234, 0x5678, 0, 0, 0, 0);
-        let options = ServerOptions::new("127.0.0.1:51823".parse().unwrap(), prefix);
+        let ipv6_server = Ipv6Addr::from(u128::from(prefix) | 1);
+        let ipv6_client = Ipv6Addr::from(u128::from(prefix) | 2);
 
-        let assign = server_assignment(options.ipv6_client);
+        let assign = server_assignment(ipv6_client);
         let encoded = encode(&assign);
         let decoded = multipass_proto::decode(&encoded).unwrap();
         match decoded {
@@ -978,43 +923,13 @@ mod tests {
                 assert_eq!(ipv4, Some((TUNNEL_CLIENT, TUNNEL_PREFIX)));
                 assert_eq!(ipv6, Some(("2001:db8:1234:5678::2".parse().unwrap(), 64)));
                 assert_eq!(
-                    options.ipv6_server,
+                    ipv6_server,
                     "2001:db8:1234:5678::1".parse::<Ipv6Addr>().unwrap()
                 );
                 assert_eq!(mtu, 1280);
             }
             _ => panic!("expected Assign"),
         }
-    }
-
-    #[test]
-    fn runtime_prefix_accepts_default_and_explicit_bind_forms() {
-        let default = ServerOptions::parse(["multipass-server", "2001:db8::/64"]).unwrap();
-        assert_eq!(default.bind, "0.0.0.0:51823".parse().unwrap());
-        assert_eq!(
-            default.ipv6_client,
-            "2001:db8::2".parse::<Ipv6Addr>().unwrap()
-        );
-
-        let explicit =
-            ServerOptions::parse(["multipass-server", "127.0.0.1:51999", "2001:db8:1234::/64"])
-                .unwrap();
-        assert_eq!(explicit.bind, "127.0.0.1:51999".parse().unwrap());
-        assert_eq!(
-            explicit.ipv6_client,
-            "2001:db8:1234::2".parse::<Ipv6Addr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn runtime_prefix_rejects_non_64_and_host_bits() {
-        assert!(
-            ServerOptions::parse(["multipass-server", "127.0.0.1:51823", "2001:db8::/56"]).is_err()
-        );
-        assert!(
-            ServerOptions::parse(["multipass-server", "127.0.0.1:51823", "2001:db8::1/64"])
-                .is_err()
-        );
     }
 
     #[test]
@@ -1027,6 +942,31 @@ mod tests {
             _ => panic!("expected Assign"),
         }
     }
+    fn client() -> ClientId {
+        ClientId::new("test-client").unwrap()
+    }
+
+    async fn authenticate_uplink(
+        session: &Session,
+        conn: u64,
+        epoch: u64,
+        uplink: &str,
+        path: u16,
+        generation: u64,
+    ) -> bool {
+        let client = client();
+        session
+            .authenticate_uplink(UplinkAuthentication {
+                authenticated_client_id: &client,
+                claimed_client_id: &client,
+                connection_id: conn,
+                epoch,
+                uplink_id: UplinkId::new(uplink).unwrap(),
+                path_id: PathId::new(path),
+                generation,
+            })
+            .await
+    }
 
     #[tokio::test]
     async fn server_registers_three_explicit_uplinks_in_one_epoch() {
@@ -1034,19 +974,19 @@ mod tests {
         for id in 1..=3 {
             let conn = session.add_test_conn().await;
             assert!(
-                session
-                    .authenticate_uplink(
-                        conn,
-                        10,
-                        UplinkId::new(format!("uplink-{id}")).unwrap(),
-                        PathId::new(id as u16),
-                        1,
-                    )
+                authenticate_uplink(&session, conn, 10, &format!("uplink-{id}"), id as u16, 1,)
                     .await
             );
         }
         let state = session.state.lock().await;
-        assert_eq!(state.conns.iter().filter(|conn| conn.epoch == Some(10)).count(), 3);
+        assert_eq!(
+            state
+                .conns
+                .iter()
+                .filter(|conn| conn.epoch == Some(10))
+                .count(),
+            3
+        );
         assert_eq!(state.scheduler.len(), 3);
     }
 
@@ -1055,12 +995,12 @@ mod tests {
         let session = Session::new();
         let old_wifi = session.add_test_conn().await;
         let ethernet = session.add_test_conn().await;
-        assert!(session.authenticate_uplink(old_wifi, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 1).await);
-        assert!(session.authenticate_uplink(ethernet, 10, UplinkId::new("ethernet").unwrap(), PathId::new(2), 1).await);
+        assert!(authenticate_uplink(&session, old_wifi, 10, "wifi", 1, 1).await);
+        assert!(authenticate_uplink(&session, ethernet, 10, "ethernet", 2, 1).await);
 
         let new_wifi = session.add_test_conn().await;
-        assert!(session.authenticate_uplink(new_wifi, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 2).await);
-        assert!(!session.authenticate_uplink(old_wifi, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 1).await);
+        assert!(authenticate_uplink(&session, new_wifi, 10, "wifi", 1, 2).await);
+        assert!(!authenticate_uplink(&session, old_wifi, 10, "wifi", 1, 1).await);
         assert!(session.accept_data(ethernet, 1).await);
         assert!(session.accept_data(new_wifi, 2).await);
     }
@@ -1069,24 +1009,24 @@ mod tests {
     async fn server_rejects_stale_generation_and_conflicting_path_id() {
         let session = Session::new();
         let wifi = session.add_test_conn().await;
-        assert!(session.authenticate_uplink(wifi, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 3).await);
+        assert!(authenticate_uplink(&session, wifi, 10, "wifi", 1, 3).await);
 
         let stale = session.add_test_conn().await;
-        assert!(!session.authenticate_uplink(stale, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 2).await);
+        assert!(!authenticate_uplink(&session, stale, 10, "wifi", 1, 2).await);
         let conflict = session.add_test_conn().await;
-        assert!(!session.authenticate_uplink(conflict, 10, UplinkId::new("ethernet").unwrap(), PathId::new(1), 1).await);
+        assert!(!authenticate_uplink(&session, conflict, 10, "ethernet", 1, 1).await);
     }
 
     #[tokio::test]
     async fn retired_epoch_rejection_does_not_mutate_valid_session() {
         let session = Session::new();
         let old = session.add_test_conn().await;
-        assert!(session.authenticate_uplink(old, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 3).await);
+        assert!(authenticate_uplink(&session, old, 10, "wifi", 1, 3).await);
         let current = session.add_test_conn().await;
-        assert!(session.authenticate_uplink(current, 20, UplinkId::new("wifi").unwrap(), PathId::new(1), 0).await);
+        assert!(authenticate_uplink(&session, current, 20, "wifi", 1, 0).await);
 
         let rollback = session.add_test_conn().await;
-        assert!(!session.authenticate_uplink(rollback, 10, UplinkId::new("ethernet").unwrap(), PathId::new(2), 0).await);
+        assert!(!authenticate_uplink(&session, rollback, 10, "ethernet", 2, 0).await);
         assert_eq!(session.state.lock().await.epoch, Some(20));
         assert!(session.accept_data(current, 1).await);
     }
@@ -1095,12 +1035,120 @@ mod tests {
     async fn new_epoch_restarts_uplink_generation() {
         let session = Session::new();
         let old = session.add_test_conn().await;
-        assert!(session.authenticate_uplink(old, 10, UplinkId::new("wifi").unwrap(), PathId::new(1), 3).await);
+        assert!(authenticate_uplink(&session, old, 10, "wifi", 1, 3).await);
 
         let restarted = session.add_test_conn().await;
-        assert!(session.authenticate_uplink(restarted, 20, UplinkId::new("wifi").unwrap(), PathId::new(1), 0).await);
+        assert!(authenticate_uplink(&session, restarted, 20, "wifi", 1, 0).await);
         assert_eq!(session.state.lock().await.epoch, Some(20));
         assert!(session.accept_data(restarted, 1).await);
+    }
+
+    #[tokio::test]
+    async fn claimed_client_id_mismatch_is_rejected_before_session_mutation() {
+        let session = Session::new();
+        let conn = session.add_test_conn().await;
+        let authenticated = ClientId::new("scooter").unwrap();
+        let claimed = ClientId::new("intruder").unwrap();
+
+        assert!(
+            !session
+                .authenticate_uplink(UplinkAuthentication {
+                    authenticated_client_id: &authenticated,
+                    claimed_client_id: &claimed,
+                    connection_id: conn,
+                    epoch: 10,
+                    uplink_id: UplinkId::new("wifi").unwrap(),
+                    path_id: PathId::new(1),
+                    generation: 1,
+                })
+                .await
+        );
+        assert!(session.state.lock().await.active_client_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_first_hello_does_not_claim_active_client_identity() {
+        let session = Session::new();
+        {
+            let mut state = session.state.lock().await;
+            state.retired_epochs.insert(10);
+        }
+
+        let rejected_conn = session.add_test_conn().await;
+        let first = ClientId::new("scooter").unwrap();
+        assert!(
+            !session
+                .authenticate_uplink(UplinkAuthentication {
+                    authenticated_client_id: &first,
+                    claimed_client_id: &first,
+                    connection_id: rejected_conn,
+                    epoch: 10,
+                    uplink_id: UplinkId::new("wifi").unwrap(),
+                    path_id: PathId::new(1),
+                    generation: 1,
+                })
+                .await
+        );
+        assert!(session.state.lock().await.active_client_id.is_none());
+
+        let accepted_conn = session.add_test_conn().await;
+        let second = ClientId::new("laptop").unwrap();
+        assert!(
+            session
+                .authenticate_uplink(UplinkAuthentication {
+                    authenticated_client_id: &second,
+                    claimed_client_id: &second,
+                    connection_id: accepted_conn,
+                    epoch: 20,
+                    uplink_id: UplinkId::new("ethernet").unwrap(),
+                    path_id: PathId::new(2),
+                    generation: 1,
+                })
+                .await
+        );
+        assert_eq!(
+            session.state.lock().await.active_client_id.as_ref(),
+            Some(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn second_authorized_identity_is_rejected_without_mutating_active_session() {
+        let session = Session::new();
+        let first_conn = session.add_test_conn().await;
+        let first = ClientId::new("scooter").unwrap();
+        assert!(
+            session
+                .authenticate_uplink(UplinkAuthentication {
+                    authenticated_client_id: &first,
+                    claimed_client_id: &first,
+                    connection_id: first_conn,
+                    epoch: 10,
+                    uplink_id: UplinkId::new("wifi").unwrap(),
+                    path_id: PathId::new(1),
+                    generation: 1,
+                })
+                .await
+        );
+
+        let second_conn = session.add_test_conn().await;
+        let second = ClientId::new("laptop").unwrap();
+        assert!(
+            !session
+                .authenticate_uplink(UplinkAuthentication {
+                    authenticated_client_id: &second,
+                    claimed_client_id: &second,
+                    connection_id: second_conn,
+                    epoch: 20,
+                    uplink_id: UplinkId::new("ethernet").unwrap(),
+                    path_id: PathId::new(2),
+                    generation: 1,
+                })
+                .await
+        );
+        let state = session.state.lock().await;
+        assert_eq!(state.active_client_id.as_ref(), Some(&first));
+        assert_eq!(state.epoch, Some(10));
     }
 
     #[tokio::test]

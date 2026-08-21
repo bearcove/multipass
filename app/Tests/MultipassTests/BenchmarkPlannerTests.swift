@@ -183,10 +183,60 @@ struct BenchmarkPlannerTests {
         #expect(Set(aggregateMemberIDs(in: first)) == Set(aggregateMemberIDs(in: reordered)))
     }
 
-    @Test("rejects an empty physical path list")
+    @Test("plans tunnel benchmarks when no physical uplinks have source addresses")
+    func plansTunnelOnlyForUnavailablePhysicalPaths() throws {
+        let unavailable = BenchmarkPath(
+            id: "waiting",
+            displayName: "Waiting Ethernet",
+            interface: "en17",
+            sourceAddress: nil
+        )
+
+        let plan = try BenchmarkPlanner.plan(
+            topology: topology(paths: [unavailable]),
+            parameters: .init()
+        )
+
+        #expect(plan.invocations.map(\.id) == [
+            .init(route: .tunnel, direction: .upload, addressFamily: .ipv4),
+            .init(route: .tunnel, direction: .download, addressFamily: .ipv4),
+            .init(route: .tunnel, direction: .upload, addressFamily: .ipv6),
+            .init(route: .tunnel, direction: .download, addressFamily: .ipv6),
+        ])
+    }
+
+    @Test("unavailable physical paths are excluded without reordering available paths")
+    func excludesUnavailablePhysicalPaths() throws {
+        let unavailable = BenchmarkPath(
+            id: "waiting",
+            displayName: "Waiting Ethernet",
+            interface: "en17",
+            sourceAddress: nil
+        )
+
+        let plan = try BenchmarkPlanner.plan(
+            topology: topology(paths: [wifi, unavailable, wired]),
+            parameters: .init()
+        )
+        let physicalIDs = plan.invocations.map(\.id).filter { $0.route != .tunnel }
+
+        #expect(physicalIDs == [
+            .init(route: .physical(pathID: "wifi"), direction: .upload, addressFamily: .ipv4),
+            .init(route: .physical(pathID: "wifi"), direction: .download, addressFamily: .ipv4),
+            .init(route: .physical(pathID: "wired"), direction: .upload, addressFamily: .ipv4),
+            .init(route: .physical(pathID: "wired"), direction: .download, addressFamily: .ipv4),
+            .init(route: .physicalAggregate, direction: .upload, addressFamily: .ipv4),
+            .init(route: .physicalAggregate, direction: .download, addressFamily: .ipv4),
+        ])
+    }
+
+    @Test("rejects a topology with no physical paths and no tunnel targets")
     func rejectsEmptyPaths() {
         #expect(throws: BenchmarkPlanningError.emptyPaths) {
-            try BenchmarkPlanner.plan(topology: topology(paths: []), parameters: .init())
+            try BenchmarkPlanner.plan(
+                topology: topology(tunnelIPv4Target: nil, tunnelIPv6Target: nil, paths: []),
+                parameters: .init()
+            )
         }
     }
 
@@ -208,7 +258,7 @@ struct BenchmarkPlannerTests {
     }
 
     @Test(arguments: ["", "not an address", "999.10.10.10", "fd00:99::2"])
-    func rejectsMissingOrInvalidPhysicalIPv4SourceAddress(sourceAddress: String) {
+    func rejectsInvalidPhysicalIPv4SourceAddress(sourceAddress: String) {
         let invalid = BenchmarkPath(
             id: "invalid",
             displayName: "Invalid",

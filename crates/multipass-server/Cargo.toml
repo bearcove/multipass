@@ -9,6 +9,7 @@ description = "multipass server (router): accept dual connections, decapsulate, 
 [dependencies]
 multipass-proto = { path = "../multipass-proto" }
 bytes.workspace = true
+base64.workspace = true
 noq.workspace = true
 noq-proto.workspace = true
 rcgen.workspace = true
@@ -19,6 +20,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 libc.workspace = true
 n0-error.workspace = true
+facet.workspace = true
+facet-json.workspace = true
 
-[dev-dependencies]
-multipass = { path = "../multipass" }

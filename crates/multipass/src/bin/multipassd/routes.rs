@@ -1,18 +1,10 @@
-//! Full-tunnel routing. Two jobs, in order:
+//! Tunnel/default-route ownership and endpoint-specific underlay routes.
 //!
-//! 1. **Pin the server's underlay address outside the tunnel.** Once the
-//!    default route points through the utun, the tunnel's *own* QUIC packets
-//!    (to the server's real IP) would otherwise recurse into the tunnel. We
-//!    add a `-host` route for the server IP via each physical interface
-//!    (`route -n add -host <server> -ifscope <iface> <iface-ip>`), keyed with
-//!    `-ifscope` so the two per-interface routes coexist and the kernel picks
-//!    the one matching the source-bound socket. This is the mullvad/wireguard
-//!    incantation; it assumes the server is on-link (correct for a desk LAN).
-//! 2. **Install the new default via the utun** (`route -n add -interface
-//!    utunN default`) — the full-tunnel switch.
-//!
-//! `teardown` reverses both, restoring normal routing when the tunnel is
-//! disconnected. Interface IP/MTU/up is configured with `ifconfig`.
+//! `setup`/`teardown` retain the existing tunnel interface and half-default
+//! ownership. Their pin list is dynamic so callers are not limited to a fixed
+//! wired/Wi-Fi pair. New roaming candidates use `install_underlay_route` and
+//! `remove_underlay_route`; their reference-counted ownership lives in
+//! `underlay.rs`.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
@@ -70,22 +62,20 @@ pub fn configure_v6(utun: &str, addr: std::net::Ipv6Addr, prefix: u8) -> bool {
     ok
 }
 
-/// Install full-tunnel routing transactionally: host-route pins first, then
-/// two more-specific half-default routes via utun. Any failure removes every
-/// route installed so far without touching the physical default route.
-pub fn setup(utun: &str, server: IpAddr, wired_if: &str, wifi_if: &str) -> bool {
-    let mut pins = Vec::with_capacity(2);
-    for iface in [wired_if, wifi_if] {
-        if iface.is_empty() {
-            continue;
-        }
-        let Some(addr) = crate::utun::ipv4_for_iface(iface) else {
-            tracing::error!(iface, "no ipv4 for interface; cannot pin server route");
-            return false;
-        };
-        pins.push((iface, addr));
-    }
-
+/// Install full-tunnel routing transactionally: all supplied endpoint pins
+/// first, then two more-specific half-default routes via utun. Any failure
+/// removes every route installed so far without touching the physical default.
+pub fn setup(utun: &str, server: IpAddr, interfaces: &[&str]) -> bool {
+    let pins = interfaces
+        .iter()
+        .copied()
+        .filter(|interface| !interface.is_empty())
+        .map(|interface| crate::utun::ipv4_for_iface(interface).map(|addr| (interface, addr)))
+        .collect::<Option<Vec<_>>>();
+    let Some(pins) = pins else {
+        tracing::error!("an interface has no IPv4 address; cannot pin server route");
+        return false;
+    };
     setup_with(utun, server, &pins, run)
 }
 
@@ -155,16 +145,15 @@ where
 }
 
 /// Reverse `setup`, deleting only routes owned by this tunnel.
-pub fn teardown(utun: &str, server: IpAddr, wired_if: &str, wifi_if: &str) {
-    let mut pins = Vec::with_capacity(2);
-    for iface in [wired_if, wifi_if] {
-        if iface.is_empty() {
-            continue;
-        }
-        if let Some(addr) = crate::utun::ipv4_for_iface(iface) {
-            pins.push((iface, addr));
-        }
-    }
+pub fn teardown(utun: &str, server: IpAddr, interfaces: &[&str]) {
+    let pins = interfaces
+        .iter()
+        .copied()
+        .filter(|interface| !interface.is_empty())
+        .filter_map(|interface| {
+            crate::utun::ipv4_for_iface(interface).map(|address| (interface, address))
+        })
+        .collect::<Vec<_>>();
     teardown_with(utun, server, &pins, run);
 }
 
@@ -202,6 +191,62 @@ where
     }
 }
 
+/// Install one endpoint-specific scoped host route from a native service
+/// resolution. The service router is the gateway for off-link endpoints;
+/// on-link endpoints use the interface/source form.
+pub fn install_underlay_route(route: &crate::underlay::UnderlayRoute) -> bool {
+    mutate_underlay_route("add", route, run)
+}
+
+/// Remove exactly the scoped host route installed for a candidate.
+pub fn remove_underlay_route(route: &crate::underlay::UnderlayRoute) -> bool {
+    mutate_underlay_route("delete", route, run)
+}
+
+fn mutate_underlay_route<F>(
+    operation: &str,
+    route: &crate::underlay::UnderlayRoute,
+    mut run_command: F,
+) -> bool
+where
+    F: FnMut(&str, &[&str]) -> bool,
+{
+    let endpoint = route.endpoint.to_string();
+    let source = route.source.to_string();
+    let next_hop = route.next_hop.map(|address| {
+        if matches!(address, IpAddr::V6(address) if address.is_unicast_link_local()) {
+            let scope = route
+                .interface_scope
+                .as_deref()
+                .unwrap_or(route.interface.as_str());
+            format!("{address}%{scope}")
+        } else {
+            address.to_string()
+        }
+    });
+    let family = match route.family {
+        crate::underlay::AddressFamily::Ipv4 => None,
+        crate::underlay::AddressFamily::Ipv6 => Some("-inet6"),
+    };
+    let gateway = next_hop.as_deref().unwrap_or(source.as_str());
+    let mut args = Vec::with_capacity(8);
+    args.extend(["-n", operation]);
+    if let Some(family) = family {
+        args.push(family);
+    }
+    args.extend([
+        "-host",
+        endpoint.as_str(),
+        "-ifscope",
+        route.interface.as_str(),
+    ]);
+    if route.next_hop.is_none() {
+        args.push("-interface");
+    }
+    args.push(gateway);
+    run_command("route", &args)
+}
+
 fn default_route_args(utun: &str) -> [[&str; 6]; 2] {
     [
         ["-n", "add", "-net", "0.0.0.0/1", "-interface", utun],
@@ -227,9 +272,8 @@ fn v6_default_route_args(utun: &str) -> [[&str; 7]; 2] {
     ]
 }
 
-/// Install the IPv6 half-default routes into the tunnel. No server-endpoint
-/// pins are needed for IPv6 because the QUIC underlay remains IPv4; the only
-/// v6 routes are the tunnel defaults. Rolls back on failure.
+/// Install the IPv6 half-default routes into the tunnel. Rolls back on
+/// failure without replacing the physical default.
 pub fn setup_v6(utun: &str) -> bool {
     let routes = v6_default_route_args(utun);
     for (index, args) in routes.iter().enumerate() {
@@ -288,7 +332,11 @@ fn run(prog: &str, args: &[&str]) -> bool {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use super::{default_route_args, setup_with, teardown_with, v6_default_route_args};
+    use crate::underlay::{AddressFamily, UnderlayRoute};
+
+    use super::{
+        default_route_args, mutate_underlay_route, setup_with, teardown_with, v6_default_route_args,
+    };
 
     #[test]
     fn tunnel_routes_preserve_physical_default() {
@@ -396,6 +444,122 @@ mod tests {
         );
         assert_eq!(calls[5].1[5], "en0");
         assert_eq!(calls[6].1[5], "en17");
+    }
+
+    #[test]
+    fn tunnel_setup_accepts_dynamic_interface_count() {
+        let pins = [
+            ("en0", Ipv4Addr::new(10, 0, 0, 2)),
+            ("en7", Ipv4Addr::new(10, 1, 0, 2)),
+            ("en9", Ipv4Addr::new(10, 2, 0, 2)),
+        ];
+        let mut calls = Vec::new();
+        assert!(setup_with(
+            "utun16",
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+            &pins,
+            |_, args| {
+                calls.push(args.iter().map(ToString::to_string).collect::<Vec<_>>());
+                true
+            },
+        ));
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0][5], "en0");
+        assert_eq!(calls[1][5], "en7");
+        assert_eq!(calls[2][5], "en9");
+    }
+
+    #[test]
+    fn underlay_route_commands_scope_ipv4_and_ipv6() {
+        let mut calls = Vec::new();
+        let v4 = UnderlayRoute {
+            endpoint: "203.0.113.9".parse().unwrap(),
+            interface: "en7".to_owned(),
+            source: "10.20.30.40".parse().unwrap(),
+            next_hop: Some("10.20.30.1".parse().unwrap()),
+            family: AddressFamily::Ipv4,
+            interface_scope: None,
+            network_generation: 1,
+        };
+        let v6 = UnderlayRoute {
+            endpoint: "2001:db8:ffff::9".parse().unwrap(),
+            interface: "en0".to_owned(),
+            source: "2001:db8:1::23".parse().unwrap(),
+            next_hop: Some("fe80::1".parse().unwrap()),
+            family: AddressFamily::Ipv6,
+            interface_scope: Some("en0".to_owned()),
+            network_generation: 1,
+        };
+        assert!(mutate_underlay_route("add", &v4, |program, args| {
+            calls.push((
+                program.to_owned(),
+                args.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ));
+            true
+        }));
+        assert!(mutate_underlay_route("delete", &v6, |program, args| {
+            calls.push((
+                program.to_owned(),
+                args.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ));
+            true
+        }));
+        assert_eq!(
+            calls[0].1,
+            [
+                "-n",
+                "add",
+                "-host",
+                "203.0.113.9",
+                "-ifscope",
+                "en7",
+                "10.20.30.1",
+            ]
+        );
+        assert_eq!(
+            calls[1].1,
+            [
+                "-n",
+                "delete",
+                "-inet6",
+                "-host",
+                "2001:db8:ffff::9",
+                "-ifscope",
+                "en0",
+                "fe80::1%en0",
+            ]
+        );
+    }
+
+    #[test]
+    fn on_link_underlay_route_uses_interface_source() {
+        let route = UnderlayRoute {
+            endpoint: "192.168.1.90".parse().unwrap(),
+            interface: "en0".to_owned(),
+            source: "192.168.1.23".parse().unwrap(),
+            next_hop: None,
+            family: AddressFamily::Ipv4,
+            interface_scope: None,
+            network_generation: 1,
+        };
+        let mut args = Vec::new();
+        assert!(mutate_underlay_route("add", &route, |_, command_args| {
+            args = command_args.iter().map(ToString::to_string).collect();
+            true
+        }));
+        assert_eq!(
+            args,
+            [
+                "-n",
+                "add",
+                "-host",
+                "192.168.1.90",
+                "-ifscope",
+                "en0",
+                "-interface",
+                "192.168.1.23",
+            ]
+        );
     }
 
     #[test]

@@ -213,62 +213,70 @@ impl Utun {
     }
 }
 
-/// Look up the IPv4 address of `name` (e.g. `"en0"`), if it has one.
-///
-/// Used to pin the server's underlay host route to a physical interface's
-/// own address (on-link next hop).
-pub fn ipv4_for_iface(name: &str) -> Option<std::net::Ipv4Addr> {
+/// Current native addresses and liveness flags for one interface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceAddresses {
+    pub up: bool,
+    pub running: bool,
+    pub addresses: Vec<std::net::IpAddr>,
+}
+
+/// Enumerate addresses assigned to `name` in one `getifaddrs` snapshot.
+pub fn interface_addresses(name: &str) -> Option<InterfaceAddresses> {
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
         return None;
     }
-    let mut out = None;
+    let mut found = false;
+    let mut up = false;
+    let mut running = false;
+    let mut addresses = Vec::new();
     let mut cur = head;
     while !cur.is_null() {
         let ifa = unsafe { &*cur };
         let ifa_name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy();
-        if ifa_name == name && !ifa.ifa_addr.is_null() {
-            let sa = unsafe { &*ifa.ifa_addr };
-            if sa.sa_family as i32 == libc::AF_INET {
-                #[allow(clippy::cast_ptr_alignment)]
-                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-                out = Some(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
-                break;
-            }
-        }
-        cur = ifa.ifa_next;
-    }
-    unsafe { libc::freeifaddrs(head) };
-    out
-}
-
-/// Map an IPv4 address back to the interface name that owns it.
-pub fn iface_for_ip(ip: std::net::Ipv4Addr) -> Option<String> {
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
-        return None;
-    }
-    let mut out = None;
-    let mut cur = head;
-    while !cur.is_null() {
-        let ifa = unsafe { &*cur };
-        if !ifa.ifa_addr.is_null() {
-            let sa = unsafe { &*ifa.ifa_addr };
-            if sa.sa_family as i32 == libc::AF_INET {
-                #[allow(clippy::cast_ptr_alignment)]
-                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-                let addr = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                if addr == ip {
-                    let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy();
-                    out = Some(name.into_owned());
-                    break;
+        if ifa_name == name {
+            found = true;
+            up |= ifa.ifa_flags & (libc::IFF_UP as u32) != 0;
+            running |= ifa.ifa_flags & (libc::IFF_RUNNING as u32) != 0;
+            if !ifa.ifa_addr.is_null() {
+                let family = unsafe { (*ifa.ifa_addr).sa_family as i32 };
+                match family {
+                    libc::AF_INET => {
+                        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                        addresses.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                            u32::from_be(sin.sin_addr.s_addr),
+                        )));
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                        addresses.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                            sin6.sin6_addr.s6_addr,
+                        )));
+                    }
+                    _ => {}
                 }
             }
         }
         cur = ifa.ifa_next;
     }
     unsafe { libc::freeifaddrs(head) };
-    out
+    found.then_some(InterfaceAddresses {
+        up,
+        running,
+        addresses,
+    })
+}
+
+/// Look up the first IPv4 address of `name`, if it has one.
+pub fn ipv4_for_iface(name: &str) -> Option<std::net::Ipv4Addr> {
+    interface_addresses(name)?
+        .addresses
+        .into_iter()
+        .find_map(|address| match address {
+            std::net::IpAddr::V4(address) => Some(address),
+            std::net::IpAddr::V6(_) => None,
+        })
 }
 
 #[cfg(test)]

@@ -36,7 +36,8 @@ nonisolated enum BenchmarkReport {
             "- Physical paths:",
         ])
         for path in current.topology.paths {
-            lines.append("  - \(escapedText(path.displayName)) (\(codeSpan(path.id))): \(codeSpan(path.interface)), \(codeSpan(path.sourceAddress))")
+            let source = path.sourceAddress.map { codeSpan($0) } ?? "Unavailable"
+            lines.append("  - \(escapedText(path.displayName)) (\(codeSpan(path.id))): \(codeSpan(path.interface)), \(source)")
         }
         lines.append(contentsOf: [
             "",

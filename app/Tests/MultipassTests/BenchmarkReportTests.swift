@@ -290,6 +290,25 @@ struct BenchmarkReportTests {
         #expect(!report.contains("\n## forged"))
     }
 
+    @Test("renders unavailable configured physical source without dropping its row")
+    func rendersUnavailablePhysicalSource() {
+        let path = BenchmarkPath(
+            id: "waiting",
+            displayName: "Waiting Ethernet",
+            interface: "en17",
+            sourceAddress: nil
+        )
+        let run = benchmarkRun(
+            topology: benchmarkTopology(paths: [path]),
+            results: [:]
+        )
+
+        let report = BenchmarkReport.markdown(current: run)
+
+        #expect(report.contains("- Waiting Ethernet (`waiting`): `en17`, Unavailable"))
+        #expect(report.contains("| Waiting Ethernet | Not run | — | — | Not run | — | — |"))
+    }
+
     @Test("renders empty code values without opening an unterminated span")
     func rendersEmptyCodeValues() {
         let path = BenchmarkPath(
